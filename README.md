@@ -3,7 +3,7 @@
 Loong-Megatron
 ==============
 
-<h4>A fork of Megatron-LM serving as the backend training engine for LoongForge, with deep customizations in memory optimization and parallelism strategies.</h4>
+<h5>A fork of Megatron-LM serving as the backend training engine for LoongForge, with in-depth customizations including performance optimization strategies, XPU support, bug fixes, and other functional enhancements.</h5>
 
 [![upstream](https://img.shields.io/badge/upstream-mcore__v0.15.0-blue)](https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.15.0)
 [![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
