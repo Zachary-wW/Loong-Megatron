@@ -2045,6 +2045,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
@@ -2157,6 +2159,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
