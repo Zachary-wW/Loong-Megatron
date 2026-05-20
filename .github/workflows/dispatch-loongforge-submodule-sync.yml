@@ -9,11 +9,11 @@ on:
       loongforge_repository:
         description: LoongForge repository to dispatch
         required: true
-        default: Zachary-wW/LoongForge
+        default: baidu-baige/LoongForge
       target_branch:
         description: LoongForge branch to update
         required: true
-        default: ci/initial-workflows
+        default: master
 
 permissions:
   contents: read
@@ -26,8 +26,8 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     env:
-      LOONGFORGE_REPOSITORY: ${{ github.event.inputs.loongforge_repository || 'Zachary-wW/LoongForge' }}
-      TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'ci/initial-workflows' }}
+      LOONGFORGE_REPOSITORY: ${{ github.event.inputs.loongforge_repository || 'baidu-baige/LoongForge' }}
+      TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'master' }}
       SUBMODULE_PATH: third_party/Loong-Megatron
       SUBMODULE_BRANCH: loong-main/core_v0.15.0
       SUBMODULE_REPOSITORY: ${{ github.repository }}
