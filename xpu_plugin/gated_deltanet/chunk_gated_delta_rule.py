@@ -144,15 +144,15 @@ def l2norm_bwd(
     y: torch.Tensor,
     rstd: torch.Tensor,
     dy: torch.Tensor,
-    eps: float=1e-6,
+    eps: float = 1e-6,
 ):
-    """Backward pass of L2 normalization (pure PyTorch, replaces buggy xspeedgate_ops on XPU)."""
-    y_f = y.float()
-    dy_f = dy.float()
-    rstd_f = rstd.float()
-    inner = (y_f * dy_f).sum(dim=-1, keepdim=True)
-    dx_f = (dy_f - y_f * inner) * rstd_f
-    return dx_f.to(y.dtype)
+    # xspeedgate_ops.l2norm_bwd with bf16 inputs [N, D]
+    orig_shape = y.shape
+    y_2d = y.reshape(-1, y.shape[-1]).bfloat16()
+    rstd_2d = rstd.reshape(-1, rstd.shape[-1]).bfloat16()
+    dy_2d = dy.reshape(-1, dy.shape[-1]).bfloat16()
+    dx_2d = torch.ops.xspeedgate_ops.l2norm_bwd(y_2d, rstd_2d, dy_2d, eps)
+    return dx_2d.to(y.dtype).reshape(orig_shape)
 
 
 def chunk_local_cumsum(
