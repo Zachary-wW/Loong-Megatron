@@ -32,19 +32,10 @@ jobs:
       SUBMODULE_BRANCH: loong-main/core_v0.15.0
       SUBMODULE_REPOSITORY: ${{ github.repository }}
     steps:
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.LOONGFORGE_DISPATCH_APP_ID }}
-          private-key: ${{ secrets.LOONGFORGE_DISPATCH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: LoongForge
-
       - name: Dispatch LoongForge sync
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.LOONGFORGE_DISPATCH_TOKEN }}
         run: |
           set -euo pipefail
           payload=$(jq -n \
