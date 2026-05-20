@@ -9,11 +9,11 @@ on:
       loongforge_repository:
         description: LoongForge repository to dispatch
         required: true
-        default: baidu-baige/LoongForge
+        default: Zachary-wW/LoongForge
       target_branch:
         description: LoongForge branch to update
         required: true
-        default: master
+        default: ci/test-github-actions-bot-sync
 
 permissions:
   contents: read
@@ -26,25 +26,16 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     env:
-      LOONGFORGE_REPOSITORY: ${{ github.event.inputs.loongforge_repository || 'baidu-baige/LoongForge' }}
-      TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'master' }}
+      LOONGFORGE_REPOSITORY: ${{ github.event.inputs.loongforge_repository || 'Zachary-wW/LoongForge' }}
+      TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'ci/test-github-actions-bot-sync' }}
       SUBMODULE_PATH: third_party/Loong-Megatron
       SUBMODULE_BRANCH: loong-main/core_v0.15.0
       SUBMODULE_REPOSITORY: ${{ github.repository }}
     steps:
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.LOONGFORGE_DISPATCH_APP_ID }}
-          private-key: ${{ secrets.LOONGFORGE_DISPATCH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: LoongForge
-
       - name: Dispatch LoongForge sync
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.LOONGFORGE_DISPATCH_TOKEN }}
         run: |
           set -euo pipefail
           payload=$(jq -n \
