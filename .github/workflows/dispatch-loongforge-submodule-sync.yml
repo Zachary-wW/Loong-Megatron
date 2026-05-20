@@ -1,0 +1,72 @@
+name: Dispatch LoongForge Submodule Sync
+
+on:
+  push:
+    branches:
+      - loong-main/core_v0.15.0
+  workflow_dispatch:
+    inputs:
+      loongforge_repository:
+        description: LoongForge repository to dispatch
+        required: true
+        default: Zachary-wW/LoongForge
+      target_branch:
+        description: LoongForge branch to update
+        required: true
+        default: ci/initial-workflows
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dispatch-loongforge-submodule-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      LOONGFORGE_REPOSITORY: ${{ github.event.inputs.loongforge_repository || 'Zachary-wW/LoongForge' }}
+      TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'ci/initial-workflows' }}
+      SUBMODULE_PATH: third_party/Loong-Megatron
+      SUBMODULE_BRANCH: loong-main/core_v0.15.0
+      SUBMODULE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.LOONGFORGE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.LOONGFORGE_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: LoongForge
+
+      - name: Dispatch LoongForge sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n \
+            --arg ref "$TARGET_BRANCH" \
+            --arg target_branch "$TARGET_BRANCH" \
+            --arg submodule_path "$SUBMODULE_PATH" \
+            --arg submodule_branch "$SUBMODULE_BRANCH" \
+            --arg submodule_repository "$SUBMODULE_REPOSITORY" \
+            '{
+              ref: $ref,
+              inputs: {
+                target_branch: $target_branch,
+                submodule_path: $submodule_path,
+                submodule_branch: $submodule_branch,
+                submodule_repository: $submodule_repository
+              }
+            }')
+
+          curl --fail-with-body \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$LOONGFORGE_REPOSITORY/actions/workflows/submodule-sync.yml/dispatches" \
+            -d "$payload"
