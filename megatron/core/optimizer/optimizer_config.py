@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -224,6 +225,23 @@ class OptimizerConfig:
                 or (self.optimizer_cpu_offload and not self.fp8_param_gather)
             )
         )
+
+        if (
+            self.optimizer_cpu_offload
+            and self.optimizer == 'adam'
+            and self.use_deepspeed_cpu_adam
+            and (
+                self.exp_avg_dtype != torch.float32
+                or self.exp_avg_sq_dtype != torch.float32
+            )
+        ):
+            warnings.warn(
+                "DeepSpeed CPUAdam requires FP32 Adam moment states for CPU-offloaded "
+                "FP32 master params. Forcing exp_avg_dtype and exp_avg_sq_dtype to "
+                "torch.float32."
+            )
+            self.exp_avg_dtype = torch.float32
+            self.exp_avg_sq_dtype = torch.float32
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
