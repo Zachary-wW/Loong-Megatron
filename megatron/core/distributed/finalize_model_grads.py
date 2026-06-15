@@ -443,8 +443,26 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
+    # main_grad.add_() for echo expert wgrads runs on moe_a2a_stream; reduce-scatter
+    # (finish_grad_sync) runs on default_stream.  Without this sync the reduce-scatter
+    # can read incomplete main_grad values, producing wrong gradients.
+    if getattr(config, 'moe_echo_expert_dispatch_overlap', False):
+        try:
+            from megatron.core.transformer.moe.moe_layer import MoELayer
+            if hasattr(MoELayer, 'moe_a2a_stream'):
+                torch.cuda.default_stream().wait_stream(MoELayer.moe_a2a_stream)
+        except ImportError:
+            pass
     for model_chunk in model:
         model_chunk.finish_grad_sync()
+    # Per-step full device sync AFTER finish_grad_sync.
+    # Safe because finish_grad_sync() has completed — no cross-rank collective is
+    # pending, and all DeepEP collectives have been submitted by all ranks.
+    # Necessary to prevent CPU-GPU drift accumulation across steps (NCCL 600s timeout)
+    # and inter-node step skew (DeepEP buffer collision).
+    # Performance: 1 sync per step; reduce-scatter already drained most GPU work.
+    if getattr(config, 'moe_echo_expert_dispatch_overlap', False):
+        torch.cuda.synchronize()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 

@@ -726,6 +726,14 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
+        if self.config.moe_router_force_hotspot_ratio > 0.0:
+            num_experts = logits.size(-1)
+            logits = logits.clone().reshape(-1, num_experts)
+            num_hotspot_tokens = int(logits.size(0) * self.config.moe_router_force_hotspot_ratio)
+            experts_per_ep_rank = num_experts // self.config.expert_model_parallel_size
+            logits[:num_hotspot_tokens, :experts_per_ep_rank] += 1.0e4
+            logits = logits.reshape(*input.shape[:-1], num_experts)
+
         probs, routing_map = self.routing(logits)
 
         return probs, routing_map

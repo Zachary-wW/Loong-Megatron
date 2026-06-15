@@ -247,6 +247,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
+    moe_hybridep_num_sms: int = 16
+    """Number of SMs to use for HybridEP. In pure NVL scenarios, 
+    16 SMs can generally achieve good bandwidth."""
+
     ####################
     # initialization
     ####################
@@ -602,8 +606,12 @@ class TransformerConfig(ModelParallelConfig):
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
     moe_router_force_load_balancing: bool = False
-    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_router_force_hotspot_ratio: float = 0.0
+    """[Experimental] Force a ratio of router tokens to route to the first EP rank.
+    This is an experimental feature and only for benchmark."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -635,8 +643,56 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts."""
+
+    moe_echo_dump_dir: Optional[str] = None
+    """The directory to dump the echo routing data."""
+
+    moe_echo_log_steps: Optional[str] = None
+    """Comma-separated list of training steps to log echo expert stats, e.g. "1,3,5"."""
+
+    moe_echo_log_layers: Optional[str] = None
+    """Comma-separated list of layer numbers to log echo expert stats, e.g. "10,15,20,25"."""
+
+    moe_echo_log_file: Optional[str] = None
+    """Path to the output log file for echo expert stats."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of echo experts to use. If None, the number of echo experts is set to
+    the number of experts."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Enable overlap of echo expert dispatch and expert computation."""
+
+    moe_echo_recompute_expert_dispatch: bool = False
+    """[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead.
+    It is only effective when moe_enable_echo is enabled."""
+
+    moe_echo_expert_dispatcher_type: str = "hybridep"
+    """The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall"."""
+
+    moe_echo_enable_random_offloading: bool = False
+    """[Experimental] Enable random offloading of echo experts for debugging and numerical verification.
+    It is only effective when moe_enable_echo is enabled."""
+
+    moe_echo_algorithm: str = "sinkhorn"
+    """Algorithm used for echo expert token assignment when moe_enable_echo is True.
+    Options:
+      - "sinkhorn": topology-aware Sinkhorn-Knopp optimal transport + iterative col-top1 matching.
+      - "greedy": one_shot_greedy (K=1) or approx_bin_packing (K>1).
+    It is only effective when moe_enable_echo is enabled."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
+
+    moe_flex_dispatcher_backend: str = "deepep"
+    """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
+    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
+    the MNNVL case."""
+
+    moe_received_token_capacity: Optional[float] = None
+    """The capacity of total received tokens on each ep rank."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -1011,11 +1067,22 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
 
+            self.moe_flex_dispatcher_backend = "deepep"
+            warnings.warn(
+                "moe_enable_deepep is deprecated."
+                "Please use --moe-flex-dispatcher-backend=deepep instead."
+            )
+
         if self.moe_token_dispatcher_type == "flex":
-            if self.moe_pad_expert_input_to_capacity:
+            if self.moe_pad_expert_input_to_capacity and (
+                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
+            ):
                 raise ValueError(
-                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
+                    "Flex token dispatcher with deepep backend does not support "
+                    "moe_pad_expert_input_to_capacity"
                 )
+            if self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "hybrid_ep":
+                raise ValueError("Only one type of backend is supported for flex token dispatcher.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -1716,6 +1783,15 @@ class TransformerConfig(ModelParallelConfig):
                     f"variable sequence length, please use alltoall dispatcher instead."
                 )
 
+        if self.moe_enable_echo:
+            assert self.gradient_accumulation_fusion is True, "MoE Echo only support gradient accumulation fusion."
+            assert (
+                self.moe_num_echo_experts is not None
+            ), "moe_num_echo_experts must be specified when moe_enable_echo is True"
+            assert (
+                self.moe_num_echo_experts % self.expert_model_parallel_size == 0
+            ), "moe_num_echo_experts must be divisible by expert_model_parallel_size when moe_enable_echo is True"
+            
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (
                 fused_permute,
