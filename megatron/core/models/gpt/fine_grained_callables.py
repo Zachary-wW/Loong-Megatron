@@ -54,14 +54,15 @@ def weak_method(method):
     return wrapped_func
 
 
-def should_free_input(name, is_moe, is_deepep):
+def should_free_input(name, is_moe, enable_deepep, enable_hybridep):
     """Determine if the node should free its input memory.
 
     Args:
         name: Node name
         is_moe: Whether it's a MoE model
-        is_deepep: Whether it's a DeepEP model
-
+        enable_deepep: Whether to use DeepEP dispatcher
+        enable_hybridep: Whether to use HybridEP dispatcher
+    
     Returns:
         bool: Whether to free input memory
     """
@@ -74,13 +75,13 @@ def should_free_input(name, is_moe, is_deepep):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": True,
+        "mlp": not enable_hybridep,
         "moe_combine": True,
-        "post_combine": is_deepep,
+        "post_combine": enable_deepep or enable_hybridep,
         # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
         # and it's not needed anymore after the forward pass
         # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "moe_dispatch": not is_deepep,
+        "moe_dispatch": not (enable_deepep or enable_hybridep),
     }
 
     return free_input_nodes.get(name, False)
@@ -237,12 +238,13 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
+             extra_args (dict): Extra arguments for nodes: is_moe, enable_deepep, enable_hybridep.
         """
         # determine whether to free input memory
         is_moe = extra_args.get("is_moe", False)
         enable_deepep = extra_args.get("enable_deepep", False)
-        free_input = should_free_input(name, is_moe, enable_deepep)
+        enable_hybridep = extra_args.get("enable_hybridep", False)
+        free_input = should_free_input(name, is_moe, enable_deepep, enable_hybridep)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -338,7 +340,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
-    enable_deepep = layer.config.moe_enable_deepep
+    enable_deepep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "deepep"
+    )
+    enable_hybridep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "hybridep"
+    )
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -428,7 +437,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -447,7 +456,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         shared_expert_output = None
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs

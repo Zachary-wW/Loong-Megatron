@@ -532,21 +532,61 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         ctx.non_tensor_values = non_tensor_values
         ctx.total_args_count = len(args)
 
+        # Skip detach of leaf nodes, since we want to access main_grad of leaf nodes.
+        # Build detached_args for backward: leaf tensors kept as-is, non-leaf tensors detached.
+        detached_args = tuple(
+            arg if (isinstance(arg, torch.Tensor) and arg.is_leaf) else
+            (arg.detach().requires_grad_(arg.requires_grad) if isinstance(arg, torch.Tensor) else arg)
+            for arg in args
+        )
+        ctx.detached_args = detached_args
+        ctx.only_calculate_input_grad = checkpoint_without_output_obj.only_calculate_input_grad
+
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
         return outputs
 
     @staticmethod
-    def backward(ctx, *args):
+    def backward(ctx, *output_grads):
         """Backward pass."""
-        inputs = ctx.inputs
+        inputs = ctx.detached_args
         outputs = ctx.outputs
-        torch.autograd.backward(outputs, args)
+        valid_outputs_with_grad = []
+        valid_output_grads = []
+        for output, output_grad in zip(outputs, output_grads):
+            if torch.is_tensor(output) and output_grad is not None:
+                valid_outputs_with_grad.append(output)
+                valid_output_grads.append(output_grad)
+
+        if ctx.only_calculate_input_grad:
+            # Use torch.autograd.grad() to get gradients directly without accumulating to .grad
+            tensor_inputs = [inp for inp in inputs if isinstance(inp, torch.Tensor) and inp.requires_grad]
+
+            if valid_outputs_with_grad and tensor_inputs:
+                grads = torch.autograd.grad(
+                    outputs=valid_outputs_with_grad,
+                    inputs=tensor_inputs,
+                    grad_outputs=valid_output_grads,
+                    allow_unused=True,
+                )
+                grad_map = {id(inp): grad for inp, grad in zip(tensor_inputs, grads)}
+            else:
+                grad_map = {}
+
+            input_grads = tuple(
+                grad_map.get(id(inp), None) if isinstance(inp, torch.Tensor) else inp
+                for inp in inputs
+            )
+        else:
+            # Use torch.autograd.backward() which accumulates gradients to .grad
+            torch.autograd.backward(valid_outputs_with_grad, grad_tensors=valid_output_grads)
+            input_grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
+
         ctx.outputs = None
         ctx.inputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
-        return (None, None) + grads
+
+        return (None, None) + input_grads
 
 
 class MHCBlockRecomputeManager:
@@ -666,7 +706,7 @@ class CheckpointWithoutOutput(object):
     recomputation while maintaining backward compatibility with existing code.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None):
+    def __init__(self, fp8=False, ckpt_manager=None, only_calculate_input_grad=False):
         """
         Initialize CheckpointWithoutOutput.
         Args:
@@ -675,9 +715,14 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
+            only_calculate_input_grad: If True, use torch.autograd.grad() in backward
+                         to compute input gradients directly without accumulating to .grad.
+                         Useful when the caller wants to manually manage gradient accumulation
+                         (e.g., for leaf parameters with main_grad). Defaults to False.
         """
         self.fp8 = fp8 is not None
         self.ckpt_manager = ckpt_manager
+        self.only_calculate_input_grad = only_calculate_input_grad
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None

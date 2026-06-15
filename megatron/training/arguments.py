@@ -3240,7 +3240,8 @@ def _add_moe_args(parser):
                        'If not specified, defaults to the ffn_hidden_size.')
     group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
                        help='Shared expert total ffn hidden size. '
-                       'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" if there are multiple shared experts. '
+                       'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" '
+                       'if there are multiple shared experts. '
                        'None means no shared expert. '
                        'By default, the shared experts execute before the router. However, when '
                        '--moe-shared-expert-overlap or --overlap-moe-expert-parallel-comm is set, '
@@ -3253,22 +3254,32 @@ def _add_moe_args(parser):
                        'Without this, the shared experts execute before the router. '
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+                       help='When there are multiple experts per rank, launch multiple local GEMM '
+                       'kernels in multiple streams to improve the utilization and performance with '
+                       'GroupedLinear in TransformerEngine.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
-                       help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
+                       help='Use legacy GroupedMLP rather than TEGroupedMLP. '
+                       'Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient. '
                        'Deprecated. Use "--recompute-granularity selective --recompute-modules moe" instead.')
     group.add_argument('--moe-extended-tp', action='store_true',
                        help='Deprecated. Use --expert-tensor-parallel-size instead.')
     group.add_argument('--moe-use-upcycling', action='store_true',
-                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
-                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save '
+                       'the converted model to the path specified by --save. Upcycling is implemented '
+                       'on the top of distributed checkpointing, so it supports parallel modes '
+                       'different from the dense model.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" '
+                       'corresponds to the load balancing loss used in GShard and SwitchTransformer; '
+                       '"seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, '
+                       'which computes the loss for each individual sample; "sinkhorn" corresponds '
+                       'to the balancing algorithm used in S-BASE, and "none" implies no load '
+                       'balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-dtype', type=str,
                        choices=['fp32', 'fp64'],
                        default=None,
@@ -3277,7 +3288,8 @@ def _add_moe_args(parser):
                             'The perf impact should be negligible when used with permute fusion. '
                             'None means no changes for dtype.')
     group.add_argument('--moe-router-fusion', action='store_true',
-                       help='Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above.')
+                       help='Enable fusion for MoE TopK routing and aux-loss computation. This is '
+                       'only supported in TransformerEngine 2.7.0 and above.')
     group.add_argument('--moe-router-score-function', type=str,
                        choices=['softmax', 'sigmoid', 'sqrtsoftplus'],
                        default='softmax',
@@ -3285,22 +3297,34 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
-                       help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
+                       help='Enable pre-softmax routing for MoE, which means softmax is before the '
+                       'top-k selection. By default, softmax is done after top-k.')
     group.add_argument('--moe-router-num-groups', type=int, default=None,
-                       help='Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.'
-                       'Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)')
+                       help='Number of groups to divide experts into for group-limited routing. '
+                       'When using group-limited routing: 1) Experts are divided into equal-sized '
+                       'groups, 2) For each token, a subset of groups are selected based on routing '
+                       'scores (sum of top-2 expert scores within each group), 3) From these '
+                       'selected groups, moe_router_topk experts are chosen.'
+                       'Two common use cases: 1) Device-limited routing: Set equal to expert '
+                       'parallel size (EP) to limit each token to experts on a subset of devices '
+                       '(See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited '
+                       'routing: Set equal to number of nodes in EP group to limit each token to '
+                       'experts on a subset of nodes (See DeepSeek-V3: '
+                       'https://arxiv.org/pdf/2412.19437)')
     group.add_argument('--moe-router-group-topk', type=int, default=None,
                        help='Number of selected groups for group-limited routing.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
-                       help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
+                       help='Scaling factor for routing score in top-k selection, only works when '
+                       '--moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
     group.add_argument('--moe-router-enable-expert-bias', action='store_true',
                        help='TopK routing with dynamic expert bias in the aux-loss-free load balancing strategy. '
                        'The routing decision is based on the sum of the routing scores and the expert bias. '
                        'See https://arxiv.org/abs/2408.15664 for details.')
     group.add_argument('--moe-router-bias-update-rate', type=float, default=1e-3,
                        help='Expert bias update rate in the aux-loss-free load balancing strategy. '
-                       'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
-                       'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
+                       'The expert bias is updated based on the number of assigned tokens to each '
+                       'expert in a global batch, where the bias is increased for the experts with '
+                       'less assigned tokens and decreased for the experts with more assigned tokens. '
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
@@ -3327,20 +3351,71 @@ def _add_moe_args(parser):
     group.add_argument('--moe-token-dispatcher-type', type=str,
                        choices=['allgather', 'alltoall', 'flex'],
                        default='allgather',
-                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+                       help="The type of token dispatcher to use. The default is 'allgather'. "
+                       "Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when "
+                       "applying expert parallelism. For more information, please refer to the "
+                       "documentation in core/moe/README.")
+    group.add_argument('--moe-enable-echo', action='store_true',
+                       help='[Experimental] Enable Elastic Cloning for Hot Experts (ECHO). '
+                       'This feature dynamically clones frequently used experts to spare/echo experts '
+                       'for better load balancing and reduced communication overhead.')
+    group.add_argument('--moe-echo-dump-dir', type=str, default=None,
+                       help='The directory to dump the echo routing data.')
+    group.add_argument('--moe-echo-log-steps', type=str, default=None,
+                       help='Comma-separated list of training steps to log echo expert stats, e.g. "1,3,5".')
+    group.add_argument('--moe-echo-log-layers', type=str, default=None,
+                       help='Comma-separated list of layer numbers to log echo expert stats, e.g. "10,15,20,25".')
+    group.add_argument('--moe-echo-log-file', type=str, default=None,
+                       help='Path to the output log file for echo expert stats.')
+    group.add_argument('--moe-echo-recompute-expert-dispatch', action='store_true',
+                       help='[Experimental] Recompute the expert dispatch for echo experts in the backward pass '
+                       'to reduce the memory overhead. It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatch-overlap', action='store_true',
+                       help='Enable overlap of echo expert dispatch and expert computation. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-enable-random-offloading', action='store_true',
+                       help='[Experimental] Enable random offloading for echo experts in the backward pass '
+                       'to reduce the memory overhead. It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-algorithm', type=str, default='sinkhorn',
+                       choices=['sinkhorn', 'greedy'],
+                       help='Algorithm used for echo expert token assignment when --moe-enable-echo is enabled. '
+                       '"sinkhorn": topology-aware Sinkhorn-Knopp OT + iterative col-top1 matching (default). '
+                       '"greedy": approx_bin_packing for K=1 spare slot, one_shot_greedy for K>1. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatcher-type', type=str, default='hybridep',
+                       choices=['hybridep', 'alltoall'],
+                       help='The type of expert dispatcher to use for echo experts. '
+                       'Can be either "hybridep" or "alltoall".')
+    group.add_argument('--moe-received-token-capacity', type=float, default=None,
+                       help='The capacity of total received tokens on each ep rank.')
+    group.add_argument('--moe-num-echo-experts', type=int, default=None,
+                       help='[Experimental] Number of echo experts to use for elastic expert cloning. '
+                       'These are spare experts that can receive overflow tokens from overloaded experts. '
+                       'If None, the number of echo experts is set to the number of experts.')
     group.add_argument('--moe-enable-deepep', action='store_true',
-                       help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
+                       help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
+    group.add_argument('--moe-flex-dispatcher-backend', type=str,
+                       choices=['deepep', 'hybridep'],
+                       default='deepep',
+                       help='The backend to use for flex token dispatcher. The default is "deepep". '
+                       'Options are "deepep" and "hybridep".')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
+                       help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
                        help='Fuse token rearrangement ops during token dispatching.')
     # Token dropping arguments
     group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
                        help='The capacity factor for each expert, None means no token will be dropped.')
     group.add_argument('--moe-pad-expert-input-to-capacity', action='store_true',
-                       help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
-    group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
-                       help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
+                       help='Pads the input for each expert to match the expert capacity length, '
+                       'effective only after the --moe-expert-capacity-factor is set.')
+    group.add_argument('--moe-token-drop-policy', type=str, default='probs',
+                       choices=['probs', 'position'],
+                       help='The policy to drop tokens. Can be either "probs" or "position". '
+                       'If "probs", the tokens with the lowest probabilities will be dropped. '
+                       'If "position", tokens at the end of each batch will be dropped.')
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
     # MoE communication overlap arguments
@@ -3350,12 +3425,16 @@ def _add_moe_args(parser):
                        help='Delay the wgrad compute for batch-level overlapping')
 
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
-                       help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
-                       'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
+                       help='This param sepecifics how many times smaller is the expert hidden size '
+                       'compared with the original dense FFN hidden size. For using granular '
+                       'upcycling strategy, please set this param as a positive integer. If this '
+                       'param is set to 1, it means using the default upcycling strategy.')
     group.add_argument('--moe-pad-experts-for-cuda-graph-inference', action='store_true',
-                       help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
-                       " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
-                       " max that an expert could see during inference so no tokens are actually dropped.")
+                       help="some MoE routers have a D2H sync that will break cuda graphs.  If "
+                       "this flag is set the router will switch to dropping and padding during "
+                       "decode time which does not have a D2H sync. The capacity factor is set "
+                       "to the max that an expert could see during inference so no tokens are "
+                       "actually dropped.")
     # add for moe memory monitor
     group.add_argument('--enable-moe-mem-monitor',  action='store_true', help='Enable mem monitor')
     group.add_argument('--print-moe-mem-monitor-interval',  type=int, default=100000,
