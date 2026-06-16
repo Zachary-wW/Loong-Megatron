@@ -943,8 +943,8 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, probs, metadata)
             expert_output, mlp_bias = self.routed_experts_compute(dispatched_input, tokens_per_expert, permuted_probs)
             output = self.post_routed_experts_compute(expert_output, metadata)
-            output = self.token_dispatcher.token_combine(output)
-            output = self.token_dispatcher.combine_postprocess(output)
+            output = self.combine(output, metadata)
+            output = self.post_combine(output, metadata, None)
             return output, mlp_bias
 
         if self.moe_layer_recompute:

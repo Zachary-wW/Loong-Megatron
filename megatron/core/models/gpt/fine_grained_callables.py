@@ -361,7 +361,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         sequence_len_offset = node.chunk_state.sequence_len_offset
 
         if layer.a2a_overlap_attn_recompute:
-            def custom_forward(hidden_states, attention_mask, rotary_pos_emb, packed_seq_params):
+            def custom_forward(hidden_states, attention_mask, rotary_pos_emb):
                 output_, _ = layer._forward_attention(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -374,7 +374,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 return output_    
 
             hidden_states = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, attention_mask, rotary_pos_emb, packed_seq_params)                        
+                    custom_forward, False, hidden_states, attention_mask, rotary_pos_emb)                        
         else:
             hidden_states, _ = layer._forward_attention(
                 hidden_states=hidden_states,
@@ -399,13 +399,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             pre mlp layernorm->router->dispatch preprocess
         """
         if layer.a2a_overlap_post_attn_recompute:
+            metadata_holder = {}
+
             def custom_forward(hidden_states):
                 pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
-                local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
-                return pre_mlp_layernorm_output, local_tokens, probs    
+                local_tokens, probs, metadata_holder['metadata'] = layer.mlp.router_and_preprocess(
+                    pre_mlp_layernorm_output
+                )
+                return pre_mlp_layernorm_output, local_tokens, probs
 
             pre_mlp_layernorm_output, local_tokens, probs  = tensor_parallel.checkpoint(
                     custom_forward, False, hidden_states)
+            metadata = metadata_holder['metadata']
 
         else:
             if layer.offload_mlp_norm:
@@ -420,7 +425,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 with get_fine_grained_offloading_context(layer.offload_mlp_norm):
                     pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
-            local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+            local_tokens, probs, metadata = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+
+        node.layer_state.dispatch_metadata = metadata
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -442,7 +449,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
-        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+        metadata = node.layer_state.dispatch_metadata
+        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs, metadata)
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
@@ -462,9 +470,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
+        metadata = node.layer_state.dispatch_metadata
 
         dispatched_input, tokens_per_expert, permuted_probs = layer.mlp.pre_routed_experts_compute(
-            dispatched_tokens, dispatched_probs)
+            dispatched_tokens, dispatched_probs, metadata)
 
         if layer.a2a_overlap_mlp_recompute:
             def custom_forward(dispatched_input, tokens_per_expert, permuted_probs, pre_mlp_layernorm_output):
@@ -489,7 +498,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )   
 
-        expert_output = layer.mlp.post_routed_experts_compute(expert_output)
+        expert_output = layer.mlp.post_routed_experts_compute(expert_output, metadata)
 
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -520,7 +529,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Triggers token combine communication.
         This communication can be overlapped with computation from another microbatch.
         """
-        output = layer.mlp.combine(output)
+        metadata = node.layer_state.dispatch_metadata
+        output = layer.mlp.combine(output, metadata)
         return output
 
     def submodule_post_combine_forward(
@@ -532,9 +542,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
-        
+        metadata = node.layer_state.dispatch_metadata
+
         # Post-process combine and add shared expert output
-        output = layer.mlp.post_combine(output, shared_expert_output)
+        output = layer.mlp.post_combine(output, metadata, shared_expert_output)
         mlp_output_with_bias = (output, None)
 
         with layer.bias_dropout_add_exec_handler():
@@ -557,6 +568,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             shared_expert_output.untyped_storage().resize_(0)
         node.layer_state.residual = None
         node.layer_state.shared_expert_output = None
+        node.layer_state.dispatch_metadata = None
 
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm
