@@ -144,12 +144,14 @@ class Attention(MegatronModule, ABC):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None
+        pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -175,7 +177,10 @@ class Attention(MegatronModule, ABC):
             self.query_projection_size, self.config.num_attention_heads
         )
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.experimental_attention_variant == "dsv4_hybrid":
+            self.num_query_groups_per_partition = self.config.num_query_groups
+        else:
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
@@ -670,7 +675,14 @@ class Attention(MegatronModule, ABC):
         # Calculate cache chunk size based on pipeline parallelism configuration
         pipeline_world_size = get_pipeline_model_parallel_world_size()
         pipeline_rank = get_pipeline_model_parallel_rank()
-        if self.config.virtual_pipeline_model_parallel_size is not None:
+        if self.config.sft_chunkpipe_mode and self.config.virtual_pipeline_model_parallel_size is not None:
+            # SFT + VPP: all sequences in one VP group means VP0 holds all entries
+            # until VP1 backward completes. Max concurrent cache per VP stage =
+            # num_microbatches - num_sequences (all non-last-chunk entries).
+            num_mb = self.config.chunkpipe_num_microbatches
+            num_seq = num_mb // self.num_chunks_per_seq
+            self.kv_cache_chunk_size = num_mb - num_seq
+        elif self.config.virtual_pipeline_model_parallel_size is not None:
             self.kv_cache_chunk_size = (pipeline_world_size - pipeline_rank - 1) * 2 \
                 + self.num_chunks_per_seq * self.config.virtual_pipeline_model_parallel_size
         else:
@@ -735,8 +747,15 @@ class Attention(MegatronModule, ABC):
             return False
 
         # During last 'keep_activations_chunks' chunks, gradient should be enabled
-        current_chunk_idx = self.config.chunkpipe_forward_microbatch % self.num_chunks_per_seq
-        return (current_chunk_idx + self.config.keep_activations_chunks >= self.num_chunks_per_seq)
+        if self.config.sft_chunkpipe_mode:
+            # SFT: use scheduler-provided chunk index
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+            effective_group = self.config.chunkpipe_current_group_size
+        else:
+            # Pretrain: derive from global counter (all groups same size)
+            current_chunk_idx = self.config.chunkpipe_forward_microbatch % self.num_chunks_per_seq
+            effective_group = self.num_chunks_per_seq
+        return (current_chunk_idx + self.config.keep_activations_chunks >= effective_group)
 
     def clear_chunk_key_value_cache(self) -> None:
         """
@@ -788,7 +807,28 @@ class Attention(MegatronModule, ABC):
         # Remove the cache entry and mark the chunk as available
         cache_chunk_index = self.micro_batch_to_cache_chunk_map.pop(micro_batch_index)
         self.empty_chunk_indices.append(cache_chunk_index)
-           
+      
+    def check_kv_cache_grad_consumed(self):
+        """Check key_cache_grad/value_cache_grad are empty after a group's backward completes.
+
+        In SFT chunkpipe, each group's backward must consume all cache grads accumulated
+        during that group's forward. Any remaining entries indicate a LIFO order violation.
+        """
+        if self.key_cache_grad:
+            orphan_keys = list(self.key_cache_grad.keys())
+            self.key_cache_grad.clear()
+            assert False, (
+                f"[ChunkPipe] Orphan key_cache_grad entries {orphan_keys} remain after group "
+                f"backward. layer={self.layer_number}"
+            )
+        if self.value_cache_grad:
+            orphan_keys = list(self.value_cache_grad.keys())
+            self.value_cache_grad.clear()
+            assert False, (
+                f"[ChunkPipe] Orphan value_cache_grad entries {orphan_keys} remain after group "
+                f"backward. layer={self.layer_number}"
+            )
+
     def append_chunk_key_value_cache(self, key: Tensor, value: Tensor) -> None:
         """
         Append key-value pairs for the current micro-batch to the chunk cache.
@@ -819,9 +859,19 @@ class Attention(MegatronModule, ABC):
         current_microbatch = self.config.chunkpipe_forward_microbatch
 
         # Skip caching if this is the last chunk in the sequence
-        if (current_microbatch + 1) % self.num_chunks_per_seq == 0:
-            return
+        skip_cache = False
+        if self.config.sft_chunkpipe_mode:
+            # SFT: use scheduler-provided chunk index to detect last chunk
+            if self.config.chunkpipe_chunk_idx_in_group >= self.config.chunkpipe_current_group_size - 1:
+                skip_cache = True
+        else:
+            # Pretrain: derive from global counter (all groups same size)
+            if (current_microbatch + 1) % self.num_chunks_per_seq == 0:
+                skip_cache = True
     
+        if skip_cache:
+            return
+
         # Get an available cache chunk
         if not self.empty_chunk_indices:
             raise RuntimeError("No available cache chunks. Consider increasing cache size or clearing old entries.")
@@ -871,7 +921,12 @@ class Attention(MegatronModule, ABC):
         is_forward = self.config.chunkpipe_forward
         microbatch_idx = (self.config.chunkpipe_forward_microbatch if is_forward
                          else self.config.chunkpipe_backward_microbatch)
-        current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
+        if self.config.sft_chunkpipe_mode:
+            # SFT: use scheduler-provided chunk index within group
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+        else:
+            # Pretrain: derive from global counter (all groups same size)
+            current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
         start_microbatch_idx = microbatch_idx - current_chunk_idx
 
         # Calculate total sequence length after concatenation
@@ -916,8 +971,26 @@ class Attention(MegatronModule, ABC):
         current_pos = 0
         for prev_chunk_idx in range(current_chunk_idx):
             # Get the cache index for this previous chunk
-            cache_chunk_idx = self.micro_batch_to_cache_chunk_map[start_microbatch_idx + prev_chunk_idx]
-
+            map_key = start_microbatch_idx + prev_chunk_idx
+            if map_key not in self.micro_batch_to_cache_chunk_map:
+                try:
+                    import torch.distributed as dist
+                    rank = dist.get_rank() if dist.is_initialized() else -1
+                except Exception:
+                    rank = -1
+                raise RuntimeError(
+                    f"[ChunkPipe Debug Rank {rank}] KeyError: map key {map_key} not found.\n"
+                    f"  microbatch_idx={microbatch_idx} is_forward={is_forward}\n"
+                    f"  current_chunk_idx={current_chunk_idx} start={start_microbatch_idx}\n"
+                    f"  map keys={sorted(self.micro_batch_to_cache_chunk_map.keys())}\n"
+                    f"  fwd_mb={getattr(self.config, 'chunkpipe_forward_microbatch', 'N/A')}\n"
+                    f"  bwd_mb={getattr(self.config, 'chunkpipe_backward_microbatch', 'N/A')}\n"
+                    f"  chunk_idx_in_group={getattr(self.config, 'chunkpipe_chunk_idx_in_group', 'N/A')}\n"
+                    f"  group_size={getattr(self.config, 'chunkpipe_current_group_size', 'N/A')}\n"
+                    f"  layer={self.layer_number}"
+                )
+            cache_chunk_idx = self.micro_batch_to_cache_chunk_map[map_key]
+            
             # Calculate cache indices for retrieving cached data
             chunk_indices = torch.arange(self.config.chunksize,
                 device=self.key_cache.device) + (cache_chunk_idx * self.config.chunksize)
@@ -1215,24 +1288,62 @@ class Attention(MegatronModule, ABC):
                 Hook function to combine key gradients of loss of subsequent chunk
                 with respect to that of current chunk.
                 """
-                chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
-                if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                if self.config.sft_chunkpipe_mode:
+                    # SFT: use scheduler-provided chunk index
+                    chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                    is_last = (chunks_in_current_sequence >= self.config.chunkpipe_current_group_size - 1)
+                else:
+                    # Pretrain: derive from global counter
+                    chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    is_last = (chunks_in_current_sequence == self.num_chunks_per_seq - 1)
+                if is_last:
                     return grad
                 else:
-                    grad_from_prev_chunk = self.key_cache_grad.pop(chunks_in_current_sequence)
-                    return grad + grad_from_prev_chunk
+                    if self.config.sft_chunkpipe_mode:
+                        if chunks_in_current_sequence in self.key_cache_grad:
+                            grad_from_prev_chunk = self.key_cache_grad.pop(chunks_in_current_sequence)
+                            return grad + grad_from_prev_chunk
+                        else:
+                            assert False, (
+                                f"[ChunkPipe] key_cache_grad[{chunks_in_current_sequence}] not available "
+                                f"during backward. This indicates LIFO order violation in VPP backward "
+                                f"scheduling. layer={self.layer_number}, "
+                                f"bwd_mb={self.config.chunkpipe_backward_microbatch}"
+                            )
+                    else:
+                        grad_from_prev_chunk = self.key_cache_grad.pop(chunks_in_current_sequence)
+                        return grad + grad_from_prev_chunk
 
             def value_hook_fn(grad):
                 """
                 Hook function to combine value gradients of loss of subsequent chunk
                 with respect to that of current chunk.
                 """
-                chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
-                if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                if self.config.sft_chunkpipe_mode:
+                    # SFT: use scheduler-provided chunk index
+                    chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                    is_last = (chunks_in_current_sequence >= self.config.chunkpipe_current_group_size - 1)
+                else:
+                    # Pretrain: derive from global counter
+                    chunks_in_current_sequence = self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    is_last = (chunks_in_current_sequence == self.num_chunks_per_seq - 1)
+                if is_last:
                     return grad
                 else:
-                    grad_from_prev_chunk = self.value_cache_grad.pop(chunks_in_current_sequence)
-                    return grad + grad_from_prev_chunk
+                    if self.config.sft_chunkpipe_mode:
+                        if chunks_in_current_sequence in self.value_cache_grad:
+                            grad_from_prev_chunk = self.value_cache_grad.pop(chunks_in_current_sequence)
+                            return grad + grad_from_prev_chunk
+                        else:
+                            assert False, (
+                                f"[ChunkPipe] value_cache_grad[{chunks_in_current_sequence}] not available "
+                                f"during backward. This indicates LIFO order violation in VPP backward "
+                                f"scheduling. layer={self.layer_number}, "
+                                f"bwd_mb={self.config.chunkpipe_backward_microbatch}"
+                            )
+                    else:
+                        grad_from_prev_chunk = self.value_cache_grad.pop(chunks_in_current_sequence)
+                        return grad + grad_from_prev_chunk
 
             if self.is_enable_grad_chunkpipe():
                 key.register_hook(key_hook_fn)
@@ -1244,6 +1355,12 @@ class Attention(MegatronModule, ABC):
             # need to concat all chunk keys & values belong to the same sequence
             # key, value, attention_mask = self.concat_chunk_key_value(key, value, attention_mask)
             key, value, attention_mask = self.concat_cached_chunk_key_value(key, value, attention_mask)
+            if not self.config.sft_chunkpipe_mode or (
+                self.config.chunkpipe_current_group_size > 1
+                and self.config.chunkpipe_chunk_idx_in_group > 0
+            ):
+                attn_mask_type = AttnMaskType.causal_bottom_right
+                packed_seq_params = None
 
         # ==================================
         # core attention computation
@@ -1344,6 +1461,7 @@ class SelfAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(
             config=config,
@@ -1353,6 +1471,7 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if self.config.enable_chunkpipe:
@@ -1555,6 +1674,7 @@ class CrossAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(
             config=config,
@@ -1564,6 +1684,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:

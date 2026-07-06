@@ -95,6 +95,8 @@ def _apply_rotary_pos_emb_bshd(
     rotary_interleaved: bool = False,
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
 ) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
@@ -107,6 +109,12 @@ def _apply_rotary_pos_emb_bshd(
     Returns:
         Tensor: The input tensor after applying RoPE
     """
+    # Some callers may pass freqs with an extra singleton axis, e.g.
+    # t: [s, b, d] and freqs: [s, 1, 1, d]. In that case, broadcasting would
+    # accidentally expand to [s, s, b, d]. Squeeze the extra singleton axis.
+    if freqs.dim() == t.dim() + 1 and freqs.size(-2) == 1:
+        freqs = freqs.squeeze(-2)
+
     rot_dim = freqs.shape[-1]
 
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
@@ -121,8 +129,18 @@ def _apply_rotary_pos_emb_bshd(
     # second part is sine component, need to change signs with _rotate_half method
     cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
     sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+    if inverse:
+        sin_ = -sin_
 
     t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
+
+    # DSv4 applies rope on V and O, so we need to un-interleave the tensor
+    # after rotation. Existing MLA code is safe because the dot product is
+    # permutation-invariant.
+    if multi_latent_attention and mla_output_remove_interleaving:
+        x1, x2 = torch.chunk(t, 2, dim=-1)
+        t = torch.stack((x1, x2), dim=-1).flatten(start_dim=-2)
+
     return torch.cat((t, t_pass), dim=-1)
 
 
@@ -182,6 +200,8 @@ def _apply_rotary_pos_emb_thd(
     rotary_interleaved: bool = False,
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
     **kwargs,
 ) -> Tensor:
@@ -232,6 +252,8 @@ def _apply_rotary_pos_emb_thd(
             rotary_interleaved=rotary_interleaved,
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         ).squeeze(1)
 
     elif 'offsets' in kwargs:
@@ -252,6 +274,8 @@ def _apply_rotary_pos_emb_thd(
             rotary_interleaved=rotary_interleaved,
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         ).squeeze(1)
 
     else:
@@ -269,6 +293,8 @@ def _apply_rotary_pos_emb_thd(
             rotary_interleaved=rotary_interleaved,
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         ).squeeze(1)
 
 
@@ -279,6 +305,8 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
     **kwargs,
 ):
     """
@@ -306,6 +334,22 @@ def apply_rotary_pos_emb(
                     rotary_interleaved=config.rotary_interleaved,
                     multi_latent_attention=config.multi_latent_attention,
                     mscale=mscale,
+                    inverse=inverse,
+                    mla_output_remove_interleaving=mla_output_remove_interleaving,
+                )
+            elif inverse or mla_output_remove_interleaving:
+                warnings.warn(
+                    "inverse / mla_output_remove_interleaving RoPE is not supported by fused "
+                    "RoPE. Falling back to unfused implementation."
+                )
+                return _apply_rotary_pos_emb_bshd(
+                    t,
+                    freqs,
+                    rotary_interleaved=config.rotary_interleaved,
+                    multi_latent_attention=config.multi_latent_attention,
+                    mscale=mscale,
+                    inverse=inverse,
+                    mla_output_remove_interleaving=mla_output_remove_interleaving,
                 )
             else:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
@@ -323,6 +367,8 @@ def apply_rotary_pos_emb(
                 rotary_interleaved=config.rotary_interleaved,
                 multi_latent_attention=config.multi_latent_attention,
                 mscale=mscale,
+                inverse=inverse,
+                mla_output_remove_interleaving=mla_output_remove_interleaving,
             )
         else:
             return _apply_rotary_pos_emb_thd(
@@ -332,6 +378,8 @@ def apply_rotary_pos_emb(
                 rotary_interleaved=config.rotary_interleaved,
                 multi_latent_attention=config.multi_latent_attention,
                 mscale=mscale,
+                inverse=inverse,
+                mla_output_remove_interleaving=mla_output_remove_interleaving,
                 cp_group=cp_group,
                 **kwargs,
             )

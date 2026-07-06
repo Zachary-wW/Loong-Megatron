@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -26,7 +27,7 @@ from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, learned_output_contract
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -387,6 +388,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            # Learned output-contract parameters introduced by upstream PR #4518.
+            # head_fn projects [s,b,n*h] -> [s,b,n] via F.linear, so shape is [n, n*h].
+            # base is [n]; scale is [1] (broadcasts). Created only on the PP rank
+            # that owns final_layernorm — creating them on other ranks would leave
+            # ownerless params under multi-stage PP.
+            if self.config.enable_hyper_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.ones(1))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -833,9 +850,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
         # Only contract if the final layer norm is in this stage
+        mhc_multistream = None
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.num_residual_streams
+            # When MTP is enabled, save pre-contraction multi-stream for MTP input.
+            if self.config.mtp_num_layers is not None and self.config.mtp_num_layers > 0:
+                mhc_multistream = hidden_states
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.num_residual_streams,
+                eps=getattr(self.config, "layernorm_epsilon", 1e-6),
             )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
@@ -858,6 +884,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # which is now hidden_states after final layernorm processing
         # if mhc_manager is not None:
         #     mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        # When mHC + MTP, return both contracted [s,b,h] (for lm_head) and
+        # pre-contraction multi-stream [s,b,n*h] (for MTP input).
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
         return hidden_states
 
     def update_config(self, chunkpipe_forward, chunk_microbatch):
@@ -957,5 +987,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         module, f'{prefix}{name}.', sharded_offsets, metadata
                     )
                 )
+
+        # mHC learned output-contract parameters (direct attributes, not submodules).
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            from megatron.core.utils import make_sharded_tensor_for_checkpoint
+            state_dict = self.state_dict(prefix='', keep_vars=True)
+            for name in ('hc_head_fn', 'hc_head_base', 'hc_head_scale'):
+                if name in state_dict:
+                    sharded_state_dict[f'{prefix}{name}'] = make_sharded_tensor_for_checkpoint(
+                        state_dict[name], f'{prefix}{name}', prepend_offsets=sharded_offsets
+                    )
 
         return sharded_state_dict

@@ -304,7 +304,12 @@ def num_floating_point_operations(args, batch_size):
         expansion_factor = 3 * 2 * 2
 
         if args.multi_latent_attention:
-            assert not args.group_query_attention
+            # MLA + hybrid-attention models legitimately combine multi-latent
+            # attention with group_query_attention semantics
+            # (num_query_groups < num_attention_heads). The 0520 tree disabled
+            # this assertion for the same reason; keep the legacy MLA flop
+            # estimate below as an approximation.
+            # assert not args.group_query_attention
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -2608,8 +2613,9 @@ def evaluate(
             tmp_seq_length = args.seq_length
             if args.enable_chunkpipe:
                 num_chunks = args.seq_length // args.chunksize
-                tmp_num_microbatches *= num_chunks
                 tmp_seq_length = args.chunksize
+                if args.training_phase != "sft":
+                    tmp_num_microbatches *= num_chunks
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -2948,8 +2954,14 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             num_chunks = args.seq_length // args.chunksize
             if dataloader_type == "single":
                 return ChunkDataIterator(num_chunks, iter(dataloader))
+            elif dataloader_type == "external":
+                # SFT chunkpipe: chunks are already produced at dataset level,
+                # no need for ChunkDataIterator to split sequences.
+                if isinstance(dataloader, list):
+                    return [RerunDataIterator(d) for d in dataloader]
+                else:
+                    return RerunDataIterator(dataloader)
             else:
-                # TODO:only support "single" type, will support other type future
                 raise RuntimeError("unexpected dataloader type")
         else:
             if dataloader_type == "single":

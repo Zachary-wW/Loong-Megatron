@@ -57,7 +57,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         mtp_num_dense_layers = 0
 
     if args.multi_latent_attention:
-        assert not args.group_query_attention
+        # assert not args.group_query_attention  # Disabled: DSv4 MLA sets GQA internally
         if args.q_lora_rank is None:
             q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
         else:

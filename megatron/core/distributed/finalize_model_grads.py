@@ -281,7 +281,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+            if (
+                config.moe_router_enable_expert_bias
+                and hasattr(module, 'expert_bias')
+                and module.expert_bias is not None
+            ):
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
@@ -299,7 +303,7 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     expert_bias_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if hasattr(module, 'expert_bias'):
+            if hasattr(module, 'expert_bias') and module.expert_bias is not None:
                 # NEW: skip expert-bias updates for frozen routers.
                 # This prevents the main model from changing when its params are frozen,
                 # while still allowing MTP routers (trainable) to update.
@@ -343,7 +347,6 @@ def _allreduce_non_tensor_model_parallel_grads(
         ddp_config = model_chunk.ddp_config
         for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
             if param.requires_grad:
-                # Check if this param needs average reduction (average_gradients_across_tp_domain)
                 if getattr(param, "average_gradients_across_tp_domain", False):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
@@ -355,9 +358,10 @@ def _allreduce_non_tensor_model_parallel_grads(
                     else:
                         grad = _unshard_if_dtensor(grad)
                         grads_avg.append(grad.data)
-                # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+                elif (
+                    getattr(param, "allreduce_gradients_across_tp_domain", False)
+                    or (config.sequence_parallel and getattr(param, "sequence_parallel", False))
+                    or (config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name))
                 ):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)

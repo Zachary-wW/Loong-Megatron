@@ -56,6 +56,7 @@ class BaseMoELayer(MegatronModule, ABC):
         config: TransformerConfig,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
@@ -83,6 +84,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.shared_experts = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
 
     @abstractmethod
     def forward(self, hidden_states):
@@ -109,6 +111,7 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -116,7 +119,10 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         self.moe_layer_recompute = (
             config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
@@ -131,7 +137,12 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+        self.router = TopKRouter(
+            config=self.config,
+            pg_collection=pg_collection,
+            layer_number=layer_number,
+            is_mtp_layer=self.is_mtp_layer,
+        )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -184,7 +195,9 @@ class MoELayer(BaseMoELayer):
                 mem_monitor_force_print_token_threshold=config.moe_mem_monitor_force_print_token_threshold
             )
 
-    def router_and_preprocess(self, hidden_states: torch.Tensor):
+    def router_and_preprocess(
+        self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+    ):
         """Compute and preprocess token routing for dispatch.
 
         This method uses the router to determine which experts to send each token to,
@@ -193,7 +206,7 @@ class MoELayer(BaseMoELayer):
         hidden states are returned as a residual connection.
         """
         residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map = self.router(hidden_states, input_ids=input_ids)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -293,7 +306,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -304,11 +317,18 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor to the MoE layer.
+            input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
+                Only used for hash-based MoE routing. Defaults to None.
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
-        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+        if (
+            self.training
+            and self.attn_tp_group.size() > 1
+            and not self.config.sequence_parallel
+            and self.config.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
@@ -317,7 +337,9 @@ class MoELayer(BaseMoELayer):
         # MoE forward: route -> dispatch -> compute -> combine -> post-combine
         def custom_forward(hidden_states):
             shared_expert_output = self.shared_experts_compute(hidden_states)
-            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+            hidden_states, probs, residual = self.router_and_preprocess(
+                hidden_states, input_ids=input_ids
+            )
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             dispatched_input, tokens_per_expert, permuted_probs = self.pre_routed_experts_compute(
                 dispatched_input, probs)
@@ -328,7 +350,9 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         def custom_forward_exclude_shared_experts(hidden_states):
-            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+            hidden_states, probs, residual = self.router_and_preprocess(
+                hidden_states, input_ids=input_ids
+            )
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             dispatched_input, tokens_per_expert, permuted_probs = self.pre_routed_experts_compute(
                 dispatched_input, probs)

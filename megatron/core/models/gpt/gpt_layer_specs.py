@@ -464,6 +464,7 @@ def get_gpt_decoder_block_spec(
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
+            experimental_attention_variant=getattr(config, "experimental_attention_variant", None),
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
@@ -475,6 +476,7 @@ def get_gpt_decoder_block_spec(
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
+            experimental_attention_variant=getattr(config, "experimental_attention_variant", None),
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
@@ -488,6 +490,7 @@ def get_gpt_decoder_block_spec(
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
+            experimental_attention_variant=getattr(config, "experimental_attention_variant", None),
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
@@ -499,6 +502,7 @@ def get_gpt_decoder_block_spec(
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
+            experimental_attention_variant=getattr(config, "experimental_attention_variant", None),
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
@@ -604,14 +608,16 @@ def get_gpt_mtp_block_spec_for_backend(
     else:
         raise ValueError(f"Invalid spec: {spec}")
 
-    # TODO: support hyper connections for mtp. 
-    # Remove all hyper connections in transformer_layer_spec
-    transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
-    transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp
-    transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
+    # Per upstream PR #4518: only strip hyper-connection submodules when mHC is disabled.
+    if not config.enable_hyper_connections:
+        transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
+        transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp
+        transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
-        transformer_layer_spec=transformer_layer_spec, backend=backend
+        transformer_layer_spec=transformer_layer_spec,
+        backend=backend,
+        enable_hyper_connections=config.enable_hyper_connections,
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
