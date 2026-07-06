@@ -1,7 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+"""Fused SwiGLU activation functions and autograd wrappers."""
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
+
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +13,34 @@ from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
+
+
+class BiasSwiGLUGradients(NamedTuple):
+    """Gradients returned by BiasSwiGLUFunction.backward."""
+
+    input_grad: torch.Tensor
+    bias_grad: torch.Tensor
+    fp8_input_store_grad: None
+    cpu_offload_input_grad: None
+    clamp_value_grad: None
+
+
+class SwiGLUGradients(NamedTuple):
+    """Gradients returned by SwiGLUFunction.backward."""
+
+    input_grad: torch.Tensor
+    fp8_input_store_grad: None
+    cpu_offload_input_grad: None
+    clamp_value_grad: None
+
+
+class WeightedSwiGLUGradients(NamedTuple):
+    """Gradients returned by WeightedSwiGLUFunction.backward."""
+
+    input_grad: torch.Tensor
+    weights_grad: torch.Tensor
+    fp8_input_store_grad: None
+    clamp_value_grad: None
 
 
 @jit_fuser
@@ -43,9 +74,70 @@ def bias_swiglu(y, bias):
 
 @jit_fuser
 def weighted_swiglu(y, weights):
+    """Apply SwiGLU activation and token-wise weights.
+
+    Args:
+        y (torch.Tensor): Input tensor to split and activate.
+        weights (torch.Tensor): Weights multiplied with the activated tensor.
+
+    Returns:
+        torch.Tensor: Weighted SwiGLU activation with the original input dtype.
+    """
     dtype = y.dtype
     res = swiglu(y) * weights
     return res.to(dtype)
+
+
+@jit_fuser
+def clamped_swiglu(y, clamp_value):
+    """Apply SwiGLU activation with clamped gate and value tensors.
+
+    Args:
+        y (torch.Tensor): Input tensor to split and activate.
+        clamp_value (float): Maximum absolute value used for clamping.
+
+    Returns:
+        torch.Tensor: Clamped SwiGLU activation with the original input dtype.
+    """
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
+    y_1 = y_1.clamp(min=None, max=clamp_value)
+    y_2 = y_2.clamp(min=-clamp_value, max=clamp_value)
+    res = F.silu(y_1) * y_2
+    return res.to(dtype)
+
+
+@jit_fuser
+def clamped_weighted_swiglu(y, weights, clamp_value):
+    """Apply clamped SwiGLU activation and token-wise weights.
+
+    Args:
+        y (torch.Tensor): Input tensor to split and activate.
+        weights (torch.Tensor): Weights multiplied with the activated tensor.
+        clamp_value (float): Maximum absolute value used for clamping.
+
+    Returns:
+        torch.Tensor: Weighted clamped SwiGLU activation with the original input dtype.
+    """
+    dtype = y.dtype
+    res = clamped_swiglu(y, clamp_value) * weights
+    return res.to(dtype)
+
+
+@jit_fuser
+def bias_clamped_swiglu(y, bias, clamp_value):
+    """Apply bias addition followed by clamped SwiGLU activation.
+
+    Args:
+        y (torch.Tensor): Input tensor to activate.
+        bias (torch.Tensor): Bias tensor added before activation.
+        clamp_value (float): Maximum absolute value used for clamping.
+
+    Returns:
+        torch.Tensor: Clamped SwiGLU activation after bias addition.
+    """
+    y = y + bias
+    return clamped_swiglu(y, clamp_value)
 
 
 # gradient of tanh approximation of gelu
@@ -88,6 +180,16 @@ def bias_swiglu_back(g, y, bias):
 
 @jit_fuser
 def weighted_swiglu_back(g, y, weights):
+    """Compute gradients for weighted SwiGLU activation.
+
+    Args:
+        g (torch.Tensor): Output gradient from the following layer.
+        y (torch.Tensor): Forward input tensor.
+        weights (torch.Tensor): Forward token-wise weights.
+
+    Returns:
+        tuple: Input gradient and weight gradient.
+    """
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
@@ -97,12 +199,80 @@ def weighted_swiglu_back(g, y, weights):
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+@jit_fuser
+def clamped_swiglu_back(g, y, clamp_value):
+    """Compute gradients for clamped SwiGLU activation.
+
+    Args:
+        g (torch.Tensor): Output gradient from the following layer.
+        y (torch.Tensor): Forward input tensor.
+        clamp_value (float): Maximum absolute value used for clamping.
+
+    Returns:
+        torch.Tensor: Gradient with respect to the input tensor.
+    """
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
+    y_1c = y_1.clamp(min=None, max=clamp_value)
+    y_2c = y_2.clamp(min=-clamp_value, max=clamp_value)
+    res = torch.cat(
+        (
+            g
+            * torch.sigmoid(y_1c)
+            * (1 + y_1c * (1 - torch.sigmoid(y_1c)))
+            * y_2c
+            * (y_1 <= clamp_value).to(g.dtype),
+            g * F.silu(y_1c) * ((y_2 >= -clamp_value) & (y_2 <= clamp_value)).to(g.dtype),
+        ),
+        -1,
+    )
+    return res.to(dtype)
+
+
+@jit_fuser
+def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
+    """Compute gradients for weighted clamped SwiGLU activation.
+
+    Args:
+        g (torch.Tensor): Output gradient from the following layer.
+        y (torch.Tensor): Forward input tensor.
+        weights (torch.Tensor): Forward token-wise weights.
+        clamp_value (float): Maximum absolute value used for clamping.
+
+    Returns:
+        tuple: Input gradient and weight gradient.
+    """
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+    input_grad = clamped_swiglu_back(g * weights, y, clamp_value)
+    weights_grad = clamped_swiglu(y, clamp_value) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+@jit_fuser
+def bias_clamped_swiglu_back(g, y, bias, clamp_value):
+    """Compute gradients for biased clamped SwiGLU activation.
+
+    Args:
+        g (torch.Tensor): Output gradient from the following layer.
+        y (torch.Tensor): Forward input tensor.
+        bias (torch.Tensor): Bias tensor used in the forward pass.
+        clamp_value (float): Maximum absolute value used for clamping.
+
+    Returns:
+        torch.Tensor: Gradient with respect to the biased input tensor.
+    """
+    y = y + bias
+    return clamped_swiglu_back(g, y, clamp_value)
+
+
 class BiasSwiGLUFunction(torch.autograd.Function):
     """Custom autograd function for SwiGLU activation with bias support."""
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, bias, fp8_input_store, cpu_offload_input):
+    def forward(ctx, input, bias, fp8_input_store, cpu_offload_input, clamp_value):
         """Forward pass of biased SwiGLU activation.
 
         Args:
@@ -121,6 +291,9 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward, bias)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
+        ctx.clamp_value = clamp_value
+        if clamp_value is not None and clamp_value > 0:
+            return bias_clamped_swiglu(input, bias, clamp_value)
         return bias_swiglu(input, bias)
 
     @staticmethod
@@ -140,8 +313,17 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         """
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp = bias_swiglu_back(grad_output, input, bias)
-        return tmp, tmp, None, None
+        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+            tmp = bias_clamped_swiglu_back(grad_output, input, bias, ctx.clamp_value)
+        else:
+            tmp = bias_swiglu_back(grad_output, input, bias)
+        return BiasSwiGLUGradients(
+            input_grad=tmp,
+            bias_grad=tmp,
+            fp8_input_store_grad=None,
+            cpu_offload_input_grad=None,
+            clamp_value_grad=None,
+        )
 
 
 class SwiGLUFunction(torch.autograd.Function):
@@ -149,7 +331,7 @@ class SwiGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, fp8_input_store, cpu_offload_input):
+    def forward(ctx, input, fp8_input_store, cpu_offload_input, clamp_value):
         """Forward pass of SwiGLU activation.
 
         Args:
@@ -166,6 +348,9 @@ class SwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
+        ctx.clamp_value = clamp_value
+        if clamp_value is not None and clamp_value > 0:
+            return clamped_swiglu(input, clamp_value)
         return swiglu(input)
 
     @staticmethod
@@ -184,29 +369,72 @@ class SwiGLUFunction(torch.autograd.Function):
         """
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp = swiglu_back(grad_output, input)
-        return tmp, None, None
+        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+            tmp = clamped_swiglu_back(grad_output, input, ctx.clamp_value)
+        else:
+            tmp = swiglu_back(grad_output, input)
+        return SwiGLUGradients(
+            input_grad=tmp,
+            fp8_input_store_grad=None,
+            cpu_offload_input_grad=None,
+            clamp_value_grad=None,
+        )
 
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
+    """Custom autograd function for token-wise weighted SwiGLU activation."""
+
     @staticmethod
-    # bias is an optional argument
-    def forward(ctx, input, weights, fp8_input_store):
+    def forward(ctx, input, weights, fp8_input_store, clamp_value):
+        """Run weighted SwiGLU forward pass.
+
+        Args:
+            ctx: Autograd context object for saving tensors for backward pass.
+            input (torch.Tensor): Input tensor to apply SwiGLU to.
+            weights (torch.Tensor): Token-wise weights multiplied with the activation.
+            fp8_input_store (bool): If True, stores intermediate values in FP8 format.
+            clamp_value (float): Optional maximum absolute value used for clamping.
+
+        Returns:
+            torch.Tensor: Weighted SwiGLU activation.
+        """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return weighted_swiglu(input, weights)
+        ctx.clamp_value = clamp_value
+        if clamp_value is not None and clamp_value > 0:
+            res = clamped_weighted_swiglu(input, weights, clamp_value)
+        else:
+            res = weighted_swiglu(input, weights)
+        return res
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run weighted SwiGLU backward pass.
+
+        Args:
+            ctx: Autograd context object containing saved tensors from forward pass.
+            grad_output (torch.Tensor): Gradient of the loss with respect to the output.
+
+        Returns:
+            tuple: Gradients for input, weights, fp8_input_store, and clamp_value.
+        """
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None
+        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+            tmp, wgrad = clamped_weighted_swiglu_back(grad_output, input, weights, ctx.clamp_value)
+        else:
+            tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        return WeightedSwiGLUGradients(
+            input_grad=tmp,
+            weights_grad=wgrad,
+            fp8_input_store_grad=None,
+            clamp_value_grad=None,
+        )
 
 
-def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
+def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False, clamp_value=None):
     """Implementation of biased SwiGLU that handles different input shapes.
 
     This function reshapes the input if necessary, applies the SwiGLU activation
@@ -229,14 +457,14 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
-        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
+        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input, clamp_value)
     else:
-        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
+        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input, clamp_value)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, clamp_value=None):
     """
     Token-wise-weighted bias swiglu fusion.
     """
@@ -246,7 +474,7 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, clamp_value)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

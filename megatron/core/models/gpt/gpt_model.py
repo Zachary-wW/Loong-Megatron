@@ -161,7 +161,7 @@ class GPTModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -252,6 +252,8 @@ class GPTModel(LanguageModule):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
             )
+
+
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
@@ -344,7 +346,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -451,8 +453,13 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[5] if len(preproc_output) == 6 else None
 
+        # Pass input_ids to decoder for hash-based MoE routing
+        decoder_extra_block_kwargs = extra_block_kwargs or {}
+        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+            decoder_extra_block_kwargs['input_ids'] = input_ids
+
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -462,8 +469,15 @@ class GPTModel(LanguageModule):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            **(extra_block_kwargs or {}),
+            **decoder_extra_block_kwargs,
         )
+        # When mHC + MTP, the decoder returns (contracted, multi-stream).
+        # MTP needs multi-stream; lm_head needs contracted.
+        if isinstance(decoder_output, tuple):
+            hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+            mhc_multistream = None
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -483,6 +497,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            mhc_multistream=mhc_multistream,
         )
 
     def _postprocess(
@@ -504,6 +519,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        mhc_multistream=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -524,6 +540,7 @@ class GPTModel(LanguageModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,

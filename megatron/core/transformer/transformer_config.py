@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, LayerType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -180,7 +180,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu."""
+    is quick_gelu or weighted SwiGLU (MoE only)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -243,6 +243,22 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    ####################
+    # DeepSeek-v4 hybrid attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios for DSv4 hybrid attention, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
@@ -490,6 +506,17 @@ class TransformerConfig(ModelParallelConfig):
     chunkpipe_backward_microbatch: int = 0
     """microbatch num for chunk pipe backward"""
 
+    chunkpipe_current_group_size: int = 0
+    """Runtime mutable field. The chunk_group_size of the group currently
+    being processed by the scheduler. For pretrain this equals chunk_num_per_seq;
+    for SFT it varies per group (1 for binpacked, >1 for long sequences)."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime mutable field. The index of the current chunk within its group
+    (0-based). Set by the scheduler before each forward_step. Avoids relying
+    on chunkpipe_forward_microbatch % group_size which breaks when group sizes
+    vary across groups in SFT."""
+
     chunk_keys: dict[int, Any] = None
     """caches for keys"""
 
@@ -498,6 +525,10 @@ class TransformerConfig(ModelParallelConfig):
 
     chunkpipe_forward: bool = False
     """chunkpipe forward"""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether chunkpipe is running in SFT mode (dynamic group_size).
+    Enabled when training_phase == 'sft' and enable_chunkpipe is True."""
 
 
     ####################
@@ -602,8 +633,17 @@ class TransformerConfig(ModelParallelConfig):
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
     moe_router_force_load_balancing: bool = False
-    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
+    lookup table for expert selection instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
+    tid2eid lookup buffer in hash-based MoE routing."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -792,8 +832,12 @@ class TransformerConfig(ModelParallelConfig):
     https://arxiv.org/abs/2601.05732"""
 
     mhc_use_triton_fused_kernel: bool = False
-    """Enable mHC Triton fused kernel. 
+    """Enable mHC Triton fused kernel.
     https://github.com/WithNucleusAI/mHC-triton/tree/main"""
+
+    use_fused_mhc: bool = False
+    """Use the fused mHC pre/post forward kernels in megatron.core.transformer.fused_mhc_kernels.
+    Read by HyperConnectionModule when enable_hyper_connections=True."""
 
     ####################
     # miscellaneous
@@ -918,6 +962,23 @@ class TransformerConfig(ModelParallelConfig):
         self.chunk_keys = {}
         self.chunk_values = {}
 
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
+            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
+            mtp_layers = getattr(self, "mtp_num_layers", 0) or 0
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) == expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
+            # sequence_parallel is supported for DSv4 Hybrid Attention
+            assert not getattr(self, "qk_clip", False), (
+                "QK clipping is not supported with DSv4 Hybrid Attention."
+            )
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
@@ -942,7 +1003,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
 
-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+        if (
+            self.num_query_groups % self.tensor_model_parallel_size != 0
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError(
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
@@ -1244,7 +1308,7 @@ class TransformerConfig(ModelParallelConfig):
         # and their gradients need to be synchronized across TP ranks via the sequence_parallel
         # attribute mechanism.
         if self.enable_hyper_connections and self.tensor_model_parallel_size > 1:
-            if not self.sequence_parallel:
+            if not self.sequence_parallel and self.experimental_attention_variant != "dsv4_hybrid":
                 raise ValueError(
                     "When enable_hyper_connections=True and tensor_model_parallel_size > 1, "
                     "sequence_parallel must be True. HyperConnectionModule parameters require "
@@ -1538,6 +1602,19 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
+        if self.activation_func_clamp_value is not None:
+            # swiglu
+            if self.activation_func == F.silu and self.gated_linear_unit:
+                if self.num_moe_experts is None:
+                    raise ValueError(
+                        "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                    )
+                if self.use_te_activation_func:
+                    raise ValueError(
+                        "use_te_activation_func must be False "
+                        "when activation_func_clamp_value is not None for SwiGLU"
+                    )
+
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
                 warnings.warn(
@@ -1604,6 +1681,36 @@ class TransformerConfig(ModelParallelConfig):
         #        "Expert bias for aux-loss-free routing only supports sigmoid score function."
         #        "Please set --moe-router-score-function sigmoid for sigmoid score function."
         #    )
+
+        if self.moe_n_hash_layers > 0:
+            assert (
+                self.actual_vocab_size is not None
+            ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
+            if self.pipeline_model_parallel_size > 1:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
+                # All hash MoE layers must be in the same virtual pipeline stage.
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
+                    f"as the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
+            warnings.warn(
+                "Hash MoE layer initialized with placeholder round-robin tid2eid. "
+                "For real training, you MUST either (a) load tid2eid from a "
+                "pre-trained DSv4 checkpoint, or (b) provide a frequency-aware "
+                "initialization (e.g., Sinkhorn-balanced over token frequency). "
+                "Round-robin will cause severe expert imbalance."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
@@ -1845,7 +1952,17 @@ class TransformerConfig(ModelParallelConfig):
                 "pre_mlp_layernorm",
                 "router",
                 "self_attention_hyper_connection",
-                "mlp_hyper_connection"
+                "mlp_hyper_connection",
+                "attn_hc",
+                "ffn_hc",
+                "hc_head",
+                "sinks",
+                "position_bias",
+                "e_score_correction_bias",
+                "q_a_norm",
+                "kv_norm",
+                "post_attention_layernorm",
+                "norm",
             }
             invalid_modules = set(self.use_fp32_dtype_for_param_pattern) - allowed_modules
             assert not invalid_modules, (
@@ -1909,6 +2026,12 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a) in DSv4 hybrid attention."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
@@ -1921,6 +2044,16 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert (
+                not getattr(self, "mla_down_proj_fusion", False)
+            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            self.qk_head_dim = derived
+            self.kv_lora_rank = derived
+            self.hetereogenous_dist_checkpoint = True
 
         if self.cache_mla_latents:
             assert (

@@ -2,6 +2,7 @@
 Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 """
 
+import os
 import copy
 import math
 from dataclasses import dataclass
@@ -169,6 +170,7 @@ def compute_dsa_indexer_loss(
     loss_coeff: float,
     sparse_loss: bool,
     pg_collection: ProcessGroupCollection,
+    causal_mask_override: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -205,28 +207,58 @@ def compute_dsa_indexer_loss(
     # Reshape to [b, np, sq, sk]
     attention_scores = attention_scores.reshape(b, np, sq, sk)
 
-    # causal_mask [sq, sk]
-    causal_mask = torch.triu(
-        torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
-        diagonal=1,
-    )
+    # causal_mask: use caller-provided mask when available (handles compressed KV),
+    # otherwise fall back to standard upper-triangular causal mask.
+    if causal_mask_override is not None:
+        causal_mask = causal_mask_override.to(dtype=torch.float32)  # [b, sq, sk]
+    else:
+        causal_mask = torch.triu(
+            torch.full(
+                (sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device
+            ),
+            diagonal=1,
+        )
     # index_mask [b, sq, sk]
     index_mask = torch.full(
         (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
     ).scatter_(-1, topk_indices, 0)
 
-    # [b, np, sq, skv] + [1, 1, sq, skv] -> [b, np, sq, skv]
-    attention_scores += causal_mask.view(1, 1, sq, sk)
+    # Apply causal mask to attention_scores
+    # causal_mask: [b, sq, sk] (from causal_mask_override) or [sq, sk] (from triu)
+    if causal_mask.dim() == 3:
+        attention_scores = attention_scores + causal_mask.unsqueeze(1)  # [b,1,sq,sk]
+    else:
+        attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
     if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
         attention_scores += index_mask.view(b, 1, sq, sk)
         # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
         index_scores += index_mask
 
+    # Identify rows where all KV positions are masked (e.g., early query positions with
+    # compress_ratio=4 have zero valid compressed KV entries). These rows would produce NaN
+    # from softmax(all -inf). Zero out their logits before softmax and mask out their
+    # contributions after, so NaN is never produced.
+    row_valid = (causal_mask > float('-inf')).any(dim=-1)
+    if row_valid.dim() == 1:
+        attn_row_mask = row_valid.view(1, 1, sq, 1)
+        idx_row_mask = row_valid.view(1, sq, 1)
+    else:
+        attn_row_mask = row_valid.view(b, 1, sq, 1)
+        idx_row_mask = row_valid.view(b, sq, 1)
+
+    # Zero out fully-masked rows before softmax so it produces valid uniform distribution
+    attention_scores = attention_scores.masked_fill(~attn_row_mask, 0.0)
+    index_scores = index_scores.masked_fill(~idx_row_mask, 0.0)
+
     # [b, np, sq, sk] -> [b, np, sq, sk]
     attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
     # [b, sq, sk] -> [b, sq, sk]
     index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+
+    # Zero out invalid rows so they contribute nothing to loss/gradients
+    attention_scores = attention_scores * attn_row_mask.float()
+    index_scores = index_scores * idx_row_mask.float()
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
@@ -236,7 +268,9 @@ def compute_dsa_indexer_loss(
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
     # obtained from softmax so they are already non-negative.
-    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True)
+    attention_scores = attention_scores / (
+        attention_scores.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    )
 
     # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
     # kl_per_element [b, sq, sk]
@@ -252,6 +286,325 @@ def compute_dsa_indexer_loss(
     indexer_loss = kl_div * loss_coeff
 
     return indexer_loss
+
+
+def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """
+    Perform index score using BF16 precision.
+
+    Reference:
+        https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
+    This is a BF16 implementation of the `fp8_index` logic:
+        1. Compute attention scores: q @ k^T;
+        2. Apply ReLU activation;
+        3. Weight by attention weights;
+        4. Sum across attention heads.
+
+    Args:
+        q: BF16 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
+        weights: BF16 [seqlen_q, batch, index_n_heads], the attention weights.
+        k: BF16 [seqlen_k, batch, index_head_dim], the key tensor.
+
+    Returns:
+        index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
+    """
+    index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+    index_scores = torch.relu(index_scores)
+    index_scores = index_scores * weights.unsqueeze(-1)
+    index_scores = index_scores.sum(dim=2)
+    index_scores = index_scores.transpose(0, 1)
+    return index_scores
+
+
+def _compute_index_scores_chunked(
+    q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    """Chunked-on-sq variant of `_compute_index_scores`.
+
+    Splits the sq dimension to avoid materializing the full
+    [s, b, h, t] fp32 score tensor (which is ~1024 GiB at s=131072,
+    h=64, t=32768). Each chunk is wrapped in torch.utils.checkpoint
+    so backward also runs chunk-by-chunk -- peak memory stays at
+    O(chunk_size * b * h * t * 4 bytes).
+    """
+    s, _, _, _ = q.shape
+    k_f = k.float()
+
+    def _chunk_fwd(qc, wc, kk_f):
+        sc = torch.einsum('sbhd,tbd->sbht', qc.float(), kk_f)
+        sc = torch.relu(sc) * wc.unsqueeze(-1)
+        return sc.sum(dim=2).transpose(0, 1)  # [b, c, t]
+
+    out_chunks = []
+    for i in range(0, s, chunk_size):
+        j = min(i + chunk_size, s)
+        out_chunks.append(
+            torch.utils.checkpoint.checkpoint(
+                _chunk_fwd, q[i:j], weights[i:j], k_f, use_reentrant=False
+            )
+        )
+    return torch.cat(out_chunks, dim=1)  # [b, s, t]
+
+def fused_qk_topk_naive(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    mask: Optional[torch.Tensor] = None,
+):
+    """Naive implementation of QK Topk."""
+    seqlen = q.size(0)
+    _chunk = int(os.environ.get('DSA_INDEX_CHUNK_SIZE', '0'))
+    if _chunk > 0:
+        index_scores = _compute_index_scores_chunked(q, weights, k, _chunk)
+    else:
+        index_scores = _compute_index_scores(q, weights, k)
+    if mask is not None:
+        assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+        index_scores = index_scores + mask
+
+    topk_k = min(index_topk, seqlen)
+    topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+
+    return index_scores, topk_indices
+
+
+def fwd_fused_indexer_loss_naive(
+    q, weights, k, query, key, topk, softmax_scale, loss_coeff, mask, sparse_loss, pg_collection
+):
+    """Naive implementation of forward pass for indexer loss."""
+    index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
+
+    indexer_loss = compute_dsa_indexer_loss(
+        index_scores,
+        topk_indices,
+        query,
+        key,
+        softmax_scale,
+        loss_coeff,
+        sparse_loss,
+        pg_collection,
+        causal_mask_override=mask,
+    )
+
+    return topk_indices, indexer_loss
+
+
+def bwd_fused_indexer_loss_naive(
+    q,
+    weights,
+    k,
+    query,
+    key,
+    topk_indices,
+    softmax_scale,
+    loss_coeff,
+    sparse_loss,
+    grad_loss,
+    pg_collection,
+    causal_mask_override=None,
+):
+    """Naive implementation of backward pass for indexer loss."""
+    _chunk = int(os.environ.get('DSA_INDEX_CHUNK_SIZE', '0'))
+    if _chunk > 0:
+        index_scores = _compute_index_scores_chunked(q, weights, k, _chunk)  # [B, Sq, Sk]
+    else:
+        index_scores = _compute_index_scores(q, weights, k)  # [B, Sq, Sk]
+
+    sq, b, np, hn = query.size()
+    sk = key.size(0)
+
+    query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+    key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
+    attention_scores = torch.bmm(query_reshaped.float(), key_reshaped.float()) * softmax_scale
+    del query_reshaped, key_reshaped
+
+    attention_scores = attention_scores.reshape(b, np, sq, sk)
+
+    if causal_mask_override is not None:
+        causal_mask = causal_mask_override.to(dtype=torch.float32)  # [b, sq, sk]
+    else:
+        causal_mask = torch.triu(
+            torch.full(
+                (sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device
+            ),
+            diagonal=1,
+        )
+    index_mask = torch.full(
+        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
+    ).scatter_(-1, topk_indices, 0)
+
+    if causal_mask.dim() == 3:
+        attention_scores = attention_scores + causal_mask.unsqueeze(1)
+        index_scores = index_scores + causal_mask
+    else:
+        attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
+        index_scores = index_scores + causal_mask.unsqueeze(0)
+
+    if sparse_loss:
+        attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
+        index_scores = index_scores + index_mask
+
+    row_valid = (causal_mask > float('-inf')).any(dim=-1)
+    del causal_mask
+    if row_valid.dim() == 1:
+        attn_row_mask = row_valid.view(1, 1, sq, 1)
+        idx_row_mask = row_valid.view(1, sq, 1)
+    else:
+        attn_row_mask = row_valid.view(b, 1, sq, 1)
+        idx_row_mask = row_valid.view(b, sq, 1)
+
+    attention_scores = attention_scores.masked_fill(~attn_row_mask, 0.0)
+    index_scores = index_scores.masked_fill(~idx_row_mask, 0.0)
+
+    attention_scores_softmax = torch.nn.functional.softmax(
+        attention_scores, dim=-1, dtype=torch.float32
+    )
+    del attention_scores
+
+    index_scores_softmax = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    del index_scores
+
+    attention_scores_softmax = attention_scores_softmax * attn_row_mask.float()
+    index_scores_softmax = index_scores_softmax * idx_row_mask.float()
+
+    attention_scores_sum = attention_scores_softmax.sum(dim=1)
+    del attention_scores_softmax
+
+    if pg_collection.tp.size() > 1:
+        torch.distributed.all_reduce(attention_scores_sum.contiguous(), group=pg_collection.tp)
+
+    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
+        dim=-1, keepdim=True
+    ).clamp(min=1e-10)
+    del attention_scores_sum
+
+    grad_kl_div = grad_loss * loss_coeff
+    grad_kl_per_row = grad_kl_div / (b * sq)
+    grad_kl_per_element = grad_kl_per_row.view(1, 1, 1).expand(b, sq, sk)
+
+    grad_index_scores_softmax = (
+        -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
+    )
+    del attention_scores_normalized
+
+    sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
+    grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
+    del index_scores_softmax, grad_index_scores_softmax, sum_grad
+
+    if causal_mask_override is not None:
+        _cm = causal_mask_override.to(dtype=torch.float32)
+        if _cm.dim() == 2:
+            _cm = _cm.unsqueeze(0)
+        causal_valid_mask = (_cm == 0).squeeze(0) if _cm.shape[0] == 1 else (_cm == 0)
+    else:
+        causal_valid_mask = torch.tril(torch.ones((sq, sk), device=q.device, dtype=torch.bool))
+
+    if causal_valid_mask.dim() == 2:
+        causal_valid_mask = causal_valid_mask.unsqueeze(0)
+    causal_valid_mask = causal_valid_mask.expand(b, sq, sk)
+
+    if sparse_loss:
+        index_valid_mask = index_mask == 0
+        del index_mask
+        valid_mask = causal_valid_mask & index_valid_mask
+        del index_valid_mask
+    else:
+        del index_mask
+        valid_mask = causal_valid_mask
+    del causal_valid_mask
+
+    grad_index_scores_logits = grad_index_scores_logits * valid_mask.float()
+    del valid_mask
+
+    grad_index_scores = grad_index_scores_logits.transpose(0, 1)
+    del grad_index_scores_logits
+
+    grad_weighted_scores = grad_index_scores.unsqueeze(2)
+    del grad_index_scores
+
+    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+    relu_mask = scores > 0
+    scores_after_relu = torch.relu(scores)
+    del scores
+
+    grad_weights = (grad_weighted_scores * scores_after_relu).sum(dim=-1)
+
+    grad_scores_after_relu = grad_weighted_scores * weights.unsqueeze(-1)
+    del grad_weighted_scores, scores_after_relu
+
+    grad_scores = grad_scores_after_relu * relu_mask.float()
+    del grad_scores_after_relu, relu_mask
+
+    grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())
+    grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())
+    del grad_scores
+
+    return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
+
+
+class FusedDSAIndexerLoss(torch.autograd.Function):
+    """Fused implementation of DSA Indexer Loss."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        weights,
+        k,
+        query,
+        key,
+        softmax_scale,
+        topk,
+        loss_coeff,
+        mask,
+        sparse_loss,
+        pg_collection,
+    ):
+        """Fused forward: index_scores never materialized in full."""
+        topk_indices, loss = fwd_fused_indexer_loss_naive(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            topk,
+            softmax_scale,
+            loss_coeff,
+            mask,
+            sparse_loss,
+            pg_collection,
+        )
+
+        ctx.save_for_backward(q, weights, k, query, key, topk_indices, mask)
+        ctx.softmax_scale = softmax_scale
+        ctx.loss_coeff = loss_coeff
+        ctx.sparse_loss = sparse_loss
+        ctx.pg_collection = pg_collection
+
+        return topk_indices, loss
+
+    @staticmethod
+    def backward(ctx, grad_topk_indices, grad_loss):
+        """Backward: recompute what we need."""
+        q, weights, k, query, key, topk_indices, mask = ctx.saved_tensors
+
+        grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            topk_indices,
+            ctx.softmax_scale,
+            ctx.loss_coeff,
+            ctx.sparse_loss,
+            grad_loss,
+            ctx.pg_collection,
+            causal_mask_override=mask,
+        )
+
+        return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -712,11 +1065,11 @@ class DSAttention(MegatronModule):
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
         self.layer_number = layer_number
-
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=pg_collection
         )
@@ -798,9 +1151,9 @@ class DSAttention(MegatronModule):
         # ===================================
         # Attach indexer loss
         # ===================================
-        if self.training and torch.is_grad_enabled():
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', None)
+        if self.training and torch.is_grad_enabled() and indexer_loss_coeff is not None:
             # Compute KL divergence loss between indexer scores and true attention scores
-            indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
             indexer_loss = compute_dsa_indexer_loss(
                 index_scores,
                 topk_indices,

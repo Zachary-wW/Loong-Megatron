@@ -581,6 +581,9 @@ class MHCBlockRecomputeManager:
     def __init__(self):
         """Initialize the MHCBlockRecomputeManager."""
         self.checkpoints = []
+        # Set by TransformerBlock before each layer forward; consumed by upstream
+        # mHC/recompute callers (DeepSeek-V4 alignment, ref upstream PR #4518).
+        self.is_last_layer_in_recompute_block = False
 
     def add_checkpoint(self, ckpt):
         """
@@ -637,6 +640,9 @@ class MHCBlockRecomputeManager:
 
 # Backward compatibility alias
 BlockLevelCheckpointManager = MHCBlockRecomputeManager
+# Upstream Megatron-LM rename (PR #2943 / #4518). Alias kept so call-sites using
+# either name resolve to the same implementation.
+CheckpointManager = MHCBlockRecomputeManager
 
 
 class CheckpointWithoutOutput(object):

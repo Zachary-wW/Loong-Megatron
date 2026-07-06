@@ -308,6 +308,7 @@ def no_rope_freq_type(x):
         # it's a single int but in str
         return int(x)
 
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -1261,14 +1262,52 @@ def validate_args(args, defaults={}):
         assert not args.create_attention_mask_in_dataloader, "miss no-create-attention-mask-in-dataloader"
         assert args.chunksize, "chunksize is not set"
         assert args.keep_activations_chunks >= 0, "keep activations chunks should >= 0"
-        if args.seq_length % args.chunksize != 0:
-            raise RuntimeError('seq_length is not divided by chunksize.')
-        
-        # Add chunk_num_per_seq parameter for chunkpipe
-        assert args.seq_length % args.chunksize == 0, "seq length should be divided by chunk size"
+
         args.chunk_num_per_seq = args.seq_length // args.chunksize
-        if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
-            raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        if args.training_phase != "sft":
+            # Pretrain: seq_length must be exactly divisible by chunksize,
+            # and chunk_num_per_seq must be divisible by PP size.
+            if args.seq_length % args.chunksize != 0:
+                raise RuntimeError('seq_length is not divided by chunksize.')
+            if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
+                raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        # SFT: seq_length is the upper bound, chunk_num_per_seq is the theoretical max.
+        # No strict divisibility required; SFT supports both PP=1 and PP>1 chunkpipe.
+
+        # Set sft_chunkpipe_mode to True when training_phase is 'sft'
+        args.sft_chunkpipe_mode = (args.training_phase == "sft")
+
+        # Compute total chunk-level microbatches per step for KV cache sizing.
+        if args.sft_chunkpipe_mode:
+            args.chunkpipe_num_microbatches = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size)
+        # SFT chunkpipe requires GBS large enough to fit a complete group (one sequence's
+        # worth of chunks) within a single training iteration, because KV cache cannot be
+        # preserved across iteration boundaries.
+        #
+        # When the user sets a small GBS (e.g. GBS=1 meaning "1 sequence per iter"), the
+        # actual number of microbatches per iter may be insufficient to hold all chunks of
+        # the longest group (chunk_num_per_seq chunks). For example, with chunksize=1024
+        # and seq_length=4096, each sequence produces up to 4 chunks, but GBS=1 only gives
+        # 1 microbatch — not enough for even one complete sequence.
+        #
+        # We auto-inflate GBS so that num_microbatches >= chunk_num_per_seq. This does NOT
+        # increase peak memory (each forward/backward still processes MBS*chunksize tokens),
+        # and with --calculate-per-token-loss the gradient normalization is mathematically
+        # equivalent regardless of GBS.
+        #
+        # Example: GBS=1, MBS=1, DP=1, chunk_num_per_seq=4
+        #   → auto-inflated to GBS=4 (4 chunks = 1 complete sequence of 4 chunks)
+        if args.sft_chunkpipe_mode:
+            dp_size = args.data_parallel_size if hasattr(args, 'data_parallel_size') else 1
+            actual_num_microbatches = args.global_batch_size // (args.micro_batch_size * dp_size)
+            if actual_num_microbatches < args.chunk_num_per_seq:
+                args.global_batch_size = args.chunk_num_per_seq * args.micro_batch_size * dp_size
+                print(f'[SFT ChunkPipe] global_batch_size auto-inflated from user setting to '
+                      f'{args.global_batch_size} to fit chunk_num_per_seq={args.chunk_num_per_seq} chunks '
+                      f'per iteration. This does not increase peak memory.')
+
+ 
         if args.chunk_num_per_seq < args.keep_activations_chunks:
             raise RuntimeError('num chunks to keep activations cannot larger than num chunks.')
 
@@ -1327,6 +1366,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['actual_vocab_size'] = args.padded_vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
@@ -2715,9 +2755,9 @@ def _add_distributed_args(parser):
                        'Replicated stages or layers can be described with multiplication. '
                        'Commas can be used cosmetically. '
                        'Default None is not using this argument to set the layout.'))
-    # add by loong-megatron for recompute layer imbalance.
+    # add by baige for recompute layer imbalance.
     group.add_argument('--custom-pipeline-recompute-layers', type=str, default=None,
-                       help='Add by loong-megatron for recompute layer imbalance. For example 10,11,12,13.'
+                       help='Add by baige for recompute layer imbalance. For example 10,11,12,13.'
                        '10 for stage0 recompute layers, 11 for stage1 recompute layers...')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
@@ -3239,7 +3279,7 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-fusion', action='store_true',
                        help='Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above.')
     group.add_argument('--moe-router-score-function', type=str,
-                       choices=['softmax', 'sigmoid'],
+                       choices=['softmax', 'sigmoid', 'sqrtsoftplus'],
                        default='softmax',
                        help='Score function for MoE TopK routing. Can be "softmax" or "sigmoid".')
     group.add_argument('--moe-router-topk', type=int, default=2,
@@ -3264,6 +3304,11 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-n-hash-layers', type=int, default=0,
+                       help='Number of leading transformer layers that use hash-based MoE routing.'
+                       ' Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid'
+                       ' lookup table for expert selection instead of learned top-k routing.'
+                       ' Default 0 disables hash MoE.')
     group.add_argument('--moe-router-padding-for-fp8', action='store_true',
                        help='Pad the routing_map to make sure the number of tokens each expert received '
                        'is a multiple of 16/32 for FP8 precision. It is suggested to enable this for '
@@ -3351,8 +3396,9 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
-    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
-                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    group.add_argument('--experimental-attention-variant', default=None,
+                   choices=['gated_delta_net', 'dsa', 'dsv4_hybrid'], type=str,
+                   help='Attention variant to use: gated_delta_net, dsa or dsv4_hybrid.')
     # DSA
     group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
                        help='Number of indexer heads for sparse attention.'
@@ -3366,7 +3412,6 @@ def _add_experimental_attention_variant_args(parser):
     group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
                        help='Use sparse indexer loss.'
                        'If set, the indexer loss will be computed using the top-k indices.')
-
     return parser
 
 def _add_heterogeneous_args(parser):
