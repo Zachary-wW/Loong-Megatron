@@ -1352,7 +1352,12 @@ class ChainedOptimizer(MegatronOptimizer):
         states = []
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'get_parameter_state_dp_zero'):
-                state_dict = optimizer.get_parameter_state_dp_zero()
+                # Arena zero-copy fast path (DP=1); None -> regular gather.
+                state_dict = None
+                if hasattr(optimizer, '_get_parameter_state_dp_zero_from_state_arenas'):
+                    state_dict = optimizer._get_parameter_state_dp_zero_from_state_arenas()
+                if state_dict is None:
+                    state_dict = optimizer.get_parameter_state_dp_zero()
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
@@ -1384,7 +1389,18 @@ class ChainedOptimizer(MegatronOptimizer):
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
             if optimizer.data_parallel_group.rank() == 0 and states is None:
-                states = torch.load(filename)
+                # mmap when the arena fast path consumes these states — a
+                # plain load costs 12 B/param of anon memory per rank at once
+                # (same guard as DistributedOptimizer.load_parameter_state).
+                if getattr(
+                    getattr(optimizer, "optimizer", None), "contiguous_state", False
+                ):
+                    try:
+                        states = torch.load(filename, mmap=True)
+                    except Exception:
+                        states = None
+                if states is None:
+                    states = torch.load(filename)
 
             state_dict = states[idx] if states else None
             optimizer.load_parameter_state_from_dp_zero(

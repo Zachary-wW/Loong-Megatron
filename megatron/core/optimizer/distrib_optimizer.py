@@ -710,6 +710,89 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     self.model_param_group_index_map[model_param] = (group_index, param_order)
                     param_order += 1
 
+        # Arenas need the final gbuf layout and index maps — materialize here.
+        self._maybe_materialize_hdo_state_arenas()
+
+    def _build_hdo_state_arena_layout(self):
+        """Build the dp_zero world (unpadded) layout for the HDO state arenas.
+
+        Mirrors the coordinate math of get_parameter_state_dp_zero(): world
+        offset of a param = cumulative unpadded numel of preceding buckets +
+        its gbuf_local start. Only meaningful at DP=1, where the local shard
+        of every bucket is the whole bucket. Entries are emitted in bucket
+        order so the arena migration's transient stays bounded.
+        """
+        gbuf_numels = []
+        entries = []
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
+            gbuf_numels.append(self.buffers[gbuf_idx].numel_unpadded)
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                offset_in_world_tensors = 0
+                for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    gbuf_world_numel_unpadded = (
+                        self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
+                    )
+                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        group_index, group_order = self.model_param_group_index_map[model_param]
+                        orig_param = self.optimizer.param_groups[group_index]["params"][
+                            group_order
+                        ]
+                        local_range = param_range_map["gbuf_local"]
+                        start = offset_in_world_tensors + local_range.start
+                        numel = local_range.end - local_range.start
+                        assert (
+                            start + numel
+                            <= offset_in_world_tensors + gbuf_world_numel_unpadded
+                        ), "param extends into bucket padding"
+                        entries.append((orig_param, gbuf_idx, start, numel))
+                    offset_in_world_tensors += gbuf_world_numel_unpadded
+        return {"gbuf_numels_unpadded": gbuf_numels, "entries": entries}
+
+    def _maybe_materialize_hdo_state_arenas(self):
+        """Materialize contiguous CPU state arenas on the inner HDO.
+
+        Called at the end of __init__ and again after the inner
+        load_state_dict (whose HDO post-load hook rebuilds the sub-optimizers,
+        detaching everything from the arenas). Every precondition failure is a
+        safe no-op: the regular gather/scatter checkpoint paths keep working.
+        """
+        if getattr(self, "is_stub_optimizer", False) or not isinstance(
+            self.optimizer, HybridDeviceOptimizer
+        ):
+            return
+        if not getattr(self.optimizer, "contiguous_state", False):
+            return
+        if self.data_parallel_group.size() != 1:
+            logger.warning(
+                "optimizer_cpu_offload_contiguous_state requires data-parallel size 1; "
+                "state arenas disabled (regular checkpoint path in use)."
+            )
+            return
+        if self.config.optimizer != 'adam':
+            logger.warning(
+                "optimizer_cpu_offload_contiguous_state only supports adam; "
+                "state arenas disabled."
+            )
+            return
+        if (
+            self.config.exp_avg_dtype != torch.float32
+            or self.config.exp_avg_sq_dtype != torch.float32
+        ):
+            logger.warning(
+                "optimizer_cpu_offload_contiguous_state requires fp32 exp_avg/exp_avg_sq; "
+                "state arenas disabled."
+            )
+            return
+        layout = self._build_hdo_state_arena_layout()
+        if self.optimizer.materialize_state_arenas(layout):
+            logger.info(
+                "HDO contiguous state arenas materialized "
+                f"({sum(layout['gbuf_numels_unpadded'])} elems x 3 keys, "
+                f"{len(layout['entries'])} params); legacy optimizer ckpt "
+                "save/load will use the zero-copy fast path."
+            )
+
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -968,6 +1051,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
 
+        # The HDO post-load rebuild detaches all state from the arenas —
+        # re-materialize before any parameter state gets loaded.
+        self._maybe_materialize_hdo_state_arenas()
+
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
@@ -1016,6 +1103,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
+                if not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
+                    # Skip non-tensor state (e.g. DeepSpeedCPUAdam's plain-int
+                    # `step` counter) — it has no `.shape` to shard.
+                    continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     tensors[k] = self.optimizer.state[sharded_model_param][k]
                     continue
@@ -1025,7 +1116,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            tensors = {"param": main_param, **optim_state}
+            tensors = {"param": main_param}
+            for k, v in optim_state.items():
+                if isinstance(v, torch.Tensor):
+                    tensors[k] = v
 
         # process muon to be compatiable with adam ( always save to exp_avg / exp_avg_sq )
         if isinstance(self.optimizer, Muon):
@@ -1077,6 +1171,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             v = fp32_param
                         elif not hasattr(sharded_model_param, "_fp8_cpu_offload_info"):
                             sharded_model_param.copy_(v)
+                    else:
+                        # copy_, don't rebind — keeps arena views / pinned
+                        # tensors alive
+                        existing = self.optimizer.state[sharded_model_param].get(k)
+                        if (
+                            isinstance(existing, torch.Tensor)
+                            and existing.shape == v.shape
+                        ):
+                            existing.copy_(v.to(existing.dtype))
+                            v = existing
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
@@ -1099,6 +1203,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for k, v in tensors.items():
                     if k == "param":
                         k = "master_param"
+                    # copy_, don't rebind — keeps arena views / pinned tensors alive
+                    existing = optim_state.get(k)
+                    if isinstance(existing, torch.Tensor) and existing.shape == v.shape:
+                        existing.copy_(v.to(existing.dtype))
+                        v = existing
                     optim_state[k] = v
             else:
                 dst_tensors = {"param": main_param, **optim_state}
@@ -1309,6 +1418,43 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return state if data_parallel_rank == 0 or return_on_all_ranks else None
 
+    def _get_parameter_state_dp_zero_from_state_arenas(self):
+        """Zero-copy dp_zero state dict built from the HDO state arenas.
+
+        At DP=1 the arenas are laid out exactly like the world tensors that
+        get_parameter_state_dp_zero() would assemble, so the state dict can
+        simply reference them — no local_shards staging, no gather, no concat,
+        no world allocation. torch.save() then streams the arena storages to
+        disk, producing a byte-identical checkpoint. Returns None whenever the
+        fast path does not apply (caller falls back to the regular path).
+        """
+        if not isinstance(self.optimizer, HybridDeviceOptimizer):
+            return None
+        if self.data_parallel_group.size() != 1:
+            return None
+        hdo = self.optimizer
+        if not (getattr(hdo, "contiguous_state", False) and hdo.state_arenas_intact()):
+            return None
+
+        state = {"buckets_coalesced": True}
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            dtype_state = {}
+            assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
+            for dtype in gbuf_range_maps:
+                arenas = hdo.state_arenas[gbuf_idx]
+                numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
+                if arenas["param"].numel() != numel_unpadded:
+                    return None
+                # Same key insertion order as get_parameter_state_dp_zero()
+                # so the pickled file is byte-identical.
+                world_tensors = {
+                    key: arenas[key] for key in ("param", "exp_avg", "exp_avg_sq")
+                }
+                world_tensors["numel_unpadded"] = numel_unpadded
+                dtype_state[dtype] = world_tensors
+            state[gbuf_idx] = dtype_state
+        return state
+
     def save_parameter_state(self, filename: str):
         """Save the distributed parameter state on DP rank 0.
 
@@ -1316,7 +1462,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             filename (str): path to save parameter state to.
         """
 
-        state_dict = self.get_parameter_state_dp_zero()
+        state_dict = self._get_parameter_state_dp_zero_from_state_arenas()
+        if state_dict is None:
+            state_dict = self.get_parameter_state_dp_zero()
         if self.data_parallel_group.rank() == 0:
             torch.save(state_dict, filename)
 
@@ -2147,6 +2295,52 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 recv_tensor[gbuf_local_start:gbuf_local_end]
                             )
 
+    @torch.no_grad()
+    def _load_parameter_state_dp_zero_into_state_arenas(self, state_dict):
+        """Copy a dp_zero state dict straight into the HDO state arenas.
+
+        Counterpart of _get_parameter_state_dp_zero_from_state_arenas(); valid
+        only at DP=1 with intact arenas. Validates the full structure before
+        copying anything, so a False return leaves the state untouched for the
+        regular path. Returns True when the state was fully loaded.
+        """
+        if not isinstance(self.optimizer, HybridDeviceOptimizer):
+            return False
+        if self.data_parallel_group.size() != 1:
+            return False
+        hdo = self.optimizer
+        if not (getattr(hdo, "contiguous_state", False) and hdo.state_arenas_intact()):
+            return False
+        if state_dict is None:
+            return False
+
+        key_map = {"param": "param", "exp_avg": "exp_avg", "exp_avg_sq": "exp_avg_sq"}
+        plan = []
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            for dtype in gbuf_range_maps:
+                if gbuf_idx not in state_dict or dtype not in state_dict[gbuf_idx]:
+                    return False
+                world = state_dict[gbuf_idx][dtype]
+                arenas = hdo.state_arenas[gbuf_idx]
+                if world.get("numel_unpadded") != arenas["param"].numel():
+                    return False
+                for ckpt_key, arena_key in key_map.items():
+                    tensor = world.get(ckpt_key)
+                    if (
+                        not isinstance(tensor, torch.Tensor)
+                        or tensor.numel() != arenas[arena_key].numel()
+                    ):
+                        return False
+                    plan.append((arenas[arena_key], tensor))
+
+        for dst, src in plan:
+            dst.copy_(src.to(dst.dtype))
+        # State tensors are already arena views; reseed just normalizes
+        # `step` typing, then refresh HDO's state references.
+        hdo._reseed_arena_state_views()
+        hdo._sync_sub_optimizers_state_to_hdo()
+        return True
+
     def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
         """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,
         using the new checkpoint format with coalesced state across buckets.
@@ -2176,6 +2370,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if data_parallel_rank == 0:
             # Do nothing if "--fp8-param-gather" is not used.
             self.split_state_dict_if_needed(state_dict)
+
+        # Arena fast path: ckpt world tensors match the arena layout at DP=1
+        # — one memcpy per key per buffer, no staging/scatter.
+        if self._load_parameter_state_dp_zero_into_state_arenas(state_dict):
+            return
 
         # Scatter tensors to all DP ranks.
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
@@ -2450,7 +2649,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
         state_dict = None
         if self.data_parallel_group.rank() == 0:
-            state_dict = torch.load(filename)
+            state_dict = None
+            if isinstance(self.optimizer, HybridDeviceOptimizer) and getattr(
+                self.optimizer, "contiguous_state", False
+            ):
+                # mmap: stream via page cache instead of materializing
+                # 12 B/param of anon memory at once
+                try:
+                    state_dict = torch.load(filename, mmap=True)
+                except Exception:
+                    state_dict = None
+            if state_dict is None:
+                state_dict = torch.load(filename)
 
         self.load_parameter_state_from_dp_zero(
             state_dict, update_legacy_format=update_legacy_format
