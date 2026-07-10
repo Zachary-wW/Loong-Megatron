@@ -1606,8 +1606,8 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
-        from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
         if args.moe_echo_dump_dir is not None:
+            from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
             GLOBAL_MOE_ROUTING_TRACKER.dump_data(os.path.join(args.moe_echo_dump_dir, f"iter_{iteration}"))
             GLOBAL_MOE_ROUTING_TRACKER.clear_data()
     if args.mtp_num_layers is not None:

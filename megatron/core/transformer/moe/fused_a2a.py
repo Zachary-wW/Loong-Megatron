@@ -296,49 +296,9 @@ _hybrid_ep_buffer = None
 import sys as _sys
 _a2a_op_counter = 0
 
-
-def _a2a_log(tag: str):
-    """Log A2A debug events when debug logging is enabled."""
-    pass
-    # global _a2a_op_counter
-    # _a2a_op_counter += 1
-    # rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-    # print(
-    #     f"[A2A] rank={rank} op#{_a2a_op_counter} buf_idx={_hybrid_ep_buffer_idx} {tag}",
-    #     file=_sys.stderr, flush=True,
-    # )
-# ───────────────────────────────────────────────────────────────────────────────
-
-# Double-buffer: two independent HybridEPBuffer instances indexed by layer_number % 2.
-# When EP spans multiple nodes (EP > node_size), IB RDMA latency can cause adjacent
-# MoE layers' backward RDMA operations to overlap across ranks (rank A executes
-# layer N-1's dispatch while rank B is still on layer N's combine).  DeepEP's
-# collective semantics require all ranks to execute the same operation on the same
-# buffer simultaneously; mixing dispatch/combine on a single buffer deadlocks.
-# Using two buffers ensures that even with one-layer skew, ranks operate on
-# different buffers and never conflict.
 _hybrid_ep_buffers = [None, None]
-# Thread-local-like index set by MoELayer before each token dispatch/combine call.
 _hybrid_ep_buffer_idx = 0
-
-# Per-buffer CUDA events: track combine_with_unpermute completion on each buffer.
-# DeepEP's dispatch_with_permute busy-polls a host-side flag to check buffer readiness.
-# When the CPU races ahead of the GPU (after many iterations), the flag is stale and
-# dispatch_with_permute spins waiting for the previous combine to finish on GPU.
-# Meanwhile the GPU needs cross-rank RDMA collectives to make progress, but all ranks'
-# CPUs are spinning → global deadlock.
-# Fix: record an event after each combine_with_unpermute, then event.synchronize()
-# before dispatch_with_permute. This is a *targeted* CPU wait — it only blocks until
-# the specific buffer's combine has executed on GPU (a local operation, no cross-rank
-# coordination needed), breaking the circular dependency.
 _hybrid_ep_buf_events = [None, None]
-
-# Events for expert_dispatch_buffers: same mechanism as token buffers.
-# expert_dispatch_buffer's combine_with_unpermute (in backward) must complete on GPU
-# before the next forward's dispatch_with_permute busy-polls.
-# Two buffers (indexed 0=FC1, 1=FC2) so back-to-back combines in backward don't
-# collide on the same buffer's host flag (DeepEP requires strict dispatch→combine
-# alternation per buffer).
 _expert_dispatch_buf_events = [None, None]
 
 
@@ -456,13 +416,11 @@ class HybridEPDispatch(torch.autograd.Function):
         # we do not need to the D2H here.
         non_blocking = num_permuted_tokens is not None
         # Process the dispatch
-        _a2a_log(f"token_dispatch FWD BEGIN (non_blocking={non_blocking})")
         # ── Per-buffer event sync: ensure this buffer's previous combine has completed
         # on GPU so that DeepEP's host-side readiness flag is up-to-date. ──
         buf_event = _hybrid_ep_buf_events[_hybrid_ep_buffer_idx]
         if buf_event is not None:
             buf_event.synchronize()
-        _a2a_log("token_dispatch FWD: buf_event synced — calling dispatch_with_permute")
         (
             dispatched_hidden,
             dispatched_probs,
@@ -480,7 +438,6 @@ class HybridEPDispatch(torch.autograd.Function):
             non_blocking=non_blocking,
             use_fp8=False,
         )
-        _a2a_log("token_dispatch FWD DONE")
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -506,7 +463,6 @@ class HybridEPDispatch(torch.autograd.Function):
         if hasattr(MoELayer, 'moe_a2a_stream'):
             with torch.cuda.stream(MoELayer.moe_a2a_stream):
                 MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
-                _a2a_log(f"token_dispatch BWD BEGIN (combine) buf={ctx.buffer_idx}")
                 combined_hidden, combined_probs = buffer.combine_with_unpermute(
                     hidden=grad_x,
                     probs=grad_probs,
@@ -517,7 +473,6 @@ class HybridEPDispatch(torch.autograd.Function):
                 if _hybrid_ep_buf_events[ctx.buffer_idx] is None:
                     _hybrid_ep_buf_events[ctx.buffer_idx] = torch.cuda.Event()
                 _hybrid_ep_buf_events[ctx.buffer_idx].record()
-                _a2a_log(f"token_dispatch BWD DONE buf={ctx.buffer_idx}")
                 MoELayer.dispatch_bwd_event.record()
             # GPU-side wait: default stream waits for moe_a2a_stream to finish the A2A
             # before consuming combined_hidden in subsequent backward ops (e.g. router
@@ -552,7 +507,6 @@ class HybridEPCombine(torch.autograd.Function):
         Forward pass of fused combine of the HybridEP backend
         '''
         buffer = get_hybrid_ep_buffer()
-        _a2a_log("token_combine FWD BEGIN")
         combined_hidden, _ = buffer.combine_with_unpermute(
             hidden=x,
             handle=handle,
@@ -564,7 +518,6 @@ class HybridEPCombine(torch.autograd.Function):
         if _hybrid_ep_buf_events[_hybrid_ep_buffer_idx] is None:
             _hybrid_ep_buf_events[_hybrid_ep_buffer_idx] = torch.cuda.Event()
         _hybrid_ep_buf_events[_hybrid_ep_buffer_idx].record()
-        _a2a_log("token_combine FWD DONE")
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
@@ -590,7 +543,6 @@ class HybridEPCombine(torch.autograd.Function):
                 buf_event = _hybrid_ep_buf_events[ctx.buffer_idx]
                 if buf_event is not None:
                     buf_event.synchronize()
-                _a2a_log(f"token_combine BWD BEGIN (dispatch) buf={ctx.buffer_idx}")
                 dispatched_hidden, _, _, _, _ = buffer.dispatch_with_permute(
                     hidden=grad_x,
                     scaling_factor=None,
@@ -598,7 +550,6 @@ class HybridEPCombine(torch.autograd.Function):
                     pad_multiple=ctx.pad_multiple,
                     num_permuted_tokens=ctx.num_permuted_tokens,
                 )
-                _a2a_log(f"token_combine BWD DONE buf={ctx.buffer_idx}")
                 MoELayer.combine_bwd_event.record()
             # GPU-side wait: default stream waits for moe_a2a_stream to finish the A2A
             # before consuming dispatched_hidden in subsequent expert GEMM backward.
@@ -665,46 +616,9 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 quantized_tensor_class = weight.__class__
                 row_weight, col_weight = weight.get_data_tensors()
                 metadata = weight.get_metadata()
-                if isinstance(weight, Float8BlockwiseQTensor):
-                    row_scale_inv = metadata['rowwise_scale_inv']
-                    col_scale_inv = metadata['columnwise_scale_inv']
-                    M_w, N_w = weight.shape
-                    _B = 128
-                    # Detect 2D blockwise: scale shape is (M//B, N//B) vs 1D (M, N//B).
-                    # Try metadata key first, then direct attribute, then fall back to shape check.
-                    _is_2d = (
-                        metadata.get('is_2D_scaled', False)
-                        or getattr(weight, 'is_2D_scaled', False)
-                        or (row_scale_inv.dim() == 2
-                            and row_scale_inv.shape[0] == M_w // _B
-                            and row_scale_inv.shape[1] == N_w // _B)
-                    )
-                    if _is_2d:
-                        # grouped_linear may set columnwise=False on the weight quantizer when
-                        # inp.requires_grad is False (e.g. during activation recompute). In that
-                        # case columnwise_data / columnwise_scale_inv will be None. For 2D
-                        # blockwise scaling, columnwise_data = fp8_transpose(rowwise_data) and
-                        # columnwise_scale_inv = rowwise_scale_inv.T — no re-quantization needed.
-                        # We compute them on-the-fly WITHOUT modifying the original weight.
-                        if col_scale_inv is None:
-                            row_weight_c = row_weight if row_weight.is_contiguous() else row_weight.contiguous()
-                            col_weight = tex.fp8_transpose(row_weight_c, metadata['fp8_dtype'], out=None)
-                            col_scale_inv = row_scale_inv.transpose(-2, -1).contiguous()
-                        # For weight (M, K):
-                        #   rowwise_scale_inv: (M//B, K//B) -> repeat(B, dim=0) -> ravel
-                        #   columnwise_scale_inv: (K//B, M//B) -> repeat(B, dim=0) -> ravel
-                        # Both produce the same ravel length (M*K//B), enabling symmetric dispatch.
-                        row_scale = row_scale_inv.repeat_interleave(_B, dim=0).ravel()
-                        col_scale = col_scale_inv.repeat_interleave(_B, dim=0).ravel()
-                        blockwise_is_2d_scaled = True
-                    else:
-                        # 1D blockwise: already float32, view is no-op
-                        row_scale = row_scale_inv.view(torch.float32).ravel()
-                        col_scale = col_scale_inv.view(torch.float32).ravel()
-                else:
-                    # MXFP8: uint8 E8M0, view converts 4 bytes -> 1 float32
-                    row_scale = metadata['rowwise_scale_inv'].view(torch.float32).ravel()
-                    col_scale = metadata['columnwise_scale_inv'].view(torch.float32).ravel()
+                # MXFP8: uint8 E8M0, view converts 4 bytes -> 1 float32
+                row_scale = metadata['rowwise_scale_inv'].view(torch.float32).ravel()
+                col_scale = metadata['columnwise_scale_inv'].view(torch.float32).ravel()
                 weight_list.extend([row_weight.ravel(), col_weight.ravel()])
                 scale_list.extend([row_scale.ravel(), col_scale.ravel()])
                 fp8_dispatch = True
@@ -808,7 +722,6 @@ class HybridEPExpertDispatch(torch.autograd.Function):
             buf_event.synchronize()
         if handle is None:
             # Process the dispatch
-            _a2a_log(f"expert_dispatch FWD BEGIN (new handle) buf={buffer_idx}")
             (
                 dispatched_weight,
                 _,
@@ -824,9 +737,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
                 non_blocking=non_blocking,
             )
-            _a2a_log(f"expert_dispatch FWD DONE (new handle) buf={buffer_idx}")
         else:
-            _a2a_log(f"expert_dispatch FWD BEGIN (resume handle) buf={buffer_idx}")
             (
                 dispatched_weight,
                 _,
@@ -840,7 +751,6 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 pad_multiple=None,
                 num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
             )
-            _a2a_log(f"expert_dispatch FWD DONE (resume handle) buf={buffer_idx}")
 
 
         ctx.handle = handle
@@ -918,7 +828,6 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         Backward pass of fused dispatch of the HybridEP backend
         '''
         buffer_idx = ctx.buffer_idx
-        _a2a_log(f"expert_dispatch BWD ENTERED buf={buffer_idx}")
         # Last element is grad for handle (None), rest are grad for expert weights
         grad_expert_weights = grad_expert_weights_and_handle[:-1]
         # TODO: dispatch and accmualte the gradient of the expert weights with fp32
@@ -940,7 +849,6 @@ class HybridEPExpertDispatch(torch.autograd.Function):
         if hasattr(MoELayer, 'moe_a2a_stream'):
             with torch.cuda.stream(MoELayer.moe_a2a_stream):
                 MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
-                _a2a_log(f"expert_dispatch BWD BEGIN (combine) buf={buffer_idx}")
                 combined_expert_grad, _ = buffer.combine_with_unpermute(
                     hidden=expert_grad_tensor,
                     probs=None,
@@ -952,7 +860,6 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 if _expert_dispatch_buf_events[buffer_idx] is None:
                     _expert_dispatch_buf_events[buffer_idx] = torch.cuda.Event()
                 _expert_dispatch_buf_events[buffer_idx].record()
-                _a2a_log(f"expert_dispatch BWD DONE (combine) buf={buffer_idx}")
                 # Record grad_combine_event on moe_a2a_stream right after A2A.
                 MoELayer.grad_combine_event.record()
             # No default_stream.wait_stream here: same reason as HybridEPDispatch.backward.

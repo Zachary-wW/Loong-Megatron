@@ -640,6 +640,9 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_hotspot_ratio: float = 0.0
+    """[Experimental] Force a ratio of router tokens to route to the first EP rank.
+    This is an experimental feature and only for benchmark."""
     moe_n_hash_layers: int = 0
     """Number of leading transformer layers that use hash-based MoE routing.
     Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
@@ -701,16 +704,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_echo_expert_dispatch_overlap: bool = False
     """Enable overlap of echo expert dispatch and expert computation."""
 
-    moe_echo_recompute_expert_dispatch: bool = False
-    """[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead.
-    It is only effective when moe_enable_echo is enabled."""
-
     moe_echo_expert_dispatcher_type: str = "hybridep"
     """The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall"."""
-
-    moe_echo_enable_random_offloading: bool = False
-    """[Experimental] Enable random offloading of echo experts for debugging and numerical verification.
-    It is only effective when moe_enable_echo is enabled."""
 
     moe_echo_algorithm: str = "sinkhorn"
     """Algorithm used for echo expert token assignment when moe_enable_echo is True.
@@ -1127,6 +1122,11 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
 
+            if self.moe_flex_dispatcher_backend == "hybridep":
+                raise ValueError(
+                    "deepep and hybridep backends cannot be enabled at the same time "
+                    "for flex token dispatcher."
+                )
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
                 "moe_enable_deepep is deprecated."
@@ -1141,8 +1141,6 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
-            if self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "hybrid_ep":
-                raise ValueError("Only one type of backend is supported for flex token dispatcher.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

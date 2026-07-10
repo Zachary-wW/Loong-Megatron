@@ -403,8 +403,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
             def custom_forward(hidden_states):
                 pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
-                local_tokens, probs, metadata_holder['metadata'] = layer.mlp.router_and_preprocess(
-                    pre_mlp_layernorm_output
+                local_tokens, probs, metadata_holder['metadata'], _ = (
+                    layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
                 )
                 return pre_mlp_layernorm_output, local_tokens, probs
 
@@ -425,7 +425,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 with get_fine_grained_offloading_context(layer.offload_mlp_norm):
                     pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
-            local_tokens, probs, metadata = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+            local_tokens, probs, metadata, _ = layer.mlp.router_and_preprocess(
+                pre_mlp_layernorm_output
+            )
 
         node.layer_state.dispatch_metadata = metadata
 

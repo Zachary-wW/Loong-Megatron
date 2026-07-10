@@ -1012,45 +1012,15 @@ class TEGroupedMLP(MegatronModule):
         fc1_event: "torch.cuda.Event",
         fc2_event: "torch.cuda.Event",
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward with home GEMM overlapping echo expert weight dispatch.
-
-        Called *after* token A2A completes, so expert weight A2A overlaps only
-        with home GEMM computation — not with token A2A.
-
-        Timeline on two streams:
-          Stream A (a2a_stream):
-            fc1_A2A ──► [fc1_event]
-                                      fc2_A2A ──► [fc2_event]
-          Default stream:
-            home_fc1 ──► wait(fc1_event) ──► set_echo_fc1 ──► echo_fc1 ──► activation
-            ──► home_fc2 ──► wait(fc2_event) ──► set_echo_fc2 ──► echo_fc2 ──► cat
-
-        fc1 and fc2 dispatches are serialized on stream A (fc2 starts only after
-        fc1 finishes on that stream), while each overlaps with its matching home
-        GEMM on the default stream.
-
-        Restrictions (asserted at runtime):
-          - No FP8 / FP4
-          - No fine-grained activation offloading
-          - No moe_act activation recompute
-          - No add_bias_linear (fc2 skip_bias_add path with non-None output bias)
-        """
+        """Forward with home GEMM overlapping echo expert weight dispatch."""
         # ── Sanity checks ──────────────────────────────────────────────────────
-        if self.config.fp8 or getattr(self.config, 'fp4', False):
-            raise RuntimeError(
-                "forward_with_dispatch_overlap does not support FP8/FP4. "
-                "Disable moe_echo_expert_dispatch_overlap when using FP8/FP4."
-            )
         if self.offload_expert_fc1 or self.offload_moe_act:
             raise RuntimeError(
                 "forward_with_dispatch_overlap does not support fine-grained activation "
-                "offloading.  Disable moe_echo_expert_dispatch_overlap when "
-                "fine_grained_activation_offloading is enabled."
             )
         if self.activation_recompute:
             raise RuntimeError(
                 "forward_with_dispatch_overlap does not support moe_act activation recompute. "
-                "Disable moe_echo_expert_dispatch_overlap together with moe_act recompute."
             )
 
         # ── Preparation ────────────────────────────────────────────────────────
@@ -1232,14 +1202,16 @@ class TEGroupedMLP(MegatronModule):
         )
         if need_fp8_padding:
             actual_tokens_per_expert = tokens_per_expert
-        received_num_tokens = permuted_local_hidden_states.shape[0]
         use_hybrid_ep_dispatcher = (
             self.config.moe_flex_dispatcher_backend == "hybridep"
             and self.config.moe_token_dispatcher_type == "flex"
         )
 
-        permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
         if self.config.moe_received_token_capacity is not None:
+            # Capture the received token count before truncation; used below to pad
+            # the output back to this length.
+            received_num_tokens = permuted_local_hidden_states.shape[0]
+            permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
             permuted_local_hidden_states = permuted_local_hidden_states[: sum(tokens_per_expert)]
             permuted_probs = permuted_probs[: sum(tokens_per_expert)]
 
@@ -1559,7 +1531,7 @@ class SequentialMLP(MegatronModule):
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
 
-        for expert_local_idx, expert in enumerate(num_local_experts):
+        for expert_local_idx, expert in enumerate(self.local_experts):
             expert_global_idx = local_expert_indices_offset + expert_local_idx
             expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
             if singleton_local_shards:

@@ -548,7 +548,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             )
             return metadata
 
-        if getattr(self.config, 'moe_router_padding_for_quantization', False):
+        if self.config.moe_router_padding_for_fp8:
             pad_multiple = get_align_size_for_quantization(self.config)
             if is_experimental_enabled() and self.config.moe_permute_fusion:
                 routing_map = fused_pad_routing_map(metadata.routing_map, pad_multiple)
@@ -1276,11 +1276,11 @@ class _DeepepManager(_DispatchManager):
         return multihot_routing_map.bool(), multihot_probs
 
 
-    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+    def get_number_of_tokens_per_expert(self, metadata: MoEFlexMetadata) -> torch.Tensor:
         """
         Get the number of tokens per expert.
         """
-        return self.tokens_per_expert
+        return metadata.tokens_per_expert
 
     def combine(
         self,
@@ -1341,9 +1341,9 @@ class _DeepepManager(_DispatchManager):
             metadata.dispatched_routing_map, metadata.dispatched_probs = self._indices_to_multihot(
                 metadata.dispatched_indices, metadata.dispatched_probs
             )
-        if getattr(self.config, 'moe_router_padding_for_quantization', False):
-            self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
-                self.dispatched_routing_map, self.tokens_per_expert
+        if self.config.moe_router_padding_for_fp8:
+            metadata.dispatched_routing_map, metadata.tokens_per_expert = self._pad_routing_map(
+                metadata.dispatched_routing_map, metadata.tokens_per_expert
             )
 
         metadata.hidden_shape_before_permute = hidden_states.shape
