@@ -3304,6 +3304,9 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-router-force-hotspot-ratio', type=float, default=0.0,
+                       help='[Experimental] Force this ratio of router tokens to route to the first EP rank. '
+                       'This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-n-hash-layers', type=int, default=0,
                        help='Number of leading transformer layers that use hash-based MoE routing.'
                        ' Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid'
@@ -3327,11 +3330,52 @@ def _add_moe_args(parser):
     group.add_argument('--moe-token-dispatcher-type', type=str,
                        choices=['allgather', 'alltoall', 'flex'],
                        default='allgather',
-                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+                       help="The type of token dispatcher to use. The default is 'allgather'. "
+                       "Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when "
+                       "applying expert parallelism. For more information, please refer to the "
+                       "documentation in core/moe/README.")
+    group.add_argument('--moe-enable-echo', action='store_true',
+                       help='[Experimental] Enable Elastic Cloning for Hot Experts (ECHO). '
+                       'This feature dynamically clones frequently used experts to spare/echo experts '
+                       'for better load balancing and reduced communication overhead.')
+    group.add_argument('--moe-echo-dump-dir', type=str, default=None,
+                       help='The directory to dump the echo routing data.')
+    group.add_argument('--moe-echo-log-steps', type=str, default=None,
+                       help='Comma-separated list of training steps to log echo expert stats, e.g. "1,3,5".')
+    group.add_argument('--moe-echo-log-layers', type=str, default=None,
+                       help='Comma-separated list of layer numbers to log echo expert stats, e.g. "10,15,20,25".')
+    group.add_argument('--moe-echo-log-file', type=str, default=None,
+                       help='Path to the output log file for echo expert stats.')
+    group.add_argument('--moe-echo-expert-dispatch-overlap', action='store_true',
+                       help='Enable overlap of echo expert dispatch and expert computation. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-algorithm', type=str, default='sinkhorn',
+                       choices=['sinkhorn', 'greedy'],
+                       help='Algorithm used for echo expert token assignment when --moe-enable-echo is enabled. '
+                       '"sinkhorn": topology-aware Sinkhorn-Knopp OT + iterative col-top1 matching (default). '
+                       '"greedy": approx_bin_packing for K=1 spare slot, one_shot_greedy for K>1. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatcher-type', type=str, default='hybridep',
+                       choices=['hybridep', 'alltoall'],
+                       help='The type of expert dispatcher to use for echo experts. '
+                       'Can be either "hybridep" or "alltoall".')
+    group.add_argument('--moe-received-token-capacity', type=float, default=None,
+                       help='The capacity of total received tokens on each ep rank.')
+    group.add_argument('--moe-num-echo-experts', type=int, default=None,
+                       help='[Experimental] Number of echo experts to use for elastic expert cloning. '
+                       'These are spare experts that can receive overflow tokens from overloaded experts. '
+                       'If None, the number of echo experts is set to the number of experts.')
     group.add_argument('--moe-enable-deepep', action='store_true',
-                       help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
+                       help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
+    group.add_argument('--moe-flex-dispatcher-backend', type=str,
+                       choices=['deepep', 'hybridep'],
+                       default='deepep',
+                       help='The backend to use for flex token dispatcher. The default is "deepep". '
+                       'Options are "deepep" and "hybridep".')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
+                       help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
                        help='Fuse token rearrangement ops during token dispatching.')
     # Token dropping arguments

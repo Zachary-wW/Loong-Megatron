@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+"""Utility functions and trackers for mixture-of-experts routing."""
+
 import os
 import math
 from typing import List, Optional, Union
@@ -7,7 +9,10 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -920,10 +925,13 @@ class RandomSTE(torch.autograd.Function):
     generator = None
 
     @staticmethod
-    def forward(ctx, logits):
+    def forward(ctx, logits, static_logits=False):
         """
         Forward pass returns random logits with rank-specific seed.
         """
+        if static_logits and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         if RandomSTE.generator is None:
             global_rank = torch.distributed.get_rank()
             base_seed = 42
@@ -939,14 +947,14 @@ class RandomSTE(torch.autograd.Function):
         """
         Backward pass propagates the gradient for logits.
         """
-        return grad_output
+        return grad_output, None
 
 
-def apply_random_logits(logits):
+def apply_random_logits(logits, static_logits=False):
     """
     Apply the RandomSTE function to the logits.
     """
-    return RandomSTE.apply(logits)
+    return RandomSTE.apply(logits, static_logits)
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -1021,6 +1029,12 @@ def router_gating_linear(
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
 
+def get_align_size_for_quantization(config: TransformerConfig):
+    """Get the alignment size for quantization."""
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    return 16
+    
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
 def get_default_pg_collection():
@@ -1042,6 +1056,50 @@ def get_default_pg_collection():
     )
     return pg_collection
 
+from collections import defaultdict
+import os
+
+
+class MoERoutingTracker:
+    """Track MoE routing statistics across layers and ranks."""
+
+    def __init__(self):
+        """Initialize the routing statistics store."""
+        self.data_dict = {}
+
+    def set_rank_info(self, ep_group):
+        """Set distributed rank metadata for dumping statistics."""
+        self.ep_group = ep_group
+        self.rank = torch.distributed.get_rank()
+        self.ep_rank = torch.distributed.get_rank(self.ep_group)
+
+    def add_data(self, moe_layer_number: int, key_name: str, data: torch.Tensor):
+        """Record a tensor statistic for a MoE layer."""
+        if key_name not in self.data_dict:
+            self.data_dict[key_name] = {}
+        if moe_layer_number not in self.data_dict[key_name]:
+            self.data_dict[key_name][moe_layer_number] = []
+        self.data_dict[key_name][moe_layer_number].append(data.detach())
+
+    def dump_data(self, dir_path: str):
+        """Dump collected routing statistics to a rank-local file."""
+        for key_name in self.data_dict.keys():
+            for moe_layer_number in self.data_dict[key_name].keys():
+                data_list = self.data_dict[key_name][moe_layer_number]
+                data_tensor = torch.stack(data_list)
+                self.data_dict[key_name][moe_layer_number] = data_tensor
+        if self.ep_rank == 0:
+            file_name = f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth"
+            file_path = os.path.join(dir_path, file_name)
+            os.makedirs(dir_path, exist_ok=True)
+            torch.save(self.data_dict, file_path)
+
+    def clear_data(self):
+        """Clear collected routing statistics."""
+        self.data_dict = {}
+
+
+GLOBAL_MOE_ROUTING_TRACKER = MoERoutingTracker()
 
 CUDA_MONITOR_UTIL = {}
 MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD = 1000000000
