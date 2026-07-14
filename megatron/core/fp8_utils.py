@@ -364,6 +364,32 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
+@dataclass
+class FP8CPUOffloadProxyInfo:
+    """Metadata attached to a zero-size proxy tensor for FP8 CPU-offloaded master params."""
+
+    # The real blockwise FP8 model-parameter wrapper, not a raw rowwise/columnwise storage.
+    # The proxy tensor itself does not own model weight storage.
+    blockwise_fp8_model_param: torch.Tensor
+    # Start offset of this DP rank's master shard in the flattened model parameter.
+    start_offset: int
+    # Number of elements in this DP rank's master shard.
+    shard_numel: int
+    # Data-parallel group used when quantizing the CPU master shard back to the FP8 model param.
+    data_parallel_group: Optional[torch.distributed.ProcessGroup]
+
+
+def get_fp8_cpu_offload_proxy_info(param: torch.Tensor) -> Optional[FP8CPUOffloadProxyInfo]:
+    """Return FP8 CPU-offload proxy metadata attached to a tensor, if present."""
+    return getattr(param, "_fp8_cpu_offload_info", None)
+
+
+def get_fp8_cpu_offload_proxy_numel(param: torch.Tensor) -> int:
+    """Return represented shard size, accounting for zero-size FP8 proxy tensors."""
+    info = get_fp8_cpu_offload_proxy_info(param)
+    return int(info.shard_numel if info is not None else param.numel())
+
+
 def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
     """Get the alignment size required for fp8 GEMM."""
     if fp8_recipe == Fp8Recipe.mxfp8:
