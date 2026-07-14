@@ -32,7 +32,7 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.cpu_offloading import FP8CPUOffloadProxyInfo, HybridDeviceOptimizer
 from megatron.core.parallel_state import get_tensor_model_parallel_group
 
 from .. import tensor_parallel
@@ -55,6 +55,13 @@ from .optimizer_config import OptimizerConfig
 from .muon import Muon, MuonDistMeta
 
 logger = getLogger(__name__)
+
+
+def _uses_cpu_offloaded_fp32_master_for_fp8_param(
+    config: OptimizerConfig, model_param: torch.Tensor
+) -> bool:
+    """Return whether this FP8 param keeps its FP32 optimizer master shard on CPU."""
+    return config._uses_fp8_cpu_offload_main_params() and is_float8tensor(model_param)
 
 
 class Range:
@@ -309,6 +316,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
         config: OptimizerConfig,
+        data_parallel_group: torch.distributed.ProcessGroup,
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -370,8 +378,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
+                    uses_cpu_offloaded_fp32_master_for_fp8 = (
+                        _uses_cpu_offloaded_fp32_master_for_fp8_param(
+                            config, model_param
+                        )
+                    )
+
                     # Generate sharded model param.
-                    if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
+                    if uses_cpu_offloaded_fp32_master_for_fp8:
+                        # This is a zero-size proxy for optimizer param-group bookkeeping.
+                        # The real FP8 model weight stays in model_param, while the FP32
+                        # master shard is allocated and owned by the CPU optimizer.
+                        shard_model_param = torch.empty(
+                            (0,), device=model_param.device, dtype=torch.bfloat16
+                        ).detach()
+                        tensor_parallel.copy_tensor_model_parallel_attributes(
+                            shard_model_param, model_param
+                        )
+                        if hasattr(model_param, 'shared'):
+                            shard_model_param.shared = model_param.shared
+                        shard_model_param._fp8_cpu_offload_info = FP8CPUOffloadProxyInfo(
+                            blockwise_fp8_model_param=model_param,
+                            start_offset=param_range.start,
+                            shard_numel=param_range.size,
+                            data_parallel_group=data_parallel_group,
+                        )
+                    elif is_float8tensor(model_param) and config.fp8_recipe != "delayed":
                         # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
                         shard_model_param = None
                     else:
@@ -385,7 +417,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_model_param.shared = model_param.shared
 
                     # Generate main param.
-                    if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    if uses_cpu_offloaded_fp32_master_for_fp8:
+                        # The optimizer owns the master shard and casts it back to the
+                        # blockwise FP8 model param after optimizer.step(). For CPU
+                        # offload this keeps the master shard on host memory.
+                        shard_main_param = None
+                    elif not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # If we use FP8 params to initialize FP32 main params (compared to using the
                         # bf16/fp16 params to initialize the main params), there will be a loss of
                         # precision at the beginning of training (this problem will not occur if the
@@ -618,7 +655,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
         ), dist_metas = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+            self.gbuf_ranges,
+            self.model_param_gbuf_map,
+            self.opt_group_ranges,
+            config,
+            self.data_parallel_group,
         )
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -876,7 +917,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     tensors["adamw_exp_avg"] = tensors.pop("exp_avg")
                                     tensors["adamw_exp_avg_sq"] = tensors.pop("exp_avg_sq")
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
+                                uses_cpu_offloaded_fp32_master_for_fp8 = (
+                                    _uses_cpu_offloaded_fp32_master_for_fp8_param(
+                                        self.config, model_param
+                                    )
+                                )
+                                if (
+                                    self.config.store_param_remainders
+                                    and self.config.bf16
+                                    and not uses_cpu_offloaded_fp32_master_for_fp8
+                                ):
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(
@@ -1017,12 +1067,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
-                        sharded_model_param.copy_(v)
+                        fp32_param = self.optimizer.param_to_fp32_param.get(
+                            sharded_model_param
+                        )
+                        if fp32_param is not None:
+                            fp32_param.data.copy_(
+                                v.to(device=fp32_param.device, dtype=fp32_param.dtype)
+                            )
+                            v = fp32_param
+                        elif not hasattr(sharded_model_param, "_fp8_cpu_offload_info"):
+                            sharded_model_param.copy_(v)
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
                 if k == "param":
-                    if self.config.store_param_remainders and self.config.bf16:
+                    if (
+                        self.config.store_param_remainders
+                        and self.config.bf16
+                        and not hasattr(sharded_model_param, "_fp8_cpu_offload_info")
+                    ):
                         v = v.to(torch.int16)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
@@ -2531,7 +2594,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
-                    assert param_range.size == shard_main_param.nelement()
+                    fp8_cpu_offload_info = getattr(
+                        shard_main_param, "_fp8_cpu_offload_info", None
+                    )
+                    if fp8_cpu_offload_info is not None:
+                        shard_main_param_numel = fp8_cpu_offload_info.shard_numel
+                    else:
+                        shard_main_param_numel = shard_main_param.nelement()
+                    assert param_range.size == shard_main_param_numel
 
                     model_grad = model_param.main_grad
                     shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]

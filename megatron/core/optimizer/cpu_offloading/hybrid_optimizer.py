@@ -5,6 +5,12 @@ from ..muon import Muon
 
 import torch
 
+from megatron.core.fp8_utils import (
+    dequantize_fp8_tensor,
+    get_fp8_cpu_offload_proxy_info,
+    get_fp8_cpu_offload_proxy_numel,
+)
+
 _CPU_ADAM_STATE_KEYS = {"exp_avg", "exp_avg_sq", "adamw_exp_avg", "adamw_exp_avg_sq"}
 
 
@@ -83,6 +89,69 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
+    def _get_high_prec_param_shard_for_fp8_proxy(self, proxy_param):
+        """Return this proxy's current high-precision model-param shard."""
+        info = get_fp8_cpu_offload_proxy_info(proxy_param)
+        assert info is not None, "Expected an FP8 CPU-offload proxy with metadata."
+        model_param = info.blockwise_fp8_model_param
+        start_offset = info.start_offset
+        shard_numel = info.shard_numel
+
+        high_precision_init_val = None
+        if hasattr(model_param, "get_high_precision_init_val"):
+            high_precision_init_val = model_param.get_high_precision_init_val()
+        if high_precision_init_val is not None:
+            return high_precision_init_val.view(-1)[start_offset : start_offset + shard_numel]
+
+        return dequantize_fp8_tensor(model_param).view(-1)[
+            start_offset : start_offset + shard_numel
+        ]
+
+    def _build_fp8_cpu_offload_master_param_shard(self, proxy_param):
+        """Build the optimizer-owned CPU FP32 master param shard for an FP8 proxy."""
+        info = get_fp8_cpu_offload_proxy_info(proxy_param)
+        assert info is not None, "Expected an FP8 CPU-offload proxy with metadata."
+        model_param_shard = self._get_high_prec_param_shard_for_fp8_proxy(proxy_param)
+        master_param = model_param_shard.detach().to(
+            device="cpu", dtype=torch.float32, copy=True
+        ).contiguous()
+        if self.pin_cpu_params:
+            master_param = master_param.pin_memory()
+        # Release the CPU bf16 high-precision init copy NOW — the master shard
+        # has already been built from it, so the init copy is dead weight.
+        # Without this, every FP8 weight keeps a CPU bf16 duplicate for the
+        # whole run, inflating host RAM by ~param_size per rank (e.g. ~240GB
+        # per node for full-size Kimi K2.6 8 ranks), which causes host OOM.
+        model_param = info.blockwise_fp8_model_param
+        if hasattr(model_param, "clear_high_precision_init_val"):
+            model_param.clear_high_precision_init_val()
+        return master_param
+
+    def _copy_fp8_offload_master_to_model_param(self, proxy_param, cpu_master_param):
+        """Quantize a CPU FP32 master shard back into the real FP8 model parameter."""
+        from megatron.core.fp8_utils import quantize_param_shard
+
+        info = get_fp8_cpu_offload_proxy_info(proxy_param)
+        assert info is not None, "Expected an FP8 CPU-offload proxy with metadata."
+        model_param = info.blockwise_fp8_model_param
+        start_offset = info.start_offset
+
+        master_param = cpu_master_param
+        staged_master_param = None
+        if not master_param.is_cuda:
+            staged_master_param = master_param.to(model_param.device, non_blocking=True)
+            master_param = staged_master_param
+
+        quantize_param_shard(
+            [model_param],
+            [master_param],
+            [start_offset],
+            info.data_parallel_group,
+        )
+
+        if staged_master_param is not None:
+            del staged_master_param
+
     def _set_sub_optimizer_grads(self):
         if self.param_update_in_fp32:
             for param in self.param_to_fp32_param:
@@ -124,7 +193,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        if get_fp8_cpu_offload_proxy_info(gpu_param) is not None:
+                            # Copy CPU master weight back to GPU model weight with FP8 quantization.
+                            self._copy_fp8_offload_master_to_model_param(gpu_param, param)
+                        else:
+                            gpu_param.data.copy_(param.data, non_blocking=True)
                 self._d2h_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -258,8 +331,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         params = []
         for group in self.param_groups:
             params.extend(group["params"])
-        params_total_numel = sum([param.numel() for param in params])
-        gpu_params_total_numel = sum([param.numel() for param in params if param.is_cuda])
+        params_total_numel = sum([get_fp8_cpu_offload_proxy_numel(param) for param in params])
+        gpu_params_total_numel = sum([get_fp8_cpu_offload_proxy_numel(param) for param in params if param.is_cuda])
         cpu_params_total_numel = params_total_numel - gpu_params_total_numel
         offload_threshold = gpu_params_total_numel * offload_fraction
         offload_params_numel = 0
@@ -276,7 +349,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in group["params"]:
                 orig_param = param
                 cpu_copy = False
-                if offload_params_numel < offload_threshold and param.is_cuda:
+                if get_fp8_cpu_offload_proxy_info(param) is not None:
+                    cpu_master_param = self._build_fp8_cpu_offload_master_param_shard(param)
+                    param = cpu_master_param
+                    offload_params_numel += param.numel()
+                    cpu_copy = True
+                elif offload_params_numel < offload_threshold and param.is_cuda:
                     param = param.detach().clone().cpu().pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
@@ -394,7 +472,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         Update the fp32 parameters by the new parameters.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+            if get_fp8_cpu_offload_proxy_info(param) is not None:
+                model_param_shard = self._get_high_prec_param_shard_for_fp8_proxy(param)
+                fp32_param.data.copy_(
+                    model_param_shard.to(device=fp32_param.device, dtype=fp32_param.dtype)
+                )
+            else:
+                fp32_param.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):

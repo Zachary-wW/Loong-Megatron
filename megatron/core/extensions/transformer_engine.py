@@ -25,6 +25,7 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_world_size,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -81,6 +82,80 @@ def _get_extra_te_kwargs(config: TransformerConfig):
 def condition_init_method(config, init_method):
     """Condition TE init_method on config.perform_initialization."""
     return init_method if config.perform_initialization else (lambda w: None)
+
+
+def _initialize_affine_weight_cpu_with_te_quantized_copy(
+    weight,
+    output_size,
+    input_size,
+    per_partition_size,
+    partition_dim,
+    init_method,
+    stride=1,
+    return_master_weight=False,
+    *,
+    params_dtype=torch.float32,
+    rank=None,
+    world_size=None,
+    skip_set_tensor_parallel_attributes=False,
+):
+    """CPU initialize affine weights, including TE FP8 weights that quantize on copy."""
+    from megatron.core.fp8_utils import is_float8tensor
+
+    if not is_float8tensor(weight.data):
+        return _initialize_affine_weight_cpu(
+            weight,
+            output_size,
+            input_size,
+            per_partition_size,
+            partition_dim,
+            init_method,
+            stride=stride,
+            return_master_weight=return_master_weight,
+            params_dtype=params_dtype,
+            rank=rank,
+            world_size=world_size,
+            skip_set_tensor_parallel_attributes=skip_set_tensor_parallel_attributes,
+        )
+
+    if not skip_set_tensor_parallel_attributes:
+        set_tensor_model_parallel_attributes(
+            tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
+        )
+
+    # Initialize master weight
+    master_weight = torch.empty(output_size, input_size, dtype=torch.float, requires_grad=False)
+    init_method(master_weight)
+    master_weight = master_weight.to(dtype=params_dtype)
+
+    # Split and copy
+    per_partition_per_stride_size = divide(per_partition_size, stride)
+    weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
+    if rank is None:
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+    my_weight_list = weight_list[rank::world_size]
+
+    # This copy block is the only behavior difference from _initialize_affine_weight_cpu.
+    # TE handles high-precision init value preservation when TE runs the init itself;
+    # this Megatron CPU-init path creates cpu_weight outside TE, so attach it
+    # explicitly before copying it to the FP8 weight device for QuantizedTensor.copy_
+    # to quantize.
+    with torch.no_grad():
+        cpu_weight = torch.cat(my_weight_list, dim=partition_dim).to_dense()
+        if hasattr(weight, "set_high_precision_init_val"):
+            weight.set_high_precision_init_val(cpu_weight)
+        if weight.device.type != "cpu":
+            copy_src = cpu_weight.to(device=weight.device, non_blocking=True)
+        else:
+            copy_src = cpu_weight
+        weight.data.copy_(copy_src)
+        if copy_src is not cpu_weight:
+            del copy_src
+
+    if return_master_weight:
+        return master_weight
+    return None
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -592,7 +667,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
-            _ = _initialize_affine_weight_cpu(
+            _ = _initialize_affine_weight_cpu_with_te_quantized_copy(
                 self.weight,
                 output_size,
                 input_size,
@@ -700,7 +775,7 @@ class TEColumnParallelLinear(TELinear):
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, world_size)
-            _ = _initialize_affine_weight_cpu(
+            _ = _initialize_affine_weight_cpu_with_te_quantized_copy(
                 self.weight,
                 output_size,
                 input_size,
@@ -794,7 +869,7 @@ class TERowParallelLinear(TELinear):
             world_size = get_pg_size(tp_group)
             rank = get_pg_rank(tp_group)
             input_size_per_partition = divide(input_size, world_size)
-            self.master_weight = _initialize_affine_weight_cpu(
+            self.master_weight = _initialize_affine_weight_cpu_with_te_quantized_copy(
                 self.weight,
                 output_size,
                 input_size,
