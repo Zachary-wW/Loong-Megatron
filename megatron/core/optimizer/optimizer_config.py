@@ -187,6 +187,27 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    optimizer_offload_grad_streaming: bool = False
+    """If True, stream gradients to CPU through two bounded pinned staging
+    arenas (bucketed waves) instead of keeping a persistent full-size pinned
+    grad mirror (saves 4 bytes/param of host RAM). Implies
+    overlap_cpu_optimizer_d2h_h2d."""
+
+    optimizer_offload_grad_streaming_bucket_mb: int = 4096
+    """Bucket (wave) size in MiB for gradient streaming; two arenas of
+    max(bucket, largest param) bytes are allocated."""
+
+    optimizer_cpu_offload_contiguous_state: bool = False
+    """If True, place the CPU-offloaded optimizer state (fp32 master params,
+    exp_avg, exp_avg_sq) in per-buffer contiguous pinned arenas laid out in
+    the distributed optimizer's dp_zero world (unpadded) order, with per-param
+    state tensors as views. With data-parallel size 1 this makes legacy
+    (--ckpt-format torch) optimizer save/load zero-copy: torch.save serializes
+    the arenas directly, producing a byte-identical dp_zero checkpoint without
+    the gather/concat host-RAM spike. Falls back to the regular path (with a
+    log message) whenever preconditions are not met (DP > 1, partial offload,
+    non-fp32 optimizer state dtypes, non-Adam optimizers)."""
+
     use_deepspeed_cpu_adam: bool = True
     """If True, use DeepSpeed CPU Adam implementation instead of Torch CPU Adam."""
 

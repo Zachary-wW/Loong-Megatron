@@ -61,6 +61,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        grad_streaming: bool = False,
+        grad_streaming_bucket_bytes: int = 4 * 1024 * 1024 * 1024,
+        contiguous_state: bool = False,
         **kwargs
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -73,6 +76,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
+                "grad_streaming": grad_streaming,
+                "grad_streaming_bucket_bytes": grad_streaming_bucket_bytes,
+                "contiguous_state": contiguous_state,
                 **kwargs,
             },
         )
@@ -82,8 +88,22 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.gpu_optimizer_cls = gpu_optimizer_cls
         self.pin_cpu_grads = pin_cpu_grads
         self.pin_cpu_params = pin_cpu_params
-        self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
+        # Bucketed gradient streaming: replace the persistent full-size pinned
+        # CPU grad mirror (4 B/param host RAM) with two bounded pinned staging
+        # arenas consumed wave-by-wave. It needs the per-param cpu_optimizers
+        # granularity and the dedicated copy streams, so it implies
+        # overlap_cpu_optimizer_d2h_h2d.
+        self.grad_streaming = grad_streaming
+        self.grad_streaming_bucket_bytes = grad_streaming_bucket_bytes
+        self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d or grad_streaming
         self.param_update_in_fp32 = param_update_in_fp32
+        # Arenas are materialized by DistributedOptimizer (it owns the dp_zero
+        # layout); while not intact, every consumer falls back to the regular
+        # paths. Pre-migration masters stay unpinned so freeing them returns
+        # memory to the OS instead of the pinned-memory cache.
+        self.contiguous_state = contiguous_state
+        self.state_arenas = None
+        self._arena_slices = None
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers()
@@ -115,7 +135,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         master_param = model_param_shard.detach().to(
             device="cpu", dtype=torch.float32, copy=True
         ).contiguous()
-        if self.pin_cpu_params:
+        if self.pin_cpu_params and not self.contiguous_state:
             master_param = master_param.pin_memory()
         # Release the CPU bf16 high-precision init copy NOW — the master shard
         # has already been built from it, so the init copy is dead weight.
@@ -152,20 +172,25 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if staged_master_param is not None:
             del staged_master_param
 
+    def _set_gpu_fp32_grads(self):
+        """fp32 grads for the non-offloaded (GPU optimizer) params."""
+        if not self.param_update_in_fp32:
+            return
+        for param in self.param_to_fp32_param:
+            if param in self.gpu_params_map_cpu_copy:
+                # Skip if the param is offloaded to CPU, it should be handled
+                # in the following part.
+                continue
+            fp32_param = self.param_to_fp32_param[param]
+            grad = getattr(param, "decoupled_grad", param.grad)
+            if grad is not None:
+                fp32_param.grad = grad.to(fp32_param.dtype)
+                fp32_param.requires_grad = True
+            else:
+                fp32_param.requires_grad = False
+
     def _set_sub_optimizer_grads(self):
-        if self.param_update_in_fp32:
-            for param in self.param_to_fp32_param:
-                if param in self.gpu_params_map_cpu_copy:
-                    # Skip if the param is offloaded to CPU, it should be handled
-                    # in the following part.
-                    continue
-                fp32_param = self.param_to_fp32_param[param]
-                grad = getattr(param, "decoupled_grad", param.grad)
-                if grad is not None:
-                    fp32_param.grad = grad.to(fp32_param.dtype)
-                    fp32_param.requires_grad = True
-                else:
-                    fp32_param.requires_grad = False
+        self._set_gpu_fp32_grads()
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
@@ -185,6 +210,139 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
+
+    # ------------------------------------------------------------------
+    # Bucketed gradient streaming
+    #
+    # Gradients are consume-once data: their CPU lifetime is only
+    # "D2H copy done -> consumed by this param's Adam update". Instead of one
+    # persistent pinned mirror per param (4 B/param host RAM, e.g. ~503 GB per
+    # node on Kimi K2.7 at offload 1.0), stage them through TWO pinned arenas
+    # of at most max(bucket_bytes, largest param) each: wave k stages into
+    # arena k%2 while the CPU consumes wave k-1 (producer-consumer pipeline,
+    # gated by one CUDA event per wave). Arena k%2 is only overwritten by wave
+    # k+2, strictly after wave k's optimizer steps finished on this thread.
+    # The arithmetic (values, kernel, per-param update order) is unchanged, so
+    # results are bit-exact vs the mirror path.
+    # ------------------------------------------------------------------
+
+    def _build_grad_streaming_plan(self):
+        """Partition cpu_optimizers (in order) into waves of <= bucket_bytes.
+
+        Returns (waves, arena_bytes) where each wave is a list of
+        (optimizer, [(param, byte_offset, nbytes), ...]) and byte offsets are
+        16-byte aligned within the wave's arena.
+        """
+        ALIGN = 16
+        waves = []
+        cur_wave = []
+        cur_bytes = 0
+        arena_bytes = 0
+        for optimizer in self.cpu_optimizers:
+            opt_params = []
+            opt_bytes = 0
+            for param in _param_generator(optimizer):
+                nbytes = param.numel() * param.element_size()
+                aligned = (nbytes + ALIGN - 1) // ALIGN * ALIGN
+                opt_params.append((param, opt_bytes, nbytes))
+                opt_bytes += aligned
+            # An optimizer's params never split across waves (its step consumes
+            # all of them at once).
+            if cur_wave and cur_bytes + opt_bytes > self.grad_streaming_bucket_bytes:
+                waves.append(cur_wave)
+                arena_bytes = max(arena_bytes, cur_bytes)
+                cur_wave = []
+                cur_bytes = 0
+            opt_params = [(p, cur_bytes + off, n) for (p, off, n) in opt_params]
+            cur_wave.append((optimizer, opt_params))
+            cur_bytes += opt_bytes
+        if cur_wave:
+            waves.append(cur_wave)
+            arena_bytes = max(arena_bytes, cur_bytes)
+        return waves, arena_bytes
+
+    def _ensure_grad_streaming_buffers(self):
+        if getattr(self, "_gs_waves", None) is not None:
+            return
+        self._gs_waves, arena_bytes = self._build_grad_streaming_plan()
+        self._gs_arenas = [
+            torch.empty(arena_bytes, dtype=torch.uint8, device="cpu",
+                        pin_memory=self.pin_cpu_grads)
+            for _ in range(2)
+        ] if arena_bytes > 0 else []
+        self._gs_events = [None, None]
+
+    def _gs_issue_wave(self, w):
+        """Producer: enqueue async D2H copies of wave w's grads into arena w%2."""
+        if w >= len(self._gs_waves):
+            return
+        arena = self._gs_arenas[w % 2]
+        with torch.cuda.stream(self._d2h_stream):
+            for optimizer, opt_params in self._gs_waves[w]:
+                for param, byte_off, nbytes in opt_params:
+                    gpu_param = self.cpu_copys_map_gpu_param[param]
+                    grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
+                    param.requires_grad = False
+                    if grad is None:
+                        param.grad = None
+                        continue
+                    view = (
+                        arena[byte_off : byte_off + nbytes]
+                        .view(param.dtype)
+                        .view(param.shape)
+                    )
+                    view.copy_(grad, non_blocking=True)
+                    param.grad = view
+            self._gs_events[w % 2] = self._d2h_stream.record_event()
+
+    def _streamed_cpu_steps(self, closure=None):
+        """Consumer loop: wait wave event, step its optimizers, refill arena."""
+        import os
+        import time
+
+        debug = os.environ.get("GRAD_STREAMING_DEBUG", "0") == "1"
+        rank = os.environ.get("RANK", "?")
+
+        def dbg(msg):
+            if debug:
+                print(f"[grad-stream][rank {rank}] {msg}", flush=True)
+
+        self._ensure_grad_streaming_buffers()
+        if not self._gs_waves:
+            return
+        n = len(self._gs_waves)
+        t_begin = time.monotonic()
+        sync_s = step_s = step_mx = 0.0
+        self._d2h_stream.wait_stream(torch.cuda.current_stream())
+        self._gs_issue_wave(0)
+        self._gs_issue_wave(1)
+        for w, wave in enumerate(self._gs_waves):
+            t0 = time.monotonic()
+            event = self._gs_events[w % 2]
+            if event is not None:
+                event.synchronize()
+            t1 = time.monotonic()
+            for optimizer, _ in wave:
+                if isinstance(optimizer, Muon):
+                    optimizer.step(self.cpu_copys_map_gpu_param)
+                else:
+                    optimizer.step(closure)
+            t2 = time.monotonic()
+            # Wave w fully consumed on this thread -> arena w%2 is free for
+            # wave w+2. (Master copy-back reads masters, not grads.)
+            self._gs_issue_wave(w + 2)
+            sync_s += t1 - t0
+            step_s += t2 - t1
+            if t2 - t1 > step_mx:
+                step_mx = t2 - t1
+        # one line per optimizer chain per iteration
+        arena = (
+            f" arena {len(self._gs_arenas[0]) / 2**30:.2f}GiBx2" if self._gs_arenas else ""
+        )
+        dbg(
+            f"{n} waves in {time.monotonic() - t_begin:.2f}s: sync {sync_s:.2f}s "
+            f"step {step_s:.2f}s (max {step_mx:.2f}s){arena}"
+        )
 
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
@@ -235,6 +393,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
 
+        if self.grad_streaming:
+            # Bucketed gradient streaming: no persistent grad mirrors; grads
+            # are staged wave-by-wave through two bounded pinned arenas.
+            self._d2h_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._d2h_stream):
+                self._set_gpu_fp32_grads()
+            if self.gpu_optimizer:
+                self.gpu_optimizer.step(closure)
+            self._streamed_cpu_steps(closure)
+            self._sync_sub_optimizers_state_to_hdo()
+            return
+
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
             self._set_sub_optimizer_grads()
@@ -280,7 +450,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
 
         self.cpu_optimizers = []
-        if self.overlap_cpu_optimizer_d2h_h2d:
+        if self.grad_streaming:
+            # Wave-granularity optimizers: one CPU optimizer per <=bucket_bytes
+            # group of params. Per-PARAM granularity (below) constructs O(1000)
+            # optimizer instances per rank; with DeepSpeed CPUAdam every
+            # instance re-enters the extension loader (file-locked across the
+            # 8 local ranks), which serializes init into tens of minutes.
+            self.cpu_optimizers = self.build_cpu_optimizer_list_bucketed(
+                self.cpu_optimizer_cls, self.cpu_param_groups,
+                self.grad_streaming_bucket_bytes,
+            )
+        elif self.overlap_cpu_optimizer_d2h_h2d:
             self.cpu_optimizers = self.build_cpu_optimizer_list(
                 self.cpu_optimizer_cls, self.cpu_param_groups
             )
@@ -299,8 +479,41 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._d2h_stream = torch.cuda.Stream()
             self._h2d_stream = torch.cuda.Stream()
         self._cpu_optimizer_map_data_event = dict()
+        # Grad-streaming plan is param-identity based; rebuild lazily after any
+        # re-init (e.g. load_state_dict replaces the CPU master params).
+        self._gs_waves = None
+        self._gs_arenas = []
+        self._gs_events = [None, None]
 
         self._register_param_copy_back_gpu_hook()
+
+    @staticmethod
+    def build_cpu_optimizer_list_bucketed(cpu_optimizer_cls, cpu_param_groups, bucket_bytes):
+        """One CPU optimizer per <=bucket_bytes run of params (in order, never
+        crossing a param-group boundary — groups carry distinct hyperparams).
+        Used by grad streaming: each optimizer becomes one pipeline wave."""
+        ALIGN = 16
+        cpu_optimizers = []
+        for group in cpu_param_groups:
+            group_defaults = group.copy()
+            params = group_defaults.pop("params")
+            if isinstance(params, torch.Tensor):
+                params = [params]
+            cur, cur_bytes = [], 0
+            for param in params:
+                nbytes = (param.numel() * param.element_size() + ALIGN - 1) // ALIGN * ALIGN
+                if cur and cur_bytes + nbytes > bucket_bytes:
+                    sub = group_defaults.copy()
+                    sub["params"] = cur
+                    cpu_optimizers.append(cpu_optimizer_cls([sub]))
+                    cur, cur_bytes = [], 0
+                cur.append(param)
+                cur_bytes += nbytes
+            if cur:
+                sub = group_defaults.copy()
+                sub["params"] = cur
+                cpu_optimizers.append(cpu_optimizer_cls([sub]))
+        return cpu_optimizers
 
     @staticmethod
     def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
@@ -327,6 +540,28 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
         return cpu_optimizers
 
+    def _rebuild_arena_master_view(self, orig_param, shaped_like):
+        """Arena view for a rebuilt CPU master (e.g. on load_state_dict).
+
+        Binding masters straight to their arena slices avoids the rebuild
+        transient where every temp master coexists until migration
+        (+4 B/param/rank host RAM). Returns None on the first build (no arena
+        layout yet) or on any mismatch — callers then allocate normally and
+        materialize_state_arenas() migrates as before."""
+        if not self.contiguous_state:
+            return None
+        arenas = self.state_arenas
+        slices = getattr(self, "_arena_slices", None)
+        if arenas is None or not slices:
+            return None
+        entry = slices.get(orig_param)
+        if entry is None:
+            return None
+        gbuf_idx, start, numel = entry
+        if shaped_like.numel() != numel:
+            return None
+        return arenas[gbuf_idx]["param"][start : start + numel].view(shaped_like.shape)
+
     def _get_sub_optimizer_param_groups(self, offload_fraction: float):
         params = []
         for group in self.param_groups:
@@ -351,11 +586,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 cpu_copy = False
                 if get_fp8_cpu_offload_proxy_info(param) is not None:
                     cpu_master_param = self._build_fp8_cpu_offload_master_param_shard(param)
+                    view = self._rebuild_arena_master_view(orig_param, cpu_master_param)
+                    if view is not None:
+                        # temp master dies this iteration -> transient is one
+                        # param, not the whole model
+                        view.copy_(cpu_master_param)
+                        cpu_master_param = view
                     param = cpu_master_param
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 elif offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    view = self._rebuild_arena_master_view(orig_param, param)
+                    if view is not None:
+                        view.copy_(param.detach())  # D2H straight into the pinned arena
+                        param = view
+                    else:
+                        param = param.detach().clone().cpu()
+                        if not self.contiguous_state:
+                            param = param.pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 if self.param_update_in_fp32:
@@ -480,6 +728,185 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             else:
                 fp32_param.data.copy_(param)
 
+    @torch.no_grad()
+    def materialize_state_arenas(self, layout):
+        """Rebase the CPU optimizer state onto contiguous per-buffer arenas.
+
+        `layout` is provided by DistributedOptimizer (the owner of the grad
+        buffer geometry) and describes the dp_zero world (unpadded) layout:
+
+            layout = {
+                "gbuf_numels_unpadded": [numel per grad buffer],
+                # bucket order, so the transient during master migration is
+                # bounded to one param at a time:
+                "entries": [(orig_param, gbuf_idx, world_start, numel), ...],
+            }
+
+        For every entry the existing per-param CPU fp32 master is copied into
+        its arena slice and rebound in place (`inner.data = view`), so object
+        identity in param_groups / state / all internal maps is preserved.
+        exp_avg / exp_avg_sq are pre-seeded as (zero) arena views on the CPU
+        sub-optimizers, which skips their lazy `zeros_like` initialization on
+        first step (both DeepSpeedCPUAdam and torch Adam/AdamW gate it on
+        `len(state) == 0` — `step` must therefore be pre-seeded too).
+
+        Must be called again after anything that reruns _init_sub_optimizers()
+        (e.g. load_state_dict): the rebuild replaces masters and sub-optimizer
+        state, leaving the arenas unbound. Arena storages themselves are
+        reused across re-materializations. Returns True when the arenas are
+        bound; False (with everything left on the regular non-arena path) when
+        a precondition fails.
+        """
+        if not self.contiguous_state:
+            return False
+
+        def _fail(reason):
+            self._arena_slices = None
+            import warnings
+
+            warnings.warn(f"HDO contiguous state arenas disabled: {reason}")
+            return False
+
+        # Preconditions: fully offloaded, Adam-family CPU sub-optimizers
+        # (their state is exactly {step, exp_avg, exp_avg_sq}).
+        if self.gpu_optimizer is not None:
+            return _fail("not fully offloaded (gpu sub-optimizer present)")
+        for opt in self.cpu_optimizers:
+            if not (
+                isinstance(opt, (torch.optim.Adam, torch.optim.AdamW))
+                or type(opt).__name__ == "DeepSpeedCPUAdam"
+            ):
+                return _fail(f"unsupported cpu optimizer {type(opt).__name__}")
+
+        # Validate the full layout before touching anything, so a failure
+        # never leaves a partial binding behind.
+        entries = layout["entries"]
+        slice_map = {}
+        for orig_param, gbuf_idx, start, numel in entries:
+            inner = self.param_to_inner_param.get(orig_param)
+            if inner is None or inner.is_cuda or inner.dtype != torch.float32:
+                return _fail("param without a CPU fp32 master")
+            if inner.numel() != numel:
+                return _fail(
+                    f"shard numel mismatch ({inner.numel()} vs layout {numel})"
+                )
+            slice_map[orig_param] = (gbuf_idx, start, numel)
+        inner_covered = {self.param_to_inner_param[p] for p in slice_map}
+        for opt in self.cpu_optimizers:
+            for p in _param_generator(opt):
+                if p not in inner_covered:
+                    return _fail("cpu sub-optimizer param not covered by layout")
+
+        # Allocate (or reuse across re-materializations) the arenas. Zeros
+        # matter: gap bytes (intra-bucket alignment) must match the zeros of
+        # the regular dp_zero save path for byte-identical checkpoints.
+        numels = list(layout["gbuf_numels_unpadded"])
+        arenas = self.state_arenas
+        if arenas is None or [a["param"].numel() for a in arenas] != numels:
+            arenas = [
+                {
+                    key: torch.zeros(
+                        (numel,), dtype=torch.float32, pin_memory=self.pin_cpu_params
+                    )
+                    for key in ("param", "exp_avg", "exp_avg_sq")
+                }
+                for numel in numels
+            ]
+            self.state_arenas = arenas
+
+        # Migrate masters. Old per-param storages (kept unpinned in arena
+        # mode) are freed back to the OS one by one as they are rebound.
+        for orig_param, gbuf_idx, start, numel in entries:
+            inner = self.param_to_inner_param[orig_param]
+            view = arenas[gbuf_idx]["param"][start : start + numel].view(inner.shape)
+            if inner.data_ptr() != view.data_ptr():
+                view.copy_(inner.data)
+                inner.data = view
+
+        self._arena_slices = slice_map
+        self._reseed_arena_state_views()
+        self._sync_sub_optimizers_state_to_hdo()
+        return True
+
+    @torch.no_grad()
+    def _reseed_arena_state_views(self):
+        """(Re-)point every CPU sub-optimizer state entry at its arena views.
+
+        Existing values are preserved: moment tensors already holding data
+        (e.g. deep-copied by a preceding torch load_state_dict) are copied
+        into the arena views before rebinding; missing entries start from the
+        arena zeros. `step` keeps its current value when present, otherwise it
+        is initialized to zero with the type the optimizer class expects
+        (plain int for DeepSpeedCPUAdam, 0-dim tensor for torch Adam/AdamW).
+        """
+        for opt in self.cpu_optimizers:
+            is_ds = type(opt).__name__ == "DeepSpeedCPUAdam"
+            for param in _param_generator(opt):
+                orig = self.inner_param_to_orig_param[param]
+                gbuf_idx, start, numel = self._arena_slices[orig]
+                state = opt.state[param]
+                step = state.get("step")
+                if step is None:
+                    step = 0 if is_ds else torch.zeros((), dtype=torch.float32)
+                elif is_ds and isinstance(step, torch.Tensor):
+                    # DistributedOptimizer.load_state_dict writes `step` as a
+                    # fp32 tensor; DeepSpeedCPUAdam's C++ adam_update expects a
+                    # plain int — normalize.
+                    step = int(step.item())
+                elif not is_ds and not isinstance(step, torch.Tensor):
+                    step = torch.tensor(float(step), dtype=torch.float32)
+                for key in ("exp_avg", "exp_avg_sq"):
+                    view = self.state_arenas[gbuf_idx][key][
+                        start : start + numel
+                    ].view(param.shape)
+                    old = state.get(key)
+                    if isinstance(old, torch.Tensor):
+                        if old.data_ptr() == view.data_ptr():
+                            continue
+                        if old.shape == view.shape:
+                            view.copy_(old.to(view.dtype))
+                    state[key] = view
+                state["step"] = step
+
+    def state_arenas_intact(self):
+        """Whether every CPU master / moment tensor is still an arena view.
+
+        Cheap data_ptr check used to gate the zero-copy save/load fast paths.
+        Returns False whenever the arenas were never materialized, or any
+        state-replacing path (e.g. a rebuild without re-materialization) has
+        silently detached tensors from the arenas — consumers then fall back
+        to the regular gather/scatter code.
+        """
+        arenas = self.state_arenas
+        slices = self._arena_slices
+        if arenas is None or slices is None or self.gpu_optimizer is not None:
+            return False
+        esize = 4  # fp32
+        try:
+            checked = 0
+            for orig, (gbuf_idx, start, numel) in slices.items():
+                inner = self.param_to_inner_param.get(orig)
+                if inner is None:
+                    return False
+                base = arenas[gbuf_idx]
+                if inner.data_ptr() != base["param"].data_ptr() + start * esize:
+                    return False
+                state = self.state.get(orig)
+                if not state:
+                    return False
+                for key in ("exp_avg", "exp_avg_sq"):
+                    t = state.get(key)
+                    if (
+                        not isinstance(t, torch.Tensor)
+                        or t.data_ptr() != base[key].data_ptr() + start * esize
+                    ):
+                        return False
+                checked += 1
+            total = sum(1 for opt in self.cpu_optimizers for _ in _param_generator(opt))
+            return checked == total
+        except (KeyError, IndexError, AttributeError):
+            return False
+
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
             """
@@ -555,11 +982,19 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         The dummy step can be used to initialize the potential optimizer.state,
         which can solve the problem of checkpoint loading for an inplace operation
         such as loading a torch distributed checkpoint, for example.
+
+        Steps the sub-optimizers directly: step()'s grad transfer reads
+        GPU-side grads, which don't exist yet at checkpoint-load time.
+        One sub-optimizer at a time, so the synthetic grads only ever
+        occupy one sub-optimizer's worth of host RAM (all-at-once means
+        +4 B/param — hundreds of GB per node at large scale).
         """
-        for group in self.param_groups:
-            for param in group["params"]:
+        self._sync_hdo_param_groups_to_sub_optimizers()
+        for optimizer in self.sub_optimizers:
+            for param in _param_generator(optimizer):
                 param.grad = torch.randn_like(param)
-        self.step()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         self.zero_grad()
 
     @property

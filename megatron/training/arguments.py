@@ -2368,6 +2368,19 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--optimizer-offload-grad-streaming', action='store_true',
+                       help='Stream gradients to CPU through two bounded pinned staging '
+                       'arenas (bucketed waves) instead of a persistent full-size grad '
+                       'mirror; saves 4 bytes/param host RAM at offload time.')
+    group.add_argument('--optimizer-offload-grad-streaming-bucket-mb', type=int, default=4096,
+                       help='Wave/bucket size in MiB for --optimizer-offload-grad-streaming.')
+    group.add_argument('--optimizer-cpu-offload-contiguous-state', action='store_true',
+                       help='Keep CPU-offloaded optimizer state (fp32 master, exp_avg, '
+                       'exp_avg_sq) in per-buffer contiguous pinned arenas laid out in '
+                       'dp_zero world order. With DP=1 this makes legacy (torch format) '
+                       'optimizer checkpoint save/load zero-copy (no gather/concat host '
+                       'RAM spike); falls back to the regular path when preconditions '
+                       'are not met.')
     group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false', dest='use_deepspeed_cpu_adam',
                        help='Disable Deepspeed CPU Adam implementation.')
     group.add_argument('--dataloader-type', type=str, default=None,
