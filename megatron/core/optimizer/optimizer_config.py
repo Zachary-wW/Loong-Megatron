@@ -279,8 +279,6 @@ class OptimizerConfig:
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."

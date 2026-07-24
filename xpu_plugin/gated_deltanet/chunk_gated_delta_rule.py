@@ -139,7 +139,6 @@ def l2norm_fwd(
     rstd = inv_norm
     return out.to(x.dtype), rstd
 
-
 def l2norm_bwd(
     y: torch.Tensor,
     rstd: torch.Tensor,

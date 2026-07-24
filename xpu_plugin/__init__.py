@@ -83,9 +83,9 @@ def replace_symbol(symbol_path, target, record_origin=True, verbose=True):
     try:
         for part in parts[1:-1]:
             obj = getattr(obj, part)
-        origin = getattr(obj, parts[-1])
+        origin = getattr(obj, parts[-1], None)
         setattr(obj, parts[-1], target)
-        if record_origin:
+        if record_origin and origin is not None:
             setattr(obj, f'__origin_{parts[-1]}', origin)
         if verbose:
             print(f'[INFO] Symbol {symbol_path} replaced with {target.__name__}')
@@ -109,6 +109,10 @@ def init_megatron_core_xpu_plugin():
     replace_module("scaled_softmax_cuda", "xpu_plugin.scaled_softmax")
     
     # replace_symbol
+    replace_symbol(
+        "transformer_engine_torch.thd_get_partitioned_indices",
+        mock_megatron.mock_thd_get_partitioned_indices,
+    )
     replace_symbol(
         "megatron.legacy.model.fused_layer_norm.MixedFusedLayerNorm",
         mock_megatron.MockMixedFusedLayerNorm,
@@ -184,3 +188,7 @@ def init_megatron_core_xpu_plugin():
             "megatron.core.fusions.linear_cross_entropy.generic.entry.backward",
             mock_megatron.mock_lce_backward,
         )
+
+    # Auto-detect DTensor params and use torch.optim.AdamW (supports DTensor and BF16)
+    # instead of TE/Apex FusedAdam to avoid optimizer kernel errors
+    replace_symbol("megatron.core.optimizer.Adam", mock_megatron.Adam)
