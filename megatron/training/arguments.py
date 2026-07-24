@@ -3469,6 +3469,8 @@ def _add_experimental_attention_variant_args(parser):
     group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
                        help='Use sparse indexer loss.'
                        'If set, the indexer loss will be computed using the top-k indices.')
+    group.add_argument('--apply-dsa-kernel-fusion', action='store_true', default=False,
+                       help='Use fused DSA/CSA kernel for sparse attention.')
     return parser
 
 def _add_heterogeneous_args(parser):

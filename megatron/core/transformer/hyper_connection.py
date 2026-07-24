@@ -17,15 +17,18 @@ from megatron.core.utils import nvtx_decorator
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
+_MHC_SINKHORN_EPS = 1e-6
+_MHC_COMPUTE_H_EPS = 1e-6
+
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     """Run Sinkhorn normalization iterations on input logits."""
-    row_max = input_logits.max(dim=-1, keepdim=True).values
-    M = torch.exp(input_logits - row_max)
-    for _ in range(num_iterations):
-        M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
-        M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
+    M = input_logits.softmax(dim=-1) + eps
+    M = M / (M.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(num_iterations - 1):
+        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + eps)
     return M
 
 
@@ -75,13 +78,13 @@ def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Native H_res @ residual + H_post * (x [+ bias])."""
+    """Native H_res.T @ residual + H_post * (x [+ bias])."""
     output_dtype = original_residual.dtype
     compute_dtype = h_res.dtype
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.to(compute_dtype).view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.to(compute_dtype).unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.to(compute_dtype).view(1, 1, 1, C)
@@ -194,6 +197,8 @@ class HyperConnectionModule(MegatronModule):
         self.n = config.num_residual_streams
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
+        self.sinkhorn_eps = _MHC_SINKHORN_EPS
+        self.compute_h_eps = _MHC_COMPUTE_H_EPS
 
         # Projection weights for dynamic mappings
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
@@ -290,7 +295,7 @@ class HyperConnectionModule(MegatronModule):
         )
         h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
+        h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
 
         # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
         h_post = h[..., self.n : 2 * self.n].sigmoid() * 2  # [s, b, n]
@@ -318,7 +323,7 @@ class HyperConnectionModule(MegatronModule):
         with torch.cuda.nvtx.range("HyperConnection::compute_h"):
             h_pre, h_post, h_res = self._compute_h(proj, r)
         h_res = self._sinkhorn_op(
-            h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.norm_eps
+            h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.sinkhorn_eps
         )  # [s, b, n, n]
 
         return h_pre, h_post, h_res
@@ -428,7 +433,7 @@ class HyperConnectionModule(MegatronModule):
         """
         Apply H_res to residual using H_res weights.
 
-        Computes: H_res @ residual
+        Computes: H_res.T @ residual
 
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -443,8 +448,8 @@ class HyperConnectionModule(MegatronModule):
         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
         residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
 
-        # Batch matrix multiply: [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched, residual_batched.to(h_res.dtype))
+        # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
+        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched.to(h_res.dtype))
 
         return mixed.view(s, b, n * C).to(residual.dtype)
 
@@ -586,7 +591,7 @@ class HyperConnectionModule(MegatronModule):
         Currently implements the operations sequentially using native PyTorch.
 
         The computation flow is:
-            1. mixed = H_res @ original_residual (apply_h_res)
+            1. mixed = H_res.T @ original_residual (apply_h_res)
             2. expanded = H_post^T @ layer_output (apply_h_post)
             3. output = dropout(expanded + bias) + mixed (bias-dropout-add)
 

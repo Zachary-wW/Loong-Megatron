@@ -243,7 +243,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
-
+    
+    apply_dsa_kernel_fusion: bool = False
+    """Whether to use fused DSA kernel"""
     ####################
     # DeepSeek-v4 hybrid attention
     ####################

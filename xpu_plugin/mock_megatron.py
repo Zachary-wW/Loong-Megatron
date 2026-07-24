@@ -4,16 +4,54 @@ This module provides megatron-core-xpu plugin.
 """
 
 import sys
+import inspect
 
 import torch
 from torch import Tensor
 from torch.nn import LayerNorm as TorchLayerNorm
+from torch.optim import AdamW
 from typing import List, Optional, Tuple
 
 try:
     import torch_xmlir
 except Exception:
     torch_xmlir = None
+
+try:
+    import xspeedgate_ops
+except Exception:
+    xspeedgate_ops = None
+
+
+class Adam:
+    """
+    Automatically detect DTensor parameters and route to torch.optim.AdamW
+    (which supports DTensor and BF16) instead of TE/Apex FusedAdam.
+    If no DTensor is found, delegate to the original Adam via __origin_Adam.
+    Silently swallows any TE/Apex-only kwargs (adam_w_mode, bias_correction,
+    master_weights, ...) when using torch.optim.AdamW.
+    """
+
+    _TORCH_ADAMW_ARGS = set(inspect.signature(AdamW).parameters)
+
+    def __new__(cls, params, **kwargs):
+        has_dtensor = any(
+            isinstance(param, torch.distributed.tensor.DTensor)
+            for param_group in params
+            for param in param_group['params']
+        )
+        if has_dtensor:
+            # Use torch.optim.AdamW for DTensor compatibility
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in cls._TORCH_ADAMW_ARGS}
+            filtered_kwargs.setdefault('fused', True)
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print('[INFO] DTensor detected in params, using torch.optim.AdamW instead of FusedAdam')
+            return AdamW(params, **filtered_kwargs)
+        else:
+            # Use original Adam (FusedAdam) via __origin_Adam
+            import megatron.core.optimizer as _optim_mod
+            OriginalAdam = getattr(_optim_mod, '__origin_Adam')
+            return OriginalAdam(params, **kwargs)
 
 
 class MockMixedFusedLayerNorm(TorchLayerNorm):
@@ -661,3 +699,11 @@ def mock_lce_backward(
             d_hidden = d_hidden.view(partial_hidden_shape).clone()
 
     return d_hidden, d_weight
+
+
+def mock_thd_get_partitioned_indices(cu_seqlens, total_tokens, world_size, rank):
+    """
+    mock_thd_get_partitioned_indices
+    """
+    assert xspeedgate_ops is not None
+    return torch.ops.xspeedgate_ops.thd_get_partitioned_indices(cu_seqlens, total_tokens, world_size, rank)
