@@ -445,13 +445,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         Dispatches tokens to the experts based on the router output.
         """
-        token_dispatcher = layer.mlp.token_dispatcher
+        metadata = node.layer_state.dispatch_metadata
         if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
-            # backward graph from connecting to attn submodule
-            token_dispatcher._comm_manager.token_probs = probs
+            # backward graph from connecting to attn submodule.
+            # NOTE: DeepEP/HybridEP managers now read probs from `metadata`
+            # (moved off `_comm_manager` by the MoE load-balance refactor),
+            # so the detached probs must be written onto `metadata`.
+            metadata.token_probs = probs
 
-        metadata = node.layer_state.dispatch_metadata
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs, metadata)
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
@@ -465,14 +467,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         shared_expert_output = None
         dispatched_probs = node.layer_state.dispatched_probs
-        token_dispatcher = layer.mlp.token_dispatcher
+        metadata = node.layer_state.dispatch_metadata
         if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
-            # backward graph from connecting to dispatch submodule
-            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
+            # backward graph from connecting to dispatch submodule.
+            # NOTE: probs now live on `metadata` (see submodule_dispatch_forward).
+            metadata.dispatched_probs = dispatched_probs
 
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
-        metadata = node.layer_state.dispatch_metadata
 
         dispatched_input, tokens_per_expert, permuted_probs = layer.mlp.pre_routed_experts_compute(
             dispatched_tokens, dispatched_probs, metadata)
