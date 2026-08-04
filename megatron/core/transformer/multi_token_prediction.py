@@ -240,7 +240,17 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
 
-    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+    if cp_partition_mode == 'contiguous':
+        # The contiguous-CP local THD layout is derived from the padded
+        # per-sequence lengths, so index with cu_seqlens_q_padded when present;
+        # the unpadded cu_seqlens would produce wrong local boundaries.
+        if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        rolled_tensor = _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group)
+        return rolled_tensor, rolled_tensor.sum()
+
+    # CP enabled (zigzag): each rank owns two chunks per sequence (front and mirrored tail).
     local_rank = torch.distributed.get_rank(group=cp_group)
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
     next_rank = global_ranks[(local_rank + 1) % cp_size]
@@ -294,6 +304,60 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
     return rolled_tensor, rolled_tensor.sum()
+
+
+def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group):
+    """Roll a contiguous-CP THD shard without crossing packed sequence boundaries.
+
+    Ported from Megatron-LM. Rank r owns global rows
+    [r * local_seq_len, (r + 1) * local_seq_len); a left shift pulls the first
+    row of the next rank into this rank's last position, except at packed
+    sequence boundaries where the rolled-in value is zeroed.
+    """
+    local_seq_len = tensor.size(dims)
+    rolled_tensor = torch.roll(tensor, shifts=-1, dims=dims)
+    if local_seq_len == 0:
+        return rolled_tensor
+
+    cp_size = cp_group.size()
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    if cu.numel() > 1:
+        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+        cu = cu[nonduplicate_boundaries]
+    if cu.numel() <= 1:
+        rolled_tensor.zero_()
+        return rolled_tensor
+
+    global_start = local_rank * local_seq_len
+    global_positions = global_start + torch.arange(local_seq_len, device=tensor.device)
+    seq_idx = torch.bucketize(global_positions, cu[1:], right=True).clamp(max=cu.numel() - 2)
+    seq_ends = cu[1:][seq_idx]
+    valid_next = (global_positions < cu[-1]) & (global_positions + 1 < seq_ends)
+
+    invalid_next = ~valid_next
+    rolled_tensor[..., invalid_next] = 0
+
+    recv_next_first = torch.empty_like(tensor.select(dims, 0))
+    ops = []
+    if local_rank < cp_size - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(torch.distributed.irecv(tensor=recv_next_first, src=next_rank))
+    if local_rank > 0:
+        prev_rank = global_ranks[local_rank - 1]
+        send_first = tensor.select(dims, 0).contiguous()
+        ops.append(torch.distributed.isend(tensor=send_first, dst=prev_rank))
+    for op in ops:
+        op.wait()
+
+    if local_rank < cp_size - 1:
+        last = rolled_tensor.select(dims, -1)
+        last.copy_(torch.where(valid_next[-1], recv_next_first, last))
+
+    return rolled_tensor
 
 
 class MTPLossLoggingHelper:

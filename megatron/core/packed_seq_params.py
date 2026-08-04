@@ -19,3 +19,8 @@ class PackedSeqParams:
     cu_seqlens_cpu: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # How packed rows are assigned to context-parallel ranks:
+    # 'zigzag' = TE thd_get_partitioned_indices layout (default),
+    # 'contiguous' = rank r owns global rows [r * l_local, (r + 1) * l_local)
+    # (required by the DSv4 CSA context-parallel path).
+    cp_partition_mode: str = 'zigzag'
