@@ -35,6 +35,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
@@ -272,6 +273,9 @@ class SelfAttentionSubmodules:
     linear_proj: LinearProjBuilder
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
+    # Optional injection point for the RoPE application function (spec or type);
+    # defaults to apply_rotary_pos_emb when unset.
+    apply_rotary_fn: ModuleSpec | type | None = None
 
 
 @dataclass
@@ -284,6 +288,9 @@ class CrossAttentionSubmodules:
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
     linear_proj: LinearProjBuilder
+    # Optional injection point for the RoPE application function (spec or type);
+    # defaults to apply_rotary_pos_emb when unset.
+    apply_rotary_fn: ModuleSpec | type | None = None
 
 
 class Attention(MegatronModule, ABC):
@@ -423,6 +430,17 @@ class Attention(MegatronModule, ABC):
             tp_group=self.pg_collection.tp,
             name=(name + ".linear_proj") if name is not None else None,
         )
+
+        # RoPE application function injection point: build from the submodule spec
+        # when provided, else fall back to the native implementation (default
+        # behavior unchanged).
+        if (
+            hasattr(submodules, "apply_rotary_fn")
+            and submodules.apply_rotary_fn is not None
+        ):
+            self.apply_rotary_fn = build_module(submodules.apply_rotary_fn)
+        else:
+            self.apply_rotary_fn = apply_rotary_pos_emb
 
         if (
             HAVE_TE
@@ -1493,10 +1511,11 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
+                assert self.apply_rotary_fn is not None, "apply_rotary_fn must be defined"
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
                     if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
+                        query = self.apply_rotary_fn(
                             query,
                             q_pos_emb,
                             config=self.config,
@@ -1514,7 +1533,7 @@ class Attention(MegatronModule, ABC):
                             mscale=self._yarn_concentration_factor,
                         )
                 if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
+                    key = self.apply_rotary_fn(
                         key,
                         k_pos_emb,
                         config=self.config,
