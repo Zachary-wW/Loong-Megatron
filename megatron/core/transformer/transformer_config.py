@@ -2284,11 +2284,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
             "sigmoid",
             "sqrtsoftplus",
+            "softmax",
         ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
-                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
-                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+                "Expert bias for aux-loss-free routing only supports 'sigmoid', 'sqrtsoftplus' "
+                "and 'softmax' score functions. Please set --moe-router-score-function to "
+                "'sigmoid', 'sqrtsoftplus' or 'softmax', or unset --moe-router-enable-expert-bias."
             )
 
         if self.num_moe_experts and self.fp8:
