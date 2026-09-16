@@ -2075,7 +2075,12 @@ class DSAttention(MegatronModule):
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
-                    num_layers=self.config.num_layers,
+                    # Include MTP layers in the count; on HybridModel a depth can span
+                    # multiple layers, so also cover the largest layer index seen here.
+                    num_layers=max(
+                        self.layer_number,
+                        self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                 )
@@ -2162,7 +2167,12 @@ class DSAttention(MegatronModule):
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
-                    num_layers=self.config.num_layers,
+                    # Include MTP layers in the count; on HybridModel a depth can span
+                    # multiple layers, so also cover the largest layer index seen here.
+                    num_layers=max(
+                        self.layer_number,
+                        self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                 )
