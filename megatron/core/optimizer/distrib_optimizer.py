@@ -1209,6 +1209,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
+                        # bf16 + HDO offload + precision-aware resume: loading only
+                        # stores state; the master param must also be copied back into
+                        # the sharded model param itself, else the main param keeps its
+                        # stale value (silent precision loss across resumes). Params
+                        # under fp8-CPU-offload carry their own fp32 mirror and are
+                        # excluded (full form lands with M-10's param_to_fp32_param).
+                        if not hasattr(sharded_model_param, "_fp8_cpu_offload_info"):
+                            sharded_model_param.copy_(v)
+                    else:
+                        # copy_ into the existing state tensor instead of rebinding:
+                        # keeps pinned/arena views alive and aligns dtype on resume.
+                        existing = self.optimizer.state[sharded_model_param].get(k)
+                        if (
+                            isinstance(existing, torch.Tensor)
+                            and existing.shape == v.shape
+                        ):
+                            existing.copy_(v.to(existing.dtype))
+                            v = existing
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
