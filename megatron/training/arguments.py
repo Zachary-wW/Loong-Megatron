@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import types
+import warnings
 
 import torch
 
@@ -1434,9 +1435,19 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
         else:
-            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
-                "Using tensor model parallelism or context parallelism require setting the environment variable " \
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
+            if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+                # Relax the historical hard assert: TP/CP with multi-stream
+                # (CUDA_DEVICE_MAX_CONNECTIONS > 1, e.g. overlap_moe's 1-or-32 mode) is a
+                # valid configuration on Hopper. Only the two options below still require
+                # CUDA_DEVICE_MAX_CONNECTIONS=1 for correctness.
+                if args.sequence_parallel:
+                    warnings.warn(
+                        "Using sequence parallelism requires setting the environment variable "
+                        "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+                if args.async_tensor_model_parallel_allreduce:
+                    warnings.warn(
+                        "Using async gradient all reduce requires setting the environment "
+                        "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
