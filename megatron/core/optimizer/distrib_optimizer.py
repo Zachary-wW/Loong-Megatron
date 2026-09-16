@@ -436,7 +436,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     .to(model_param.device)
                                     .float()
                                 )
-                                model_param.clear_high_precision_init_val()
+                                # Keep the high-precision init value alive: copy_group_params
+                                # (state_dict load path) consumes it to initialize the main
+                                # params losslessly; dequantizing the fp8 shard instead loses
+                                # precision at load time.
+                                # model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
@@ -3117,13 +3121,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         model_param = model_param_to_state_dict_param_map[model_param]
 
                     if self._is_distopt_quantized_param(model_param):
-                        if self._is_grouped_quantized_tensor(model_param):
-                            dequantized_model_param = model_param.float()
+                        if hasattr(model_param, 'get_high_precision_init_val'):
+                            # Prefer the retained high-precision init value over a lossy
+                            # dequantize when initializing main params from a state_dict
+                            # load (the build side keeps it alive for exactly this path).
+                            shard_model_param = (
+                                model_param.get_high_precision_init_val()
+                                .view(-1)[param_range.start : param_range.end]
+                                .clone()
+                                .to(model_param.device)
+                                .float()
+                            )
+                            model_param.clear_high_precision_init_val()
                         else:
-                            dequantized_model_param = dequantize_fp8_tensor(model_param)
-                        shard_model_param = dequantized_model_param.view(-1)[
-                            param_range.start : param_range.end
-                        ]
+                            if self._is_grouped_quantized_tensor(model_param):
+                                dequantized_model_param = model_param.float()
+                            else:
+                                dequantized_model_param = dequantize_fp8_tensor(model_param)
+                            shard_model_param = dequantized_model_param.view(-1)[
+                                param_range.start : param_range.end
+                            ]
                     else:
                         shard_model_param = model_param.view(-1)[
                             param_range.start : param_range.end
