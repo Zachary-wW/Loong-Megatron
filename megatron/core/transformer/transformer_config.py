@@ -920,6 +920,19 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
+    ### MoE memory monitor (migrated from AIAK, M-05-2) ###
+    enable_moe_mem_monitor: bool = False
+    """Whether to enable MoE memory/token monitoring."""
+
+    print_moe_mem_monitor_interval: int = 1000
+    """Interval to print memory monitor data."""
+
+    moe_mem_monitor_log: str = None
+    """Path to log memory monitor data."""
+
+    moe_mem_monitor_force_print_token_threshold: int = 100000000
+    """Force printing memory usage when dispatcher tokens exceed this number."""
+
     moe_router_fusion: bool = False
     """Enable fusion for MoE TopK routing and aux-loss computation. This is only
     supported in TransformerEngine 2.7.0 and above.

@@ -83,6 +83,16 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     parser = _add_fault_injector_args(parser)
 
+
+    # MoE memory monitor (migrated from AIAK, M-05-2)
+    group.add_argument('--enable-moe-mem-monitor', action='store_true',
+                       help='Enable MoE memory/token monitoring')
+    group.add_argument('--print-moe-mem-monitor-interval', type=int, default=100000,
+                       help='Interval at which to log memory usage')
+    group.add_argument('--moe-mem-monitor-log', type=str, default=None,
+                       help='File path where to store memory monitoring logs')
+    group.add_argument('--moe-mem-monitor-force-print-token-threshold', type=int, default=10000000,
+                       help='Force printing out memory usage when it exceeds this number')
     return parser
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
