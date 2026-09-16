@@ -74,9 +74,17 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_loss_scaling_factor: Optional[float] = 0.1
     """Weighting factor of Multi-Token Prediction (MTP) loss.
-    We compute the average of the MTP losses across all depths, 
-    and multiply it the scaling factor to obtain the overall MTP loss, 
+    We compute the average of the MTP losses across all depths,
+    and multiply it the scaling factor to obtain the overall MTP loss,
     which serves as an additional training objective.
+    """
+
+    mtp_loss_scaling_factor_decay_ratio: Optional[float] = None
+    """Decay the MTP loss based on the current depth of the MTP module:
+    loss_factor_i = loss_factor_base * decay_ratio ** depth, where `i` is the
+    current depth of the MTP module. The per-depth weighting itself is applied
+    by external training scripts reading this config value; the config surface
+    (and its auto-generated CLI flag) must be present.
     """
 
     mtp_use_repeated_layer: bool = False

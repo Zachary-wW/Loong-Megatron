@@ -2526,6 +2526,9 @@ def load_checkpoint(
             with load_ctx():
                 module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
+            # Print the exception content to make strict-load failures diagnosable
+            # (PyTorch only prints missing/unexpected keys to stderr on its own).
+            print(f'[load_state_dict strict={strict}] exception:\n{e}')
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 with load_ctx():
