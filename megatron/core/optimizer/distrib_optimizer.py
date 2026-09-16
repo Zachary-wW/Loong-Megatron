@@ -1213,8 +1213,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
+                    # bf16 + precision-aware + store_param_remainders resume: the ckpt
+                    # stores the master param in its int16 scaled form; convert back
+                    # before set_scaled_state, else dtype mismatch crashes the resume.
+                    if (
+                        self.config.store_param_remainders
+                        and self.config.bf16
+                        and not hasattr(sharded_model_param, "_fp8_cpu_offload_info")
+                    ):
+                        v = v.to(torch.int16)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
+                    # Optimizer states are always restored as fp32.
+                    if v.dtype != torch.float32:
+                        v = v.to(torch.float32)
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
