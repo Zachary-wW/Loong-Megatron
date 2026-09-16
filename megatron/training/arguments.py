@@ -1230,7 +1230,10 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    # Note: community main still forces False; dev has lifted the force. Keep it
+    # liftable for true variable-length SFT (set programmatically via
+    # ModelParallelConfig.variable_seq_lengths; no CLI flag exists).
+    # args.variable_seq_lengths = False
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
