@@ -1238,6 +1238,11 @@ def maybe_save_dataloader_state(
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
         return
 
+    # For virtual pipeline model parallel, the train data iterator is a list of per-chunk
+    # iterators; take the first chunk's iterator before accessing its attributes.
+    if isinstance(train_iterator, list) and mpu.get_virtual_pipeline_model_parallel_rank() is not None:
+        train_iterator = train_iterator[0]
+
     # If dataloader doesn't support saving state, raise an error.
     if not hasattr(train_iterator.iterable, 'save_state'):
         raise RuntimeError(
