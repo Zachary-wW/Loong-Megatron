@@ -26,6 +26,8 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    # CPU copy of cu_seqlens consumed by out-of-tree linear-attention (FLA) kernels.
+    cu_seqlens_cpu: Tensor = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

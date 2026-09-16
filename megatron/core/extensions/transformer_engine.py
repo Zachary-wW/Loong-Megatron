@@ -1940,6 +1940,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
+        # cu_seqlens_cpu is used by linear attention (FLA) kernels; TE's DotProductAttention
+        # does not accept it.
+        self.kept_packed_seq_params.discard("cu_seqlens_cpu")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
