@@ -235,7 +235,13 @@ def _set_wandb_writer(args):
         if args.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
-        import wandb
+        # SwanLab backend: swap the wandb module for swanlab when
+        # ENABLE_SWANLAB=1 (API-compatible writer).
+        if os.environ.get('ENABLE_SWANLAB', '0') == "1":
+            import swanlab as wandb
+        else:
+            import wandb
+
         if args.wandb_save_dir:
             save_dir = args.wandb_save_dir
         else:
