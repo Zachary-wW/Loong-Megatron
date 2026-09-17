@@ -664,3 +664,51 @@ def async_reduce_scatter_along_first_dim(input_, group=None):
         handle.tensor, handle._input_buffer, group=group, async_op=True
     )
     return handle
+
+
+class _GatherFromSequenceParallelRegionAsync(torch.autograd.Function):
+    """Launch an equal-split first-dimension all-gather without waiting for it."""
+
+    @staticmethod
+    def forward(ctx, input_, group, tensor_parallel_output_grad, handle):
+        """Launch the forward all-gather and publish its work through ``handle``."""
+        ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
+        ctx.group = group
+
+        dim_size = list(input_.size())
+        dim_size[0] *= group.size()
+        output = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
+        input_buffer = input_.contiguous()
+        handle._input_buffer = input_buffer
+        handle.work = dist_all_gather_func(output, input_buffer, group=group, async_op=True)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Preserve the synchronous gather's reduce-scatter backward semantics."""
+        if ctx.tensor_parallel_output_grad:
+            grad_input = _reduce_scatter_along_first_dim(grad_output, ctx.group)
+        else:
+            grad_input = _split_along_first_dim(grad_output, ctx.group)
+        return grad_input, None, None, None
+
+
+def async_gather_from_sequence_parallel_region(
+    input_, tensor_parallel_output_grad=True, group=None
+):
+    """Launch an equal-split AG and return a handle whose ``wait`` yields its tensor.
+
+    The caller must wait before the gathered tensor's first use. The returned
+    tensor retains the same autograd contract as
+    :func:`gather_from_sequence_parallel_region`: its backward either
+    reduce-scatters or splits along the first dimension.
+    """
+    group = get_tensor_model_parallel_group_if_none(group)
+    handle = _AsyncCollectiveHandle()
+    if group.size() == 1:
+        handle.tensor = input_
+        return handle
+    handle.tensor = _GatherFromSequenceParallelRegionAsync.apply(
+        input_, group, tensor_parallel_output_grad, handle
+    )
+    return handle
