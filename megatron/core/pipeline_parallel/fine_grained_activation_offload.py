@@ -1202,6 +1202,26 @@ class ChunkOffloadHandler:
         self.bulk_reload()
 
 
+def fine_grained_offloading_init_chunk_handler(vp_stage, min_offloaded_tensor_size=None):
+    """Initialize the chunk handler for this model chunk, called at the start of a
+    microbatch forward pass (compat wrapper for downstream callers; the community
+    manager method takes the full parallel context from the global state)."""
+    import torch.distributed
+
+    from megatron.core import parallel_state
+
+    if torch.distributed.is_initialized():
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+    else:
+        pp_rank, vp_size = 0, 1
+    if min_offloaded_tensor_size is None:
+        min_offloaded_tensor_size = 1024 * 1024
+    PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
+        pp_rank, vp_size, vp_stage, min_offloaded_tensor_size
+    )
+
+
 def fine_grained_offloading_disable_offload():
     """Disable the offload."""
     debug_rank("fine_grained_offloading_disable_offload")
