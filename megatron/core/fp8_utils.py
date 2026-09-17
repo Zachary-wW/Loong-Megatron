@@ -8,7 +8,7 @@ import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
-from typing import Callable, List, Optional, Set, Union
+from typing import Any, Callable, List, Optional, Set, Union
 
 import torch
 
