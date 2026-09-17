@@ -23,8 +23,8 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core import tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import CheckpointWithoutOutput as _CheckpointWithoutOutput
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -354,7 +354,7 @@ class MLP(MegatronModule):
             return intermediate_parallel
 
         if self.activation_recompute:
-            self.activation_checkpoint = _CheckpointWithoutOutput()
+            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             intermediate_parallel = self.activation_checkpoint.checkpoint(
                 bias_act_func, intermediate_parallel, bias_parallel
             )
