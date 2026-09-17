@@ -836,6 +836,10 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_hotspot_ratio: float = 0.0
+    """[Experimental] Force a ratio of router tokens to route to the first EP rank.
+    This is an experimental feature and only for benchmark."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -881,6 +885,38 @@ class TransformerConfig(ModelParallelConfig):
     """This feature involves selectively dropping and padding tokens for each expert to achieve a
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
+
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts."""
+
+    moe_echo_dump_dir: Optional[str] = None
+    """The directory to dump the echo routing data."""
+
+    moe_echo_log_steps: Optional[str] = None
+    """Comma-separated list of training steps to log echo expert stats, e.g. "1,3,5"."""
+
+    moe_echo_log_layers: Optional[str] = None
+    """Comma-separated list of layer numbers to log echo expert stats, e.g. "10,15,20,25"."""
+
+    moe_echo_log_file: Optional[str] = None
+    """Path to the output log file for echo expert stats."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of echo experts to use. If None, the number of echo experts is set to
+    the number of experts."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Enable overlap of echo expert dispatch and expert computation."""
+
+    moe_echo_expert_dispatcher_type: str = "hybridep"
+    """The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall"."""
+
+    moe_echo_algorithm: str = "sinkhorn"
+    """Algorithm used for echo expert token assignment when moe_enable_echo is True.
+    Options:
+      - "sinkhorn": topology-aware Sinkhorn-Knopp optimal transport + iterative col-top1 matching.
+      - "greedy": one_shot_greedy (K=1) or approx_bin_packing (K>1).
+    It is only effective when moe_enable_echo is enabled."""
 
     moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
