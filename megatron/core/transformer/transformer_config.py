@@ -3065,6 +3065,82 @@ class TransformerConfig(ModelParallelConfig):
             ), "Batch invariant mode does not support attention dropout"
 
 
+    attention_latent_norm_epsilon: float | None = None
+    """Epsilon for the primary query and key-value latent norms in attention.
+       If unset, inherit ``layernorm_epsilon`` for backward compatibility."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
+    sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol)."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
+
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    dsa_cp_balance_indexer: bool = False
+    """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
+    causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
+    each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
+    existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
+    contiguous order. Balancing requires the per-sequence zigzag and the fused indexer kernel
+    backend. Eligibility is decided from the actual microbatch: its per-rank row count must be
+    even, and every padded sequence length (including any capacity tail) must be divisible by
+    ``2 * cp_size``. ``pad_packed_seq_alignment`` only controls capacity rounding and may be
+    ``None``, ``"max"``, or an integer; it is not an eligibility guarantee. An ineligible eager
+    pack takes the contiguous reference path for that microbatch, so eager runs may switch paths
+    and capacities between packs. The current
+    fused kernel package silently corrupts any fused call above 32768 query rows that is
+    not the process's first fused call (verified on GB200, cudnn-frontend 1.26.0): the
+    balanced two-half-call path therefore fails closed above per-rank capacities of
+    2 * 32768 rows, balanced-run reference fallbacks above 32768 rows take the unfused
+    implementation, and pre-existing paths keep their behavior with a once-per-process
+    correctness warning. Whether balancing is worthwhile for a workload is decided once,
+    at recipe level, by this flag.
+    Selection Q inherits the effective per-layer precision. Only delayed-scaling selection
+    uses a stateless nonquantized projection; its canonical local projection still records once
+    in eval/no-grad checkpoint forwards so amax and recompute metadata remain consistent.
+    Compact BF16/MXFP8 scoring returns its sparse-loss prediction with the selected indices in
+    the existing combine collectives. MXFP8 never takes an unfused BF16 fallback.
+    For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
+    is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
+    then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
+    copies its two typed metadata owners once into a fixed-address graph-slot arena shared by all
+    captured DSA callables. Staged route inputs retain their originating slot so replay cannot
+    follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
+    compatibility matrix. PP/VPP also requires ``cuda_graph_dynamic_microbatches`` so a graph input
+    slot cannot be reused while its forward remains live. Dynamic CP, local CUDA graphs, and
+    full-iteration CUDA graphs do not use dynamic-pack routing. A step batch-size schedule may not
+    increase the source global batch size after capture; doing so would require retaining graph
+    instances sized for the largest future schedule entry. Other graph configurations retain the
+    static-composition behavior."""
+
+    dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
+    """Precision used only by the fused compact DSA indexer forward and Top-K."""
+
+    dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
+    """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
+    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
+    backend. The final index scores remain FP32 independently of this option. This option does
+    not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+
+    dsa_indexer_weights_proj_use_quantization: bool = True
+    """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
+    quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+    ``dsa_indexer_weights_proj_output_dtype`` then controls its BF16 or FP32 output contract.
+    This option does not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a)."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
 @dataclass
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.

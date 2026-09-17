@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -15,6 +16,10 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
     dsa_layout,
     dsa_masking,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+    warn_fused_indexer_row_limit_once,
 )
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
@@ -138,6 +143,23 @@ _DENSE_ATTN_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _FLASH_MLA_REQUIRED_VALUE_DIM = 512
 _CUDA_GRID_Y_MAX = 65535
 _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS = 32768
+
+
+def _indexer_forward_wrapper_with_warning(
+    index_q: Tensor, index_k: Tensor, weights: Tensor, **kwargs
+) -> dict:
+    """Call cuDNN indexer forward after the shared above-limit diagnostic."""
+    if index_q.ndim == 4:
+        total_q = int(index_q.shape[0] * index_q.shape[1])
+    elif index_q.ndim == 3:
+        total_q = int(index_q.shape[0])
+    else:
+        raise RuntimeError(
+            f"cuDNN DSA indexer expects 3-D THD or 4-D BSHD query input, got {index_q.shape}."
+        )
+    if total_q > FUSED_INDEXER_MAX_SAFE_ROWS:
+        warn_fused_indexer_row_limit_once(total_q, logger=logging.getLogger(__name__))
+    return _cudnn_dsa.indexer_forward_wrapper(index_q, index_k, weights, **kwargs)
 
 
 def _assert_supported_indexer_scoring(use_relu: bool) -> None:
@@ -612,11 +634,11 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+            scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+            scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
         else:
@@ -738,7 +760,7 @@ def _indexer_topk_multi_packed_cp_thd(
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
-    scores = _cudnn_dsa.indexer_forward_wrapper(
+    scores = _indexer_forward_wrapper_with_warning(
         q_bshd[0],
         segmented_k,
         w_bsh[0],
@@ -1148,7 +1170,7 @@ def _indexer_topk_bshd(
                 q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
             )
         else:
-            scores = _cudnn_dsa.indexer_forward_wrapper(
+            scores = _indexer_forward_wrapper_with_warning(
                 q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
             )[
                 "scores"
@@ -1496,8 +1518,6 @@ def _pad_sparse_backward_topk(
     attn_score: Tensor, index_score: Tensor, topk_indices: Tensor, block_size: int
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Pad sparse indexer-backward top-k tensors to cuDNN's block-size multiple."""
-    # The backward wrapper has no separate top-k length; zero-score slots still need valid indices.
-    topk_indices = topk_indices.clamp_min(0)
     topk = topk_indices.size(-1)
     padded_topk = round_up_to_nearest_multiple(topk, block_size)
     if padded_topk == topk:
@@ -1506,7 +1526,9 @@ def _pad_sparse_backward_topk(
     pad_width = padded_topk - topk
     attn_score = torch.nn.functional.pad(attn_score, (0, pad_width), value=0.0)
     index_score = torch.nn.functional.pad(index_score, (0, pad_width), value=0.0)
-    topk_indices = torch.nn.functional.pad(topk_indices, (0, pad_width), value=0)
+    # Negative indices are rejected by the kernel's bounds guard before K loads
+    # and dK atomics, so preserve the invalid-slot sentinel through padding.
+    topk_indices = torch.nn.functional.pad(topk_indices, (0, pad_width), value=-1)
     return attn_score.contiguous(), index_score.contiguous(), topk_indices.contiguous()
 
 
@@ -1830,13 +1852,15 @@ def _compute_sparse_indexer_loss_and_grads(
             .mul(skv)
         )
         topk_indices_for_bwd = topk_indices_for_bwd + batch_offsets
-    topk_indices_for_bwd = topk_indices_for_bwd.masked_fill(~valid_positions, 0)
+    topk_indices_for_bwd = topk_indices_for_bwd.masked_fill(~valid_positions, -1)
     attn_score_for_bwd = target
     # The cuDNN sparse indexer-backward score-grad kernel gates the KL gradient
     # on positive predicted probabilities. Preserve the mathematically correct
     # ``predict - target`` gradient for underflowed softmax entries by keeping
-    # selected probabilities nonzero before handing them to cuDNN.
+    # selected probabilities nonzero before handing them to cuDNN. Invalid slots
+    # stay zero and use negative indices so the main kernel skips their K/dK work.
     index_score_for_bwd = predict.clamp_min(_CLIP_PROB_MIN)
+    index_score_for_bwd.masked_fill_(~valid_positions, 0.0)
     block_i = 128
     attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd = _pad_sparse_backward_topk(
         attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd, block_i

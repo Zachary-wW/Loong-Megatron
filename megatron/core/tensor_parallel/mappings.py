@@ -619,3 +619,48 @@ def all_to_all_hp2sp(input_, group=None):
     )
     output = torch.cat(split_tensors, dim=-1)
     return output
+
+
+class _AsyncCollectiveHandle:
+    """Awaitable tensor result of an asynchronous collective."""
+
+    def __init__(self):
+        self.tensor = None
+        self.work = None
+        # Keep a temporary contiguous input alive until NCCL has consumed it.
+        self._input_buffer = None
+
+    def wait(self):
+        """Wait at the first consumer and return the collective output."""
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+            self._input_buffer = None
+        return self.tensor
+
+
+def async_reduce_scatter_along_first_dim(input_, group=None):
+    """Launch an equal-split first-dimension reduce-scatter and return a handle.
+
+    This helper is intended for custom backward implementations that have
+    independent work to execute before the reduced local gradient is consumed.
+    The caller must invoke ``wait`` before using the returned tensor.
+    """
+    group = get_tensor_model_parallel_group_if_none(group)
+    handle = _AsyncCollectiveHandle()
+    if group.size() == 1:
+        handle.tensor = input_
+        return handle
+
+    dim_size = list(input_.size())
+    assert (
+        dim_size[0] % group.size() == 0
+    ), "First dimension of the tensor should be divisible by tensor parallel size"
+    dim_size[0] //= group.size()
+
+    handle.tensor = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
+    handle._input_buffer = input_.contiguous()
+    handle.work = dist_reduce_scatter_func(
+        handle.tensor, handle._input_buffer, group=group, async_op=True
+    )
+    return handle

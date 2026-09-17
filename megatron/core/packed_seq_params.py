@@ -26,6 +26,11 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    cp_partition_mode: str = 'zigzag'
+    """Context-parallel partitioning mode for packed sequences: 'zigzag' or
+    'contiguous' (DS V4 CSA forces contiguous under CP>1; migrated from
+    community dev, M-30)."""
+
     # CPU copy of cu_seqlens consumed by out-of-tree linear-attention (FLA) kernels.
     cu_seqlens_cpu: Tensor = None
 

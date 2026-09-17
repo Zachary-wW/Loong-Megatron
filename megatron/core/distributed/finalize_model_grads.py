@@ -448,9 +448,13 @@ def _allreduce_non_tensor_model_parallel_grads(
                     else:
                         grad = _unshard_if_dtensor(grad)
                         grads_avg.append(grad.data)
-                # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+                # Check if this param needs sum reduction (sequence parallel or qk_layernorm);
+                # allreduce_gradients_across_tp_domain marks params whose grads are summed
+                # across the TP domain (e.g. DS V4 groups; migrated from AIAK, M-30-2).
+                elif (
+                    getattr(param, "allreduce_gradients_across_tp_domain", False)
+                    or (config.sequence_parallel and getattr(param, "sequence_parallel", False))
+                    or (config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name))
                 ):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
