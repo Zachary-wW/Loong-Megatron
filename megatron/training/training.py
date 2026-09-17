@@ -1822,6 +1822,21 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
+        # Partial-module fp32 training (migrated from AIAK, M-17): keep parameters /
+        # buffers matching use_fp32_dtype_for_param_pattern in fp32 after the fp16
+        # conversion (sensitive modules such as layernorm / lm_head / router).
+        fp32_param_patterns = getattr(args, 'use_fp32_dtype_for_param_pattern', None)
+        if fp32_param_patterns and not isinstance(fp32_param_patterns, (list, tuple)):
+            fp32_param_patterns = [fp32_param_patterns]
+        if fp32_param_patterns:
+            for model_module in model:
+                for name, param in model_module.module.named_parameters():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        param.data = param.data.to(dtype=torch.float32)
+                for name, buf in model_module.module.named_buffers():
+                    if any(pattern in name for pattern in fp32_param_patterns):
+                        buf.data = buf.data.to(dtype=torch.float32)
+
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]

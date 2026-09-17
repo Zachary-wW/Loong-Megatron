@@ -933,6 +933,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_mem_monitor_force_print_token_threshold: int = 100000000
     """Force printing memory usage when dispatcher tokens exceed this number."""
 
+    use_fp32_dtype_for_param_pattern: Optional[List[str]] = None
+    """Partial-module fp32 training (migrated from AIAK, M-17): name patterns of
+    parameters/buffers kept in fp32 under fp16/bf16 training (e.g. layernorm,
+    output layer, router). See TransformerConfig.__post_init__ validation for
+    the allowed module names."""
+
     moe_router_fusion: bool = False
     """Enable fusion for MoE TopK routing and aux-loss computation. This is only
     supported in TransformerEngine 2.7.0 and above.
@@ -2669,6 +2675,33 @@ class TransformerConfig(ModelParallelConfig):
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
                     f"variable sequence length, please use alltoall dispatcher instead."
                 )
+
+        if self.use_fp32_dtype_for_param_pattern is not None:
+            allowed_modules = {
+                'expert_bias',
+                'output_layer',
+                'final_layernorm',
+                'input_layernorm',
+                'pre_mlp_layernorm',
+                'router',
+                'self_attention_hyper_connection',
+                'mlp_hyper_connection',
+                'attn_hc',
+                'ffn_hc',
+                'hc_head',
+                'sinks',
+                'position_bias',
+                'e_score_correction_bias',
+                'q_a_norm',
+                'kv_norm',
+                'post_attention_layernorm',
+                'norm',
+            }
+            invalid_modules = set(self.use_fp32_dtype_for_param_pattern) - allowed_modules
+            assert not invalid_modules, (
+                f'Invalid choices for use_fp32_dtype_for_param_pattern: {invalid_modules}. '
+                f'Allowed modules are: {allowed_modules}'
+            )
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (
