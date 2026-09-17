@@ -1202,6 +1202,86 @@ class ChunkOffloadHandler:
         self.bulk_reload()
 
 
+# ============================================================================
+# Compat / extension layer for downstream callers (LoongForge) — migrated from
+# the AIAK offload public API (M-13). The community base already carries the
+# manager and the group start/commit autograd functions; these wrappers restore
+# the function-level entries the AIAK-era callers use.
+# ============================================================================
+
+OFFLOAD_TAG = '_lf_offload_tag'
+_OFFLOAD_TENSOR_MODE = None
+
+
+def set_offload_tag(tensor):
+    """Set the offload tag on the tensor (offload_tensors whitelist mechanism)."""
+    setattr(tensor, OFFLOAD_TAG, True)
+
+
+def offloading_checker(tensor):
+    """Check whether the tensor should be offloaded.
+
+    When --offload-tensors is unset, all tensors offload (True). When set, only
+    tensors carrying the offload tag (set via set_offload_tag by the callables
+    wiring) are eligible.
+    """
+    global _OFFLOAD_TENSOR_MODE
+
+    if _OFFLOAD_TENSOR_MODE is None:
+        from megatron.training import get_args
+
+        args = get_args()
+        _OFFLOAD_TENSOR_MODE = getattr(args, 'offload_tensors', False)
+
+    if not _OFFLOAD_TENSOR_MODE:
+        return True
+
+    return getattr(tensor, OFFLOAD_TAG, False)
+
+
+def fine_grained_offloading_reset():
+    """Reset the chunk state, called at the start of a training iteration."""
+    PipelineOffloadManager.get_instance().reset()
+
+
+def fine_grained_offloading_set_last_layer(is_last_layer):
+    """Record the last-layer scheduling hint for this chunk.
+
+    The community manager tracks chunk lifecycle internally; the flag is stored
+    for downstream callers that query it and is otherwise inert.
+    """
+    manager = PipelineOffloadManager.get_instance()
+    manager._lf_is_last_layer = is_last_layer
+
+
+def get_fine_grained_offloading_context(flag):
+    """Return the fine-grained offloading context (the manager) when enabled."""
+    return PipelineOffloadManager.get_instance() if flag else nullcontext()
+
+
+def fine_grained_offloading_group_commit(*tensor, name, forced_released_tensors=[]):
+    """Specify the tensors to be released after offloading.
+
+    forced_released_tensors are released (untyped_storage().resize_(0)) after
+    offloading — only specify tensors that are not automatically released by
+    torch gc.
+    """
+    cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+    return FineGrainedOffloadingGroupCommitFunction.apply(
+        *tensor, cur_forward_chunk, name, forced_released_tensors
+    )
+
+
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU (community impl; re-exported for
+    downstream callers that imported it from this module)."""
+    from megatron.core.pipeline_parallel.utils import (
+        set_ideal_affinity_for_current_gpu as _impl,
+    )
+
+    _impl()
+
+
 def fine_grained_offloading_init_chunk_handler(vp_stage, min_offloaded_tensor_size=None):
     """Initialize the chunk handler for this model chunk, called at the start of a
     microbatch forward pass (compat wrapper for downstream callers; the community
