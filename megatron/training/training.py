@@ -4600,12 +4600,22 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
         flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+            [int(do_train), int(do_valid), int(do_test)],
+            dtype=torch.long,
+            device='cpu' if getattr(args, 'preprocess_data_on_cpu', False) else 'cuda',
         )
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = torch.tensor(
+            [0, 0, 0],
+            dtype=torch.long,
+            device='cpu' if getattr(args, 'preprocess_data_on_cpu', False) else 'cuda',
+        )
 
-    torch.distributed.broadcast(flags, 0)
+    if getattr(args, 'preprocess_data_on_cpu', False):
+        # Dataset preprocessing does not require the broadcast.
+        print("Dataset preprocessing does not require this step.")
+    else:
+        torch.distributed.broadcast(flags, 0)
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()

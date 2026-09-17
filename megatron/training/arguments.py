@@ -1459,7 +1459,12 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
         else:
-            if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+            if getattr(args, 'preprocess_data_on_cpu', False):
+                print(
+                    "Skipping CUDA_DEVICE_MAX_CONNECTIONS checks because megatron "
+                    "preprocesses data on CPU"
+                )
+            elif os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
                 # Relax the historical hard assert: TP/CP with multi-stream
                 # (CUDA_DEVICE_MAX_CONNECTIONS > 1, e.g. overlap_moe's 1-or-32 mode) is a
                 # valid configuration on Hopper. Only the two options below still require
@@ -3245,6 +3250,10 @@ def _add_data_args(parser):
                        help='FIM PAD token')
     group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
                        help='FIM EOD token')
+    group.add_argument('--preprocess-data-on-cpu', action='store_true',
+                       default=False,
+                       help='If set, build dataset indices on CPU without GPUs '
+                       '(migrated from AIAK, M-07-2; pair with FAKE_GPU_COUNT).')
     return parser
 
 
