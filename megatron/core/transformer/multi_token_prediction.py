@@ -1817,10 +1817,15 @@ class MultiTokenPredictionBlock(MegatronModule):
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-        hidden_states = hidden_states_list[offset]
+        hidden_states_main = hidden_states_list[offset]
+        hidden_states = hidden_states_main
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
+            if self.config.mtp_connection_type == 'parallel':
+                # Parallel heads re-read the main hidden states every depth; keep
+                # the detached view so mtp_detach_heads holds for each head.
+                hidden_states_main = hidden_states
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
@@ -1843,6 +1848,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
             hidden_states_list.append(hidden_states)
+
+            # sequential (community default, DeepSeek-V3 style): chain each head's
+            # output into the next head; parallel: every head reads the main
+            # model's hidden states (fan-out; migrated from AIAK, M-22).
+            if self.config.mtp_connection_type == 'parallel':
+                hidden_states = hidden_states_main
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)

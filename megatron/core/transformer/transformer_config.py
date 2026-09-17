@@ -95,6 +95,11 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    mtp_connection_type: str = 'sequential'
+    """How multiple MTP heads connect to the trunk (migrated from AIAK, M-22):
+    'sequential' chains each head's output into the next head (DeepSeek-V3
+    style, community default); 'parallel' fans out every head directly from
+    the main model's hidden states."""
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
