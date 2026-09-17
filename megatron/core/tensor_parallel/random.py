@@ -736,8 +736,19 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False):
+    def __init__(self, fp8=False, ckpt_manager=None):
+        """Initialize CheckpointWithoutOutput.
+
+        Args:
+            fp8: Whether to use FP8 mode. Defaults to False.
+            ckpt_manager: Optional MHCBlockRecomputeManager instance. When provided,
+                checkpoint() auto-registers this object to the manager, and
+                discard_output_and_register_recompute() only discards outputs
+                (the manager handles unified hook registration). (Migrated from
+                AIAK, M-24.)
+        """
         self.fp8 = fp8 is not None
+        self.ckpt_manager = ckpt_manager
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -763,6 +774,11 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+
+        # Auto-register to the manager when provided (migrated from AIAK, M-24).
+        if self.ckpt_manager is not None:
+            self.ckpt_manager.add_checkpoint(self)
+
         return outputs
 
     def _recompute(self, _):
@@ -842,6 +858,11 @@ class CheckpointWithoutOutput(object):
         if is_graph_warmup():
             return
 
+        # When ckpt_manager is set, this is a no-op: the manager handles all
+        # discarding and hook registration uniformly (migrated from AIAK, M-24).
+        if self.ckpt_manager is not None:
+            return
+
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:
@@ -853,3 +874,99 @@ class CheckpointWithoutOutput(object):
         # computations.
         if hook_tensor.requires_grad:
             hook_tensor.register_hook(self._recompute)
+
+
+class MHCBlockRecomputeManager:
+    """
+    MHC (Manifold-Constrained Hyper-Connections) Block-Level Recompute Manager.
+    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock for
+    HyperConnection computations, enabling unified recomputation during backward pass.
+    This is particularly useful for scenarios where multiple checkpoint operations have
+    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+    The manager ensures that during backward:
+    1. All checkpoint outputs are discarded to save memory
+    2. Recomputation happens in the correct forward order
+    3. Each checkpoint's output is restored before the next one needs it as input
+    Design Philosophy:
+    - This manager is passed into HyperConnectionModule.forward() so that the checkpoint
+      logic is encapsulated within HyperConnection, making TransformerLayer unaware of
+      the detailed checkpoint process.
+    - When manager is None, HyperConnection operates normally without checkpointing.
+    - When manager is provided, HyperConnection wraps its computations with
+      CheckpointWithoutOutput and registers them to the manager.
+    Usage:
+        # In TransformerBlock:
+        manager = MHCBlockRecomputeManager()
+        # Pass manager to each layer's HyperConnection
+        for layer in self.layers:
+            hidden_states = layer.forward(..., mhc_recompute_manager=manager)
+        # After all layers, register unified recompute on final output
+        final_output = hidden_states.sum()  # or loss
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
+    """
+
+    def __init__(self):
+        """Initialize the MHCBlockRecomputeManager."""
+        self.checkpoints = []
+        # Set by TransformerBlock before each layer forward; consumed by upstream
+        # mHC/recompute callers (DeepSeek-V4 alignment, ref upstream PR #4518).
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        """
+        Add a CheckpointWithoutOutput object to the manager.
+        Args:
+            ckpt: CheckpointWithoutOutput object that has already called checkpoint()
+        """
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """
+        Discard all checkpoint outputs and register a unified recompute hook.
+        This method:
+        1. Releases the storage of all checkpoint outputs to save memory
+        2. Registers a hook on hook_tensor that will trigger sequential recomputation
+           of all checkpoints when gradients flow back
+        Args:
+            hook_tensor: The tensor to register the recompute hook on. This should be
+                        the final output that depends on all checkpointed computations.
+                        Typically this is the loss tensor or a sum of the block output.
+        Note:
+            The caller must ensure that:
+            - hook_tensor's gradient is computed before any recomputed tensor is needed
+            - All checkpoint outputs are no longer used in the forward pass after this call
+        """
+        # Discard all checkpoint outputs to save memory
+        for ckpt in self.checkpoints:
+            for output in ckpt.outputs:
+                output.untyped_storage().resize_(0)
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def _unified_recompute_hook(self, grad_output):
+        """
+        Unified recompute hook that recomputes all checkpoints in forward order.
+        This hook is triggered during backward pass. It sequentially recomputes each
+        checkpoint, which restores the output tensor storage. Since checkpoints are
+        processed in forward order, each checkpoint's input (which is the previous
+        checkpoint's output) will be available when needed.
+        Args:
+            grad_output: The gradient output (passed by PyTorch hook mechanism)
+        """
+        for ckpt in self.checkpoints:
+            # Call _recompute for each checkpoint in forward order
+            # The _recompute method will restore the output tensor storage
+            ckpt._recompute(None)
+
+
+# Backward compatibility alias
+BlockLevelCheckpointManager = MHCBlockRecomputeManager
+# Upstream Megatron-LM rename (PR #2943 / #4518). Alias kept so call-sites using
+# either name resolve to the same implementation.
+CheckpointManager = MHCBlockRecomputeManager

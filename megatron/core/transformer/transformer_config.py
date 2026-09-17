@@ -1136,6 +1136,61 @@ class TransformerConfig(ModelParallelConfig):
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
     ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    recompute_hyper_connections: bool = False
+    """Enable recomputation for HyperConnection intermediate activations.
+    
+    When enabled, all HyperConnection operations (compute_mappings, aggregate, apply_h_res, 
+    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by MHCBlockRecomputeManager.
+    This significantly reduces memory usage by discarding intermediate activations and 
+    recomputing them during backward pass.
+    
+    Requirements:
+    - Only effective when enable_hyper_connections=True and training=True
+    - Must use recompute_granularity='selective'
+    - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
+    
+    The last layer in each recompute block's final MLP BDA output is NOT checkpointed and 
+    serves as the hook_tensor for registering the unified recompute hook."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+    
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new MHCBlockRecomputeManager is created for subsequent layers
+    
+    If None, all layers in the transformer block share a single recompute block."""
+
+    mhc_use_perm_decomposition: bool = False
+    """Enable mHC perm decomposition. 
+    https://arxiv.org/abs/2601.05732"""
+
+    mhc_use_triton_fused_kernel: bool = False
+    """Enable mHC Triton fused kernel.
+    https://github.com/WithNucleusAI/mHC-triton/tree/main"""
+
+    use_fused_mhc: bool = False
+    """Use the fused mHC pre/post forward kernels in megatron.core.transformer.fused_mhc_kernels.
+    Read by HyperConnectionModule when enable_hyper_connections=True."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
