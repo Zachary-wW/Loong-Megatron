@@ -3010,6 +3010,10 @@ def _add_distributed_args(parser):
                        'every parameter.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
+    group.add_argument("--force-turn-on-bucketing", action='store_true',
+                       dest='force_turn_on_bucketing', default=False,
+                       help="Force turn on parameter bucketing on all pipeline stages "
+                       "(normally disabled on pp_rank > 0)")
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
