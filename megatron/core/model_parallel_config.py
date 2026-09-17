@@ -322,9 +322,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+       from Transformer Engine library is used, if 'linear', the fused
+       linear+cross-entropy kernel is used which skips logits materialization
+       entirely (migrated from AIAK, M-23). Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

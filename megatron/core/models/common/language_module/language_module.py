@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -15,6 +15,7 @@ try:
 except:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -151,6 +152,69 @@ class LanguageModule(MegatronModule):
                     check_and_set_env_variable(
                         f"NVTE_FLASH_ATTN_V{version}", 0, self.config.attention_backend
                     )
+
+    def compute_output_layer_and_language_model_loss(
+        self,
+        hidden: Tensor,
+        labels: Optional[Tensor],
+        weight: Tensor = None,
+        sequence_parallel_enabled: bool = False,
+        column_parallel_linear: torch.nn.Module = None,
+        col_linear_kwargs: Dict[str, Any] = {},
+        reduction: Literal["none", "sum", "mean"] = "none",
+        ignore_index: int = -100,
+    ) -> Tensor:
+        """Computes the language model loss directly from the final hidden states,
+        optionally skipping logits materialization via the fused linear
+        cross-entropy kernel (migrated from AIAK, M-23).
+
+        Args:
+            hidden (Tensor): The hidden states from the transformer model
+            labels (Optional[Tensor]): The labels of dimension [batch size, seq length]
+            weight (Tensor): The output-layer weight tensor of shape
+                [vocab size, hidden size]. Required when using fused linear
+                cross entropy.
+            sequence_parallel_enabled (bool): Whether sequence parallelism is on.
+            column_parallel_linear (torch.nn.Module): The column parallel linear
+                layer used to compute logits when not using the fused path.
+            col_linear_kwargs (Dict[str, Any]): Additional kwargs for the column
+                parallel linear layer.
+            reduction (str): 'none' | 'sum' | 'mean'.
+            ignore_index (int): Index ignored in the loss calculation.
+
+        Returns:
+            Tensor: Loss tensor of dimensions [batch size, sequence_length].
+        """
+        if (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == 'linear'
+        ):
+            assert (
+                weight is not None
+            ), "weight cannot be None when using fused linear cross entropy."
+            assert (
+                labels is not None
+            ), "labels cannot be None when using fused linear cross entropy."
+            # [b s] => [s b]
+            labels = labels.transpose(0, 1).contiguous()
+            loss = linear_cross_entropy(
+                hidden,
+                weight,
+                labels,
+                tp_group=self.pg_collection.tp,
+                sequence_parallel=sequence_parallel_enabled,
+                reduction=reduction,
+                ignore_index=ignore_index,
+            )
+            # [s b] => [b, s]
+            loss = loss.view_as(labels).transpose(0, 1).contiguous()
+            return loss
+        else:
+            assert (
+                column_parallel_linear is not None
+            ), "column_parallel_linear cannot be None when not using fused linear cross entropy."
+            logits, _ = column_parallel_linear(hidden, **col_linear_kwargs)
+            return self.compute_language_model_loss(labels, logits)
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
