@@ -109,3 +109,14 @@ class MaybeMultiStorageClient:
 
 maybe_msc = MaybeMultiStorageClient()
 __all__ = ['MultiStorageClientFeature', 'maybe_msc']
+
+
+def open_file(*args, **kwargs):
+    """Open a file with the appropriate method based on whether MSC is enabled.
+
+    (Compat entry for downstream callers; migrated from the AIAK-era module.)"""
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.open(*args, **kwargs)
+    else:
+        return open(*args, **kwargs)
