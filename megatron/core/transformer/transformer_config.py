@@ -1813,6 +1813,15 @@ class TransformerConfig(ModelParallelConfig):
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
+                    # AIAK selective-recompute partitions (migrated, M-08):
+                    # mlp_act = dense-MLP activation segment (finer than 'mlp');
+                    # routed_experts = router->dispatch->experts->combine, shared
+                    #   experts excluded (third partition between 'moe' and
+                    #   'shared_experts');
+                    # pre_mlp = the whole attention half-layer.
+                    "mlp_act",
+                    "routed_experts",
+                    "pre_mlp",
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",

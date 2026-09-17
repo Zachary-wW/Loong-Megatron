@@ -447,6 +447,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        # Whole-attention-half recompute (migrated from AIAK, M-08): coarser than
+        # core_attn+layernorm, recomputes the entire pre-MLP block in backward.
+        self.recompute_pre_mlp = False
         if self.config.recompute_granularity == 'selective':
             assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
@@ -511,6 +514,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                             )
 
                             set_save_original_input(self.mlp.linear_fc1)
+            if "pre_mlp" in self.config.recompute_modules:
+                self.recompute_pre_mlp = True
             if "mlp" in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
@@ -751,7 +756,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        if self.recompute_pre_mlp:
+            hidden_states, context = self._checkpoint_pre_mlp_forward(*args, **kwargs)
+        else:
+            hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -759,6 +767,86 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
+
+    def _checkpoint_pre_mlp_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[Any] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Checkpointed wrapper over the attention half-layer (migrated from AIAK,
+        M-08, with the 6e73f401 self-binding / argument-order fix): non-tensor
+        arguments are captured by the closure; tensor arguments are passed
+        positionally through the checkpoint."""
+        return self._checkpoint_pre_mlp_handler(
+            attention_bias,
+            inference_context,
+            packed_seq_params,
+            sequence_len_offset,
+            inference_params,
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            rotary_pos_cos_sin,
+            padding_mask,
+        )
+
+    def _checkpoint_pre_mlp_handler(
+        self,
+        attention_bias,
+        inference_context,
+        packed_seq_params,
+        sequence_len_offset,
+        inference_params,
+        *args,
+    ):
+        def custom(hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                   rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin, padding_mask):
+            return self._forward_attention(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                inference_params=inference_params,
+            )
+
+        if self.config.fp8 or self.config.fp4:
+            from megatron.core.extensions.transformer_engine import te_checkpoint
+
+            return te_checkpoint(
+                custom,
+                False,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                parallel_state.get_tensor_model_parallel_group(),
+                *args,
+            )
+        else:
+            return tensor_parallel.checkpoint(custom, False, *args)
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")

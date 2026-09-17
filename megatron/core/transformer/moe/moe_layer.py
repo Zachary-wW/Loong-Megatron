@@ -257,6 +257,12 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Selective recompute of the routed path only (migrated from AIAK, M-08):
+        # router -> dispatch -> experts -> combine recomputed; shared experts excluded.
+        self.routed_experts_recompute = (
+            config.recompute_granularity == 'selective'
+            and "routed_experts" in config.recompute_modules
+        )
 
         self.tp_group = pg_collection.tp
 
@@ -713,6 +719,42 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        # Selective routed-experts recompute (migrated from AIAK, M-08): everything
+        # except the shared experts goes inside the checkpoint; shared experts are
+        # computed outside so their activations survive.
+        def custom_forward_exclude_shared_experts(hidden_states, intermediate_tensors=None, padding_mask=None):
+            shared_expert_output = None
+            try:
+                if "route" in self.fwd_execution_map:
+                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    if intermediate_tensors is not None:
+                        return hidden_states, probs
+            except MoECudaGraphPartialCaptureSignal as e:
+                return e.get_early_return_outputs(hidden_states, shared_expert_output)
+
+            if "expert_compute" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    hidden_states, probs = intermediate_tensors
+                dispatched_input, probs = self.dispatch(hidden_states, probs)
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                assert mlp_bias is None, (
+                    f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                )
+                output = self.combine(output)
+                if intermediate_tensors is not None:
+                    return output, mlp_bias
+
+            if "postprocess" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    output, _ = intermediate_tensors
+                # Shared expert output is added by the caller (outside the checkpoint).
+                output = self.postprocess(output, None)
+                if intermediate_tensors is not None:
+                    return output
+
+            return output, mlp_bias
+
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -728,6 +770,32 @@ class MoELayer(BaseMoELayer):
                 outputs = tensor_parallel.checkpoint(
                     custom_forward, False, hidden_states, intermediate_tensors, padding_mask
                 )
+        elif self.routed_experts_recompute and self.training:
+            if self.config.fp8 or self.config.fp4:
+                outputs = te_checkpoint(
+                    custom_forward_exclude_shared_experts,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.tp_group,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                )
+            else:
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward_exclude_shared_experts,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                )
+            # Shared experts outside the recomputed region.
+            shared_expert_output = self.shared_experts_compute(hidden_states)
+            if shared_expert_output is not None:
+                if isinstance(outputs, tuple):
+                    outputs = (outputs[0] + shared_expert_output,) + tuple(outputs[1:])
+                else:
+                    outputs = outputs + shared_expert_output
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 

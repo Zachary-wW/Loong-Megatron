@@ -24,6 +24,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import CheckpointWithoutOutput as _CheckpointWithoutOutput
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -255,6 +256,16 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
+        # Selective activation recompute (migrated from AIAK, M-08): recompute only
+        # the activation segment of the dense MLP (finer than community 'mlp').
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "mlp_act" in self.config.recompute_modules
+        )
+        if self.activation_recompute and self.config.fp8:
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input()
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
     ):
@@ -264,81 +275,91 @@ class MLP(MegatronModule):
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
-        nvtx_range_push(suffix="activation")
-        if self.config.use_te_activation_func:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
-            if per_token_scale is not None:
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-        elif self.config.bias_activation_fusion:
-            if per_token_scale is not None:
-                if self.activation_func == F.silu and self.config.gated_linear_unit:
-                    # dtype is handled inside the fused kernel
-                    intermediate_parallel = weighted_bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        per_token_scale.unsqueeze(-1),
-                        self.config.activation_func_fp8_input_store,
-                    )
-                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                    intermediate_parallel = weighted_bias_quick_geglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        per_token_scale.unsqueeze(-1),
-                        self.config.activation_func_fp8_input_store,
-                        self.config.glu_linear_offset,
-                        self.config.activation_func_clamp_value,
-                    )
-                else:
-                    raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
-                    )
-            else:
-                if self.activation_func == F.gelu:
-                    if self.config.gated_linear_unit:
-                        intermediate_parallel = bias_geglu_impl(
-                            intermediate_parallel, bias_parallel
+        def bias_act_func(intermediate_parallel, bias_parallel):
+            nvtx_range_push(suffix="activation")
+            if self.config.use_te_activation_func:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if per_token_scale is not None:
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+            elif self.config.bias_activation_fusion:
+                if per_token_scale is not None:
+                    if self.activation_func == F.silu and self.config.gated_linear_unit:
+                        # dtype is handled inside the fused kernel
+                        intermediate_parallel = weighted_bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            per_token_scale.unsqueeze(-1),
+                            self.config.activation_func_fp8_input_store,
+                        )
+                    elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                        intermediate_parallel = weighted_bias_quick_geglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            per_token_scale.unsqueeze(-1),
+                            self.config.activation_func_fp8_input_store,
+                            self.config.glu_linear_offset,
+                            self.config.activation_func_clamp_value,
                         )
                     else:
-                        assert self.config.add_bias_linear is True
-                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-                elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                    intermediate_parallel = bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        self.config.activation_func_fp8_input_store,
-                        self.config.cpu_offloading
-                        and self.config.cpu_offloading_activations
-                        and HAVE_TE,
-                    )
+                        raise ValueError(
+                            "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
+                        )
                 else:
-                    raise ValueError("Only support fusion of gelu and swiglu")
-        else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
-                    )
-
-                intermediate_parallel = glu(intermediate_parallel)
+                    if self.activation_func == F.gelu:
+                        if self.config.gated_linear_unit:
+                            intermediate_parallel = bias_geglu_impl(
+                                intermediate_parallel, bias_parallel
+                            )
+                        else:
+                            assert self.config.add_bias_linear is True
+                            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                    elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                        intermediate_parallel = bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            self.config.activation_func_fp8_input_store,
+                            self.config.cpu_offloading
+                            and self.config.cpu_offloading_activations
+                            and HAVE_TE,
+                        )
+                    else:
+                        raise ValueError("Only support fusion of gelu and swiglu")
             else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                if self.config.gated_linear_unit:
 
-            if per_token_scale is not None:
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-        nvtx_range_pop(suffix="activation")
+                    def glu(x):
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
+
+                    intermediate_parallel = glu(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+
+                if per_token_scale is not None:
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+            nvtx_range_pop(suffix="activation")
+            return intermediate_parallel
+
+        if self.activation_recompute:
+            self.activation_checkpoint = _CheckpointWithoutOutput()
+            intermediate_parallel = self.activation_checkpoint.checkpoint(
+                bias_act_func, intermediate_parallel, bias_parallel
+            )
+        else:
+            intermediate_parallel = bias_act_func(intermediate_parallel, bias_parallel)
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
@@ -347,6 +368,9 @@ class MLP(MegatronModule):
             cast(torch.Tensor, intermediate_parallel)
         )
         nvtx_range_pop(suffix="linear_fc2")
+
+        if self.activation_recompute:
+            self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly
