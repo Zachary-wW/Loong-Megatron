@@ -2759,6 +2759,16 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
 
 
 @lru_cache(maxsize=None)
+
+@contextmanager
+def nvtx_range(msg=None, suffix=None):
+    """Create an NVTX range controlled by ``configure_nvtx_profiling``."""
+    nvtx_range_push(msg, suffix)
+    try:
+        yield
+    finally:
+        nvtx_range_pop(msg, suffix)
+
 def _nvtx_decorator_get_func_path(func):
     """Get the path of a function.
 
