@@ -398,6 +398,17 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
+    # --selective-fp8 requires --fp8 (migrated from AIAK, M-28)
+    if args.selective_fp8 and not args.fp8:
+        raise ValueError(
+            "--selective-fp8 requires FP8 training to be enabled (--fp8 e4m3 or --fp8 hybrid)."
+        )
+    # --selective-fp8-allowed-ub-names without --selective-fp8 is a no-op
+    if args.selective_fp8_allowed_ub_names and not args.selective_fp8:
+        print(
+            "WARNING: --selective-fp8-allowed-ub-names has no effect without --selective-fp8."
+        )
+
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
         assert args.ckpt_convert_save is not None

@@ -591,6 +591,16 @@ class TransformerConfig(ModelParallelConfig):
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
     4) 'blockwise' for blockwise scaling recipe, 5) 'custom' for custom quantization recipe."""
 
+    selective_fp8: bool = False
+    """Selective FP8 (migrated from AIAK, M-28): only modules matched by
+    selective_fp8_allowed_ub_names run in FP8; all other modules stay in BF16.
+    Use when FP8 causes loss spikes on specific modules — exclude them
+    pointwise while keeping the FP8 gains elsewhere."""
+
+    selective_fp8_allowed_ub_names: Optional[List[str]] = None
+    """Whitelist of tp_comm_buffer_name values that keep FP8 under
+    --selective-fp8 (e.g. ['qkv', 'proj'])."""
+
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
     together with fp8 mode (i.e., TransformerConfig.fp8 is not None). Note that not all parameters

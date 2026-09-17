@@ -636,7 +636,12 @@ class TEGroupedMLP(MegatronModule):
         unpadded_tokens_per_expert = None
         if skip_routed_expert_padding(self.config):
             pass
-        elif self.config.fp8 or self.config.fp4:
+        elif (self.config.fp8 or self.config.fp4) and not getattr(
+            self.linear_fc1, "_selective_fp8_disabled", False
+        ):
+            # selective_fp8 (migrated from AIAK, M-28): when fc1 was initialized
+            # without FP8 (decided at init time), the expert GEMMs run in BF16 —
+            # skip FP8 padding/unpadding accordingly.
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
