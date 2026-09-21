@@ -41,6 +41,17 @@ def _te_do_not_offload(tensor):
     )
 
 
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+except ImportError:  # pragma: no cover - TE not installed (CPU-only environments)
+    Float8Tensor = None
+
+
+def _is_float8_tensor(tensor):
+    """Whether `tensor` is a TE Float8Tensor carrying a raw uint8 payload."""
+    return Float8Tensor is not None and isinstance(tensor, Float8Tensor)
+
+
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     """
     Print an ASCII table summarizing offload bytes across all ranks.
@@ -832,8 +843,24 @@ class ChunkOffloadHandler:
         """Offload."""
         debug_rank("--------offload")
 
+        fp8_offload = _is_float8_tensor(src_tensor)
+
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
+
+        if fp8_offload:
+            # fp8 activations: keep the raw uint8 payload pool-managed so it can be
+            # recycled on reload; the Float8Tensor wrapper itself is not pool-tracked.
+            if use_cpu_pool:
+                fp8_data = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=torch.uint8)
+            else:
+                fp8_data = torch.empty(
+                    src_tensor.shape, dtype=torch.uint8, device="cpu", pin_memory=pin_memory
+                )
+            cpu_backup = Float8Tensor.make_like(src_tensor, data=fp8_data)
+            cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
+            state = (src_tensor.device, cpu_backup, use_cpu_pool, fp8_data)
+            return state
 
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
@@ -849,9 +876,18 @@ class ChunkOffloadHandler:
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool = state
+        if len(state) == 4:
+            dev, cpu_backup, use_cpu_pool, fp8_data = state
+        else:
+            dev, cpu_backup, use_cpu_pool = state
+            fp8_data = None
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
+        if fp8_data is not None:
+            gpu_tensor = cpu_backup.to(dev, non_blocking=non_blocking)
+            if use_cpu_pool:
+                self.cpu_tensor_pool.free(fp8_data)
+            return gpu_tensor
         gpu_tensor = torch.empty(
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
@@ -986,6 +1022,8 @@ class ChunkOffloadHandler:
     def tensor_need_offloading_checker(self, tensor):
         """Check if the tensor needs to be offloaded."""
         debug_rank("tensor_need_offloading_checker")
+        if not offloading_checker(tensor):
+            return False
         if not self._can_manage_tensor_for_offload(tensor):
             return False
         if _te_do_not_offload(tensor):
@@ -1228,10 +1266,13 @@ def offloading_checker(tensor):
     global _OFFLOAD_TENSOR_MODE
 
     if _OFFLOAD_TENSOR_MODE is None:
-        from megatron.training import get_args
+        try:
+            from megatron.training import get_args
 
-        args = get_args()
-        _OFFLOAD_TENSOR_MODE = getattr(args, 'offload_tensors', False)
+            args = get_args()
+            _OFFLOAD_TENSOR_MODE = bool(getattr(args, 'offload_tensors', None))
+        except Exception:  # pragma: no cover - args not initialized (unit tests)
+            _OFFLOAD_TENSOR_MODE = False
 
     if not _OFFLOAD_TENSOR_MODE:
         return True
