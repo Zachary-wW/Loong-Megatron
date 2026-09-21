@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -21,6 +22,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
+    HybridEPExpertDispatch,
     alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
@@ -1996,3 +1998,268 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """Reset the accumulated over-budget flag on the communication manager."""
         if hasattr(self._comm_manager, 'over_budget'):
             self._comm_manager.over_budget.fill_(0)
+
+
+# ============================================================================
+# ECHO hotspot expert cloning (migrated from AIAK, M-31): expert-WEIGHT
+# dispatchers. Unlike the token dispatchers above, these send expert
+# parameters (fc1/fc2 weight chunks) to the EP ranks whose echo experts
+# replicate the hot home experts, following the offloading plan produced by
+# megatron/core/transformer/moe/offloading_planner.py.
+# ============================================================================
+
+
+class MoEElasticExpertMetadata:
+    """Metadata for the elastic expert (weight) dispatchers.
+
+    buffer_idx selects which expert_dispatch_buffer HybridEPExpertDispatch
+    uses (0=FC1, 1=FC2).
+    """
+
+    def __init__(self):
+        self.global_routing_map = None
+        self.local_to_global_routing_map = None
+        self.global_to_local_routing_map = None
+        self.input_splits = None
+        self.output_splits = None
+        self.num_out_experts = None
+        self.input_chunks_per_rank = None
+        self.has_experts_per_slot = None
+        self.handle = None
+        self.buffer_idx = 0
+
+
+class MoEElasticExpertDispatcher:
+    """Dispatches expert weights to other EP ranks via plain A2A (ECHO)."""
+
+    def __init__(
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+    ):
+        self.config = config
+
+        # Initialize process groups
+        self.ep_group = pg_collection.ep
+        self.ep_size = self.ep_group.size()
+        self.ep_rank = self.ep_group.rank()
+
+        self.num_local_experts = config.moe_num_echo_experts // self.ep_size
+        assert self.config.moe_enable_echo, "Elastic expert dispatcher requires --moe-enable-echo"
+
+        self.permute_idx_device = "cpu"
+        input_chunk_idxs = torch.arange(
+            self.config.moe_num_echo_experts, device=self.permute_idx_device
+        )
+        # [num_local_experts, tp_size * ep_size]. Sort the input chunks by local experts.
+        self.sort_input_by_local_experts = input_chunk_idxs.reshape(
+            -1, self.num_local_experts
+        ).T.ravel()
+
+    def preprocess(self, routing_map: torch.Tensor) -> MoEElasticExpertMetadata:
+        """Preprocess the (home -> echo) offloading map for expert dispatch.
+
+        Args:
+            routing_map (torch.Tensor): Mapping of home experts to spare experts,
+                shape [num_home_experts, num_spare_experts].
+
+        Returns:
+            MoEElasticExpertMetadata: Metadata for expert weight dispatch.
+        """
+        num_home_experts, num_spare_experts = routing_map.shape
+        num_local_home_experts = num_home_experts // self.ep_size
+        num_local_spare_experts = num_spare_experts // self.ep_size
+        metadata = MoEElasticExpertMetadata()
+        metadata.global_routing_map = routing_map
+
+        metadata.local_to_global_routing_map = routing_map[
+            self.ep_rank * num_local_home_experts : (self.ep_rank + 1) * num_local_home_experts, :
+        ].reshape(num_local_home_experts, self.ep_size, num_local_spare_experts)
+        metadata.global_to_local_routing_map = routing_map[
+            :, self.ep_rank * num_local_spare_experts : (self.ep_rank + 1) * num_local_spare_experts
+        ].reshape(self.ep_size, num_local_home_experts, num_local_spare_experts)
+
+        metadata.input_splits = None
+        metadata.output_splits = None
+        metadata.num_out_experts = None
+        metadata.input_chunks_per_rank = None
+        metadata.has_experts_per_slot = None
+
+        return metadata
+
+    def _materialize_dispatch_metadata(self, metadata: MoEElasticExpertMetadata):
+        """Populate lazy dispatch metadata for elastic expert dispatch."""
+        if metadata.input_splits is None:
+            metadata.input_splits = metadata.local_to_global_routing_map.sum(dim=[0, 2]).tolist()
+            metadata.output_splits = metadata.global_to_local_routing_map.sum(dim=[1, 2]).tolist()
+            metadata.num_out_experts = sum(metadata.input_splits)
+            metadata.input_chunks_per_rank = (
+                metadata.global_to_local_routing_map.sum(dim=1).int().ravel().cpu()
+            )
+            metadata.has_experts_per_slot = (
+                metadata.global_to_local_routing_map.sum(dim=[0, 1]).tolist()
+            )
+
+    def expert_dispatch_preprocess(
+        self, metadata: MoEElasticExpertMetadata, *expert_weights
+    ) -> dict:
+        """Ravel, stack, and permute the expert weights ahead of the A2A.
+
+        Separated from expert_dispatch_communication so callers can run this
+        on the default stream before switching to a dedicated dispatch
+        stream, avoiding HBM bandwidth contention between the preprocess
+        kernels and concurrent GEMM computation.
+        """
+        self._materialize_dispatch_metadata(metadata)
+        weight_shape = expert_weights[0].shape
+        stacked = torch.stack([weight.ravel() for weight in expert_weights], dim=0)
+        permuted_expert_weights, _, _ = permute(
+            stacked,
+            metadata.local_to_global_routing_map,
+            num_out_tokens=metadata.num_out_experts,
+            fused=False,  # TODO: fix permute fusion with expert dispatch
+        )
+        return dict(permuted_weights=permuted_expert_weights, weight_shape=weight_shape)
+
+    def expert_dispatch_communication(
+        self, metadata: MoEElasticExpertMetadata, preprocessed: dict, *expert_weights
+    ) -> List[torch.Tensor]:
+        """Dispatch preprocessed expert weights via AlltoAll.
+
+        Should be called from a dedicated dispatch stream after
+        expert_dispatch_preprocess has completed on the default stream.
+
+        Args:
+            metadata: MoEElasticExpertMetadata from preprocess.
+            preprocessed: dict returned by expert_dispatch_preprocess.
+            expert_weights: unused, kept for interface symmetry with
+                MoESyncFreeElasticExpertDispatcher.
+
+        Returns:
+            List of dispatched weight tensors received from remote ranks.
+        """
+        weight_shape = preprocessed['weight_shape']
+        permuted_expert_weights = preprocessed['permuted_weights']
+        dispatched_expert_weights = all_to_all(
+            self.ep_group,
+            permuted_expert_weights,
+            metadata.output_splits,
+            metadata.input_splits,
+        )
+        dispatched_expert_weights, _ = sort_chunks_by_idxs(
+            dispatched_expert_weights,
+            metadata.input_chunks_per_rank,
+            self.sort_input_by_local_experts,
+            fused=False,
+        )
+        expert_weights = torch.split(
+            dispatched_expert_weights, metadata.has_experts_per_slot, dim=0
+        )
+        weight_list = []
+        for weight in expert_weights:
+            if weight.numel() > 0:
+                weight_list.append(weight.reshape(weight_shape))
+            else:
+                weight_list.append(weight)
+        return weight_list
+
+    def expert_dispatch(
+        self, metadata: MoEElasticExpertMetadata, *expert_weights
+    ) -> List[torch.Tensor]:
+        """Dispatch expert weights to the ranks that need them.
+
+        Unlike the token dispatchers, this sends expert parameters rather
+        than tokens.
+        """
+        preprocessed = self.expert_dispatch_preprocess(metadata, *expert_weights)
+        return self.expert_dispatch_communication(metadata, preprocessed, *expert_weights)
+
+
+class MoESyncFreeElasticExpertDispatcher:
+    """Dispatches expert weights via the HybridEP buffer (ECHO).
+
+    "Sync-free" relative to the plain A2A variant: the HybridEP dispatch
+    handles host-side chunk bookkeeping internally.
+    """
+
+    def __init__(self, config: TransformerConfig, pg_collection: ProcessGroupCollection):
+        self.config = config
+
+        # Initialize process groups
+        self.ep_group = pg_collection.ep
+        self.ep_size = self.ep_group.size()
+        self.ep_rank = self.ep_group.rank()
+
+        # Find power of 2 multiplier that makes hidden_size * 2^n closest to 8192
+        n = max(0, round(math.log2(8192 / config.hidden_size)))
+        self.weight_chunk_size = config.hidden_size * (2 ** n)
+        # Align to FP8 block size (128) so scale tensors chunk evenly
+        FP8_BLOCK_SIZE = 128
+        self.weight_chunk_size = (self.weight_chunk_size // FP8_BLOCK_SIZE) * FP8_BLOCK_SIZE
+        assert self.weight_chunk_size > 0, (
+            f"weight_chunk_size must be >= {FP8_BLOCK_SIZE}, got hidden_size={config.hidden_size}"
+        )
+        self.num_total_experts = config.moe_num_echo_experts
+        self.num_local_echo_experts = config.moe_num_echo_experts // self.ep_size
+        self.num_local_home_experts = config.num_moe_experts // self.ep_size
+        assert self.config.moe_enable_echo, "Elastic expert dispatcher requires --moe-enable-echo"
+
+    def preprocess(self, routing_map: torch.Tensor) -> MoEElasticExpertMetadata:
+        """Preprocess the (home -> echo) offloading map for expert dispatch."""
+        num_home_experts, _ = routing_map.shape
+        num_local_home_experts = num_home_experts // self.ep_size
+        metadata = MoEElasticExpertMetadata()
+        metadata.global_routing_map = routing_map
+        # Extract the rows for home experts on this rank.
+        metadata.routing_map = routing_map[
+            self.ep_rank * num_local_home_experts : (self.ep_rank + 1) * num_local_home_experts, :
+        ]
+        return metadata
+
+    def expert_dispatch_preprocess(self, metadata: MoEElasticExpertMetadata, *expert_weights):
+        """Extract raw weight data and stack into chunked rows (default stream)."""
+        return HybridEPExpertDispatch.preprocess(
+            metadata.routing_map,
+            self.weight_chunk_size,
+            *expert_weights,
+        )
+
+    def expert_dispatch_communication(
+        self,
+        metadata: MoEElasticExpertMetadata,
+        preprocessed: dict,
+        *expert_weights,
+    ) -> List[torch.Tensor]:
+        """Run the HybridEP A2A for the preprocessed weight chunks.
+
+        Args:
+            metadata: MoEElasticExpertMetadata from preprocess.
+            preprocessed: dict returned by expert_dispatch_preprocess.
+            expert_weights: original home expert weight tensors (needed by
+                backward to accumulate gradients into their main_grad).
+        """
+        # Inject buffer_idx into preprocess_meta so forward/backward select
+        # the correct expert_dispatch_buffer (FC1=0, FC2=1).
+        preprocessed['meta']['buffer_idx'] = metadata.buffer_idx
+        num_sms = self.config.moe_hybridep_num_sms or 24
+        result = HybridEPExpertDispatch.apply(
+            preprocessed['weight_tensor'],
+            preprocessed['routing_map_expanded'],
+            preprocessed['scale_tensor'],
+            preprocessed['meta'],
+            self.ep_group,
+            metadata.handle,
+            self.num_local_echo_experts,
+            num_sms,
+            num_sms,
+            self.num_local_echo_experts,
+            *expert_weights,
+        )
+        dispatched_expert_weights = result[:-1]
+        metadata.handle = result[-1]
+        return dispatched_expert_weights
+
+    def expert_dispatch(
+        self, metadata: MoEElasticExpertMetadata, *expert_weights
+    ) -> List[torch.Tensor]:
+        """Dispatch expert weights to the ranks that need them (HybridEP)."""
+        preprocessed = self.expert_dispatch_preprocess(metadata, *expert_weights)
+        return self.expert_dispatch_communication(metadata, preprocessed, *expert_weights)

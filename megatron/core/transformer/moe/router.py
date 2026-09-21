@@ -863,6 +863,18 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
+        if self.config.moe_router_force_hotspot_ratio > 0.0:
+            # Force a fraction of tokens to route to this rank's experts
+            # (ECHO benchmarking hook, migrated from AIAK M-31): biases the
+            # first `ratio` tokens toward the local experts so the echo
+            # offloading path actually has hotspots to clone.
+            num_experts = logits.size(-1)
+            logits = logits.clone().reshape(-1, num_experts)
+            num_hotspot_tokens = int(logits.size(0) * self.config.moe_router_force_hotspot_ratio)
+            experts_per_ep_rank = num_experts // self.config.expert_model_parallel_size
+            logits[:num_hotspot_tokens, :experts_per_ep_rank] += 1.0e4
+            logits = logits.reshape(*input.shape[:-1], num_experts)
+
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
         return probs, routing_map

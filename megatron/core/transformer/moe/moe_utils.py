@@ -1770,3 +1770,50 @@ def process_numeric_files(input_dir, output_file):
             with open(filepath, 'rb') as in_f:
                 out_f.write(in_f.read())
                 out_f.write(b'\n')
+
+
+class MoERoutingTracker:
+    """Track MoE routing statistics across layers and ranks (ECHO observability).
+
+    Migrated from AIAK (M-31): collects per-layer routing tensors so the echo
+    offloading quality (hotspot distribution, rerouted token counts) can be
+    dumped and analyzed offline.
+    """
+
+    def __init__(self):
+        """Initialize the routing statistics store."""
+        self.data_dict = {}
+
+    def set_rank_info(self, ep_group):
+        """Set distributed rank metadata for dumping statistics."""
+        self.ep_group = ep_group
+        self.rank = torch.distributed.get_rank()
+        self.ep_rank = torch.distributed.get_rank(self.ep_group)
+
+    def add_data(self, moe_layer_number: int, key_name: str, data: torch.Tensor):
+        """Record a tensor statistic for a MoE layer."""
+        if key_name not in self.data_dict:
+            self.data_dict[key_name] = {}
+        if moe_layer_number not in self.data_dict[key_name]:
+            self.data_dict[key_name][moe_layer_number] = []
+        self.data_dict[key_name][moe_layer_number].append(data.detach())
+
+    def dump_data(self, dir_path: str):
+        """Dump collected routing statistics to a rank-local file."""
+        for key_name in self.data_dict.keys():
+            for moe_layer_number in self.data_dict[key_name].keys():
+                data_list = self.data_dict[key_name][moe_layer_number]
+                data_tensor = torch.stack(data_list)
+                self.data_dict[key_name][moe_layer_number] = data_tensor
+        if self.ep_rank == 0:
+            file_name = f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth"
+            file_path = os.path.join(dir_path, file_name)
+            os.makedirs(dir_path, exist_ok=True)
+            torch.save(self.data_dict, file_path)
+
+    def clear_data(self):
+        """Clear collected routing statistics."""
+        self.data_dict = {}
+
+
+GLOBAL_MOE_ROUTING_TRACKER = MoERoutingTracker()

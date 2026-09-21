@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -9,12 +10,14 @@ from typing import Optional, Protocol
 import torch
 
 from megatron.core import tensor_parallel, utils
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core import parallel_state
 from megatron.core.transformer.moe.moe_utils import (
+    GLOBAL_MOE_ROUTING_TRACKER,
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
@@ -24,12 +27,15 @@ from megatron.core.transformer.moe.moe_utils import (
     monitor_max_memory_usage,
     write_monitor_data_to_file,
 )
+from megatron.core.transformer.moe.offloading_planner import gen_offloading_plan
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
+    MoEElasticExpertDispatcher,
     MoEFlexTokenDispatcher,
+    MoESyncFreeElasticExpertDispatcher,
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -188,16 +194,37 @@ class BaseMoELayer(MegatronModule, ABC):
         assert ep_size > 0, "Expected non-negative expert parallel size"
 
         assert self.config.num_moe_experts % ep_size == 0
-        self.num_local_experts = self.config.num_moe_experts // ep_size
-        local_expert_indices_offset = ep_rank * self.num_local_experts
+        # ECHO (migrated from AIAK, M-31): the expert pool grows by the echo
+        # (spare) experts; home experts keep the pre-echo index semantics.
+        if self.config.moe_enable_echo:
+            self.num_local_total_experts = (
+                self.config.num_moe_experts + self.config.moe_num_echo_experts
+            ) // ep_size
+        else:
+            self.num_local_total_experts = self.config.num_moe_experts // ep_size
+        self.num_home_experts = self.config.num_moe_experts // ep_size
+        # Preserve the legacy attribute name for code that reads
+        # mlp.num_local_experts (e.g. upcycling_utils.py). It equals the
+        # number of home (non-echo) experts on this rank, matching the
+        # pre-echo semantics.
+        self.num_local_experts = self.num_home_experts
+        local_expert_indices_offset = ep_rank * self.num_local_total_experts
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
         self.local_expert_indices = [
-            local_expert_indices_offset + i for i in range(self.num_local_experts)
+            local_expert_indices_offset + i for i in range(self.num_local_total_experts)
         ]
-        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+        if self.config.moe_enable_echo:
+            assert all(
+                map(
+                    lambda x: x < self.config.num_moe_experts + self.config.moe_num_echo_experts,
+                    self.local_expert_indices,
+                )
+            )
+        else:
+            assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
@@ -309,21 +336,21 @@ class MoELayer(BaseMoELayer):
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
-                self.num_local_experts,
+                self.num_local_total_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
+                self.num_local_total_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
+                self.num_local_total_experts,
                 self.local_expert_indices,
                 config=self.config,
                 pg_collection=pg_collection,
@@ -334,12 +361,44 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = self.submodules.experts(
-            self.num_local_experts,
-            self.config,
-            pg_collection=pg_collection,
-            name=(name + ".experts") if name is not None else None,
-        )
+        if config.moe_enable_echo:
+            # ECHO (migrated from AIAK, M-31): build home+echo experts so the
+            # echo slots exist, then drop their initial parameters — the
+            # weights are refreshed every step by the expert dispatch.
+            if config.moe_echo_expert_dispatcher_type == "hybridep":
+                self.expert_dispatcher = MoESyncFreeElasticExpertDispatcher(
+                    config=self.config, pg_collection=pg_collection
+                )
+            elif config.moe_echo_expert_dispatcher_type == "alltoall":
+                self.expert_dispatcher = MoEElasticExpertDispatcher(
+                    config=self.config, pg_collection=pg_collection
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported expert dispatcher type: {config.moe_echo_expert_dispatcher_type}"
+                )
+            num_echo_local_experts = self.config.moe_num_echo_experts // self.ep_group.size()
+            echo_config = dataclasses.replace(
+                self.config, gradient_accumulation_fusion=False, moe_enable_echo=False
+            )
+            self.experts = self.submodules.experts(
+                num_echo_local_experts + self.num_home_experts,
+                echo_config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
+            self.echo_expert_indices = list(
+                range(self.num_home_experts, num_echo_local_experts + self.num_home_experts)
+            )
+            self.home_expert_indices = list(range(self.num_home_experts))
+            self.experts.free_expert_parameters(self.echo_expert_indices)
+        else:
+            self.experts = self.submodules.experts(
+                self.num_local_experts,
+                self.config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -715,6 +774,12 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
+        # ECHO (migrated from AIAK, M-31): hotspot expert cloning forward.
+        # Replaces the standard route->dispatch->compute->combine flow: the
+        # router output is re-planned so overflow tokens land on echo experts.
+        if self.config.moe_enable_echo:
+            return self.echo_forward(hidden_states)
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
@@ -870,7 +935,228 @@ class MoELayer(BaseMoELayer):
         if self.shared_experts is not None and not self.shared_experts_recompute:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
-            set_save_original_input(self.shared_experts.linear_fc1)
+
+    def echo_forward(self, hidden_states: torch.Tensor):
+        """Forward pass for the MoE layer with echo experts (ECHO, M-31).
+
+        Overflow tokens are re-routed to spare/echo experts for better load
+        balancing: (1) route, (2) generate an offloading plan over the EP
+        group, (3) dispatch the hot home experts' weights to the ranks that
+        clone them, (4) run the standard token dispatch / expert / combine
+        flow over the re-routed map.
+
+        Migrated from AIAK aiak-train-2023; the token flow is re-expressed
+        through this layer's community stage methods (preprocess / dispatch /
+        routed-experts three-way split / combine / postprocess).
+        """
+        if self.config.moe_echo_expert_dispatch_overlap:
+            raise NotImplementedError(
+                "moe_echo_expert_dispatch_overlap is not yet wired on the v0.19.2 base "
+                "(requires experts.forward_with_dispatch_overlap and the moe_a2a_stream "
+                "machinery); follow-up to the M-31 Phase 2 port."
+            )
+        residual = hidden_states
+
+        # Step 1: Routing
+        probs, routing_map = self.route(hidden_states)
+
+        # Step 2: Offloading plan (rerouting + expert offloading map)
+        tokens_per_expert_current_ep_rank = routing_map.sum(dim=0)
+        tokens_per_expert_per_ep_rank = gather_from_sequence_parallel_region(
+            tokens_per_expert_current_ep_rank, group=self.ep_group
+        ).reshape(self.ep_group.size(), self.config.num_moe_experts)
+
+        num_spare_experts_per_ep_rank = self.config.moe_num_echo_experts // self.ep_group.size()
+        if self.config.moe_echo_algorithm == "greedy":
+            if num_spare_experts_per_ep_rank == 1:
+                assignment_algorithm = "approx_bin_packing"
+            else:
+                assignment_algorithm = "one_shot_greedy"
+        else:
+            assignment_algorithm = "sinkhorn"
+        rerouting_map, rerouted_probs, expert_offloading_map = gen_offloading_plan(
+            routing_map,
+            probs,
+            tokens_per_expert_per_ep_rank,
+            self.ep_group.rank(),
+            num_ep_ranks=self.ep_group.size(),
+            num_spare_experts_per_ep_rank=num_spare_experts_per_ep_rank,
+            assignment_algorithm=assignment_algorithm,
+        )
+        if self.config.moe_echo_dump_dir is not None:
+            GLOBAL_MOE_ROUTING_TRACKER.set_rank_info(self.ep_group)
+            num_offloaded_experts_per_rank = (
+                expert_offloading_map.reshape(self.ep_group.size(), -1).sum(dim=-1)
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.add_data(
+                self.layer_number,
+                "num_offloaded_experts_per_rank",
+                num_offloaded_experts_per_rank,
+            )
+            rerouted_tokens_per_rank = (
+                rerouting_map.sum(dim=0).reshape(self.ep_group.size(), -1).sum(dim=-1)
+            )
+            torch.distributed.all_reduce(
+                rerouted_tokens_per_rank,
+                group=self.ep_group,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.add_data(
+                self.layer_number,
+                "rerouted_tokens_per_rank",
+                rerouted_tokens_per_rank,
+            )
+        if self.config.moe_echo_log_file is not None:
+            self._echo_log(
+                tokens_per_expert_per_ep_rank,
+                rerouting_map,
+                expert_offloading_map,
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.add_data(
+                self.layer_number,
+                "tokens_per_expert_per_ep_rank",
+                tokens_per_expert_per_ep_rank,
+            )
+            tokens_per_rank = tokens_per_expert_per_ep_rank.reshape(
+                self.ep_group.size(),
+                self.ep_group.size(),
+                -1,
+            ).sum(dim=[0, 2])
+            GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_rank", tokens_per_rank)
+
+        # Step 3: Expert weight dispatch for the echo experts
+        fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+        fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+        fc1_expert_dispatch_metadata.buffer_idx = 0
+        fc2_expert_dispatch_metadata.buffer_idx = 1
+
+        fc1_expert_weights = self.experts.get_expert_weights("fc1", self.home_expert_indices)
+        dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
+            fc1_expert_dispatch_metadata,
+            *fc1_expert_weights,
+        )
+        self.experts.set_expert_weights("fc1", dispatched_fc1_weights, self.echo_expert_indices)
+
+        fc2_expert_weights = self.experts.get_expert_weights("fc2", self.home_expert_indices)
+        dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
+            fc2_expert_dispatch_metadata,
+            *fc2_expert_weights,
+        )
+        self.experts.set_expert_weights("fc2", dispatched_fc2_weights, self.echo_expert_indices)
+
+        # Steps 4-6: token flow over the re-routed map, through this layer's
+        # standard stage methods (latent projection included in preprocess).
+        def dispatch_and_compute(hidden_states, probs):
+            hidden_states, probs = self.preprocess(hidden_states, probs, rerouting_map)
+            dispatched_input, probs = self.dispatch(hidden_states, probs)
+            output, mlp_bias = self._routed_experts_compute_fused(dispatched_input, probs)
+            output = self.combine(output)
+            return output, mlp_bias
+
+        if self.moe_layer_recompute:
+            output, mlp_bias = tensor_parallel.checkpoint(
+                dispatch_and_compute, False, hidden_states, rerouted_probs
+            )
+        else:
+            output, mlp_bias = dispatch_and_compute(hidden_states, rerouted_probs)
+
+        # Shared experts run on the residual (pre-layernorm) input, as in the
+        # standard flow where shared_experts_compute receives the
+        # pre_mlp_layernorm output.
+        if self.use_shared_expert and not self.shared_expert_overlap:
+            shared_expert_output = apply_module(self.shared_experts)(residual)
+            output = output + shared_expert_output
+
+        return output, None
+
+    def _echo_log(
+        self,
+        tokens_per_expert_per_ep_rank: torch.Tensor,
+        rerouting_map: torch.Tensor,
+        expert_offloading_map: torch.Tensor,
+    ):
+        """Log echo expert stats for the current step and layer (ECHO, M-31).
+
+        All EP ranks must call this together (collective ops inside).
+        Only EP rank 0 writes the result to file.
+        """
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+        iteration = getattr(args, 'curr_iteration', 0)
+
+        # Step filter — consistent across all ranks, no collective ops yet
+        if self.config.moe_echo_log_steps is not None:
+            log_steps = {int(s) for s in self.config.moe_echo_log_steps.split(',')}
+            if iteration not in log_steps:
+                return
+
+        # Layer filter — consistent across all ranks
+        if self.config.moe_echo_log_layers is not None:
+            log_layers = {int(s) for s in self.config.moe_echo_log_layers.split(',')}
+            if self.layer_number not in log_layers:
+                return
+
+        # ---- Collective operation: all EP ranks must reach here together ----
+        ep_size = self.ep_group.size()
+        num_experts = self.config.num_moe_experts
+        num_home_experts_per_rank = num_experts // ep_size
+        num_echo_slots = (
+            expert_offloading_map.shape[1] if expert_offloading_map.ndim == 2 else 1
+        )
+        num_echo_slots_per_rank = max(1, num_echo_slots // ep_size)
+        # rerouting_map is the postprocessed tensor from gen_offloading_plan, whose
+        # column layout interleaves home experts and echo slots per EP rank:
+        #   [home_r0..., echo_r0..., home_r1..., echo_r1..., ...]
+        section = num_home_experts_per_rank + num_echo_slots_per_rank
+
+        local_after = rerouting_map.sum(dim=0).float().to(tokens_per_expert_per_ep_rank.device)
+        torch.distributed.all_reduce(local_after, group=self.ep_group)
+        after_counts = local_after.long().cpu()
+
+        # ---- Only rank 0 formats and writes from here ----
+        if self.ep_group.rank() == 0:
+            before_tokens = tokens_per_expert_per_ep_rank.sum().item()
+            after_tokens = after_counts.sum().item()
+
+            num_layers = self.config.num_layers
+            num_experts = self.config.num_moe_experts
+            num_local_experts = num_experts // ep_size
+            num_offloaded = int(expert_offloading_map.sum().item())
+
+            lines = []
+            lines.append(f"iteration: {iteration}")
+            lines.append(f"layer_number: {self.layer_number}")
+            lines.append(f"ep_size: {ep_size}")
+            lines.append(f"num_layers: {num_layers}")
+            lines.append(f"num_experts: {num_experts}")
+            lines.append(f"num_local_experts: {num_local_experts}")
+            lines.append(f"before_echo_total_tokens: {before_tokens}")
+            lines.append(f"after_echo_total_tokens: {after_tokens}")
+            lines.append(f"num_offloaded_experts: {num_offloaded}")
+
+            # Per-EP-rank token counts before echo
+            tokens_per_rank = (
+                tokens_per_expert_per_ep_rank.reshape(ep_size, ep_size, -1).sum(dim=[0, 2])
+            )
+            for i in range(ep_size):
+                lines.append(f"rank {i} before_tokens: {tokens_per_rank[i].item()}")
+
+            # After-echo per home expert counts (section layout: [home, echo] x ep_size)
+            after_counts_home = after_counts[: num_home_experts_per_rank * ep_size].reshape(
+                ep_size, num_home_experts_per_rank
+            )
+            max_after = after_counts_home.sum(dim=1).max().item()
+            min_after = after_counts_home.sum(dim=1).min().item()
+            lines.append(f"max_after_tokens_per_rank: {max_after}")
+            lines.append(f"min_after_tokens_per_rank: {min_after}")
+            lines.append(f"imbalance_pct_after: {(max_after - min_after) / max(max_after, 1) * 100:.2f}")
+
+            log_line = " | ".join(lines)
+            print(f"[ECHO] {log_line}")
+            if self.config.moe_echo_log_file is not None:
+                with open(self.config.moe_echo_log_file, "a") as f:
+                    f.write(log_line + "\n")
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):

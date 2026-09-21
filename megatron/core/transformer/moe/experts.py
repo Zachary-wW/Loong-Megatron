@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
 from math import ceil
-from typing import Optional, Protocol, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -177,6 +177,23 @@ class GroupedMLPSubmodules:
     """
     Builder for an activation function module; only used if config.use_te_activation_func is True.
     """
+
+
+
+class DummyFunction(torch.autograd.Function):
+    """Autograd placeholder for empty expert weight tensors (ECHO, M-31)."""
+
+    @staticmethod
+    def forward(ctx, x, weight_shape):
+        """Create a placeholder weight tensor for forward computation."""
+        ctx.input = x
+        dummy_weight = torch.empty(weight_shape, dtype=x.dtype, device=x.device)
+        return dummy_weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Return a zero gradient for the placeholder input."""
+        return torch.zeros_like(ctx.input), None
 
 
 class TEGroupedMLP(MegatronModule):
@@ -994,6 +1011,56 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
 
+    def free_expert_parameters(self, expert_indices: List[int]):
+        """Free the parameters of the echo experts (ECHO, M-31).
+
+        Echo experts start as clones of the home experts (same init); their
+        weights are refreshed every step by the expert dispatch, so the
+        initial parameters are dropped to save memory.
+        """
+        to_free_weight_names = [f'weight{i}' for i in expert_indices]
+        for module in [self.linear_fc1, self.linear_fc2]:
+            for name, param in list(module.named_parameters()):
+                if name in to_free_weight_names:
+                    delattr(module, name)
+                    module._parameters.pop(name, None)
+
+    def get_expert_weights(self, module, expert_indices: List[int]) -> List[torch.Tensor]:
+        """Get the raw weights of the given experts (fc1 or fc2)."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
+        weight_list = []
+        for i in expert_indices:
+            weight = getattr(expert_layer, f"weight{i}")
+            weight_list.append(weight)
+        return weight_list
+
+    def set_expert_weights(
+        self,
+        module,
+        expert_weights: List[torch.Tensor],
+        expert_indices: List[int],
+    ):
+        """Set the weights of the echo experts from the dispatched tensors."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
+        # Shape of a live (home) weight — echo slots receive tensors of the
+        # same layout, and empty slots need it to build the dummy placeholder.
+        weight_shape = getattr(expert_layer, "weight0").shape
+        for i, expert_index in enumerate(expert_indices):
+            if expert_weights[i].numel() == 0:
+                setattr(
+                    expert_layer,
+                    f"weight{expert_index}",
+                    DummyFunction.apply(expert_weights[i], weight_shape),
+                )
+            else:
+                setattr(
+                    expert_layer,
+                    f"weight{expert_index}",
+                    expert_weights[i],
+                )
+
 
 class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
@@ -1378,6 +1445,43 @@ class SequentialMLP(MegatronModule):
         """Backward pass for weight gradients in SequentialMLP."""
         for expert in self.local_experts:
             expert.backward_dw()
+
+    def free_expert_parameters(self, expert_indices: List[int]):
+        """Free the parameters of the echo experts (ECHO, M-31)."""
+        for expert_idx in expert_indices:
+            expert = self.local_experts[expert_idx]
+            for layer_name in ['linear_fc1', 'linear_fc2']:
+                layer = getattr(expert, layer_name)
+                for param_name in list(layer._parameters.keys()):
+                    if getattr(layer, param_name) is not None:
+                        delattr(layer, param_name)
+                        layer._parameters.pop(param_name, None)
+
+    def get_expert_weights(self, module, expert_indices: List[int]) -> List[torch.Tensor]:
+        """Get the raw weights of the given experts (fc1 or fc2)."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer_name = "linear_fc1" if module == "fc1" else "linear_fc2"
+        weight_list = []
+        for i in expert_indices:
+            weight = getattr(self.local_experts[i], expert_layer_name).weight
+            weight_list.append(weight)
+        return weight_list
+
+    def set_expert_weights(
+        self,
+        module,
+        expert_weights: List[torch.Tensor],
+        expert_indices: List[int],
+    ):
+        """Set the weights of the echo experts from the dispatched tensors."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer_name = "linear_fc1" if module == "fc1" else "linear_fc2"
+        for i, expert_index in enumerate(expert_indices):
+            layer = getattr(self.local_experts[expert_index], expert_layer_name)
+            if expert_weights[i].numel() == 0:
+                layer.weight = DummyFunction.apply(expert_weights[i], layer.weight.shape)
+            else:
+                layer.weight = expert_weights[i]
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""

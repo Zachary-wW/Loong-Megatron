@@ -2025,6 +2025,19 @@ class TransformerConfig(ModelParallelConfig):
                     "which is needed in core_attn.backward()."
                 )
 
+            # ECHO (migrated from AIAK, M-31): the expert pool grows by the
+            # echo experts; the pool must split evenly across EP ranks.
+            if self.moe_enable_echo:
+                assert self.moe_num_echo_experts > 0, (
+                    "moe_enable_echo requires moe_num_echo_experts > 0."
+                )
+                assert (self.num_moe_experts + self.moe_num_echo_experts) % (
+                    self.expert_model_parallel_size
+                ) == 0, (
+                    "num_moe_experts + moe_num_echo_experts must be divisible by "
+                    "expert_model_parallel_size."
+                )
+
             # Validate offload_tensors if specified
             if self.offload_tensors:
                 allowed_tensors = {
