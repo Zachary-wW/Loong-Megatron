@@ -1133,6 +1133,16 @@ class RerunDataIterator:
         self.replaying: bool = False
         self.replay_pos: int = 0
 
+    def __iter__(self):
+        """Support iter() so the wrapper can be used where an iterator is expected.
+
+        Migrated from AIAK (#64, aiak-train-2006): the separated parallel-save
+        flow iterates the data iterator directly; RerunDataIterator only
+        defined __next__, so iterating it fell through to the underlying
+        iterable and lost the replay bookkeeping.
+        """
+        return self
+
     def __next__(self) -> Any:
         """__next__ method override adding replay capability."""
 
@@ -1418,3 +1428,75 @@ def _compare_floats(a: torch.Tensor, b: torch.Tensor) -> float:
     ):
         return COMPARISON_MISMATCH
     return math.fabs((af - bf) / (af + bf) * 2)
+
+
+class ChunkDataIterator(RerunDataIterator):
+    """A data iterator wrapper that splits each batch's sequence into chunks (M-26).
+
+    Migrated from AIAK: each origin batch is split along the sequence dim into
+    num_chunks chunks (attention_mask splits along dim 2 — its [1,1,S,S] shape
+    would OOM at full length under chunkpipe); the scheduler consumes one
+    chunk per micro-batch.
+    """
+
+    def __init__(self, num_chunks: int, iterable: Iterable[Any]):
+        super().__init__(iterable)
+        self.current_chunk_index = 0
+        self.current_chunks = []
+        self.num_chunks = num_chunks
+
+    def __next__(self):
+        """Return the next chunk; reads a new batch when the current one is exhausted."""
+        if self.current_chunk_index >= self.num_chunks:
+            self.current_chunk_index = 0
+            self.current_chunks = []
+
+        if len(self.current_chunks) == 0:
+            # No buffered chunks — read the next batch and split it.
+            self.current_chunks = self.split_batch_into_chunks(super().__next__())
+
+        chunk = self.current_chunks[self.current_chunk_index]
+        self.current_chunk_index += 1
+        return chunk
+
+    def get_next_chunk(self):
+        """Peek the upcoming chunk without consuming it (None at batch end)."""
+        if self.current_chunk_index >= self.num_chunks:
+            return None
+        assert (
+            len(self.current_chunks) == self.num_chunks
+        ), "should call next before get_next_chunk"
+        return self.current_chunks[self.current_chunk_index]
+
+    def split_batch_into_chunks(self, batch):
+        """Split one batch dict into per-chunk dicts along the sequence dim."""
+        if not isinstance(batch, dict):
+            raise ValueError(f"Unsupported batch type: {type(batch)}")
+
+        chunks = []
+        for i in range(self.num_chunks):
+            chunk = {}
+            for key, value in batch.items():
+                # attention_mask is [1, 1, S, S]: split along dim 2.
+                chunk_dim = 2 if key == 'attention_mask' else 1
+
+                if isinstance(value, torch.Tensor):
+                    if value.dim() <= chunk_dim:
+                        raise ValueError(f"dim for {key} <= chunk_dim {chunk_dim}")
+                    dim_size = value.size(chunk_dim)
+                    if dim_size % self.num_chunks != 0:
+                        raise ValueError(
+                            f"dim size {dim_size} cannot be divided by "
+                            f"{self.num_chunks}, key {key}"
+                        )
+                    chunk_size = dim_size // self.num_chunks
+                    start_idx = i * chunk_size
+                    end_idx = (i + 1) * chunk_size
+                    if chunk_dim == 1:
+                        chunk[key] = value[:, start_idx:end_idx]
+                    elif chunk_dim == 2:
+                        chunk[key] = value[:, :, start_idx:end_idx]
+                else:
+                    chunk[key] = value
+            chunks.append(chunk)
+        return chunks
