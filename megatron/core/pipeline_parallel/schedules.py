@@ -696,6 +696,367 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     return pg_collection
 
 
+def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
+    """Remove one micro-batch's attention key-value cache (chunkpipe, M-26).
+
+    Migrated from AIAK: after a chunk's backward pass, its KV cache entry is
+    released back to the free list. Covers decoder layers, the DSA indexer
+    chunk caches (when present), and MTP layers on the last pipeline stage.
+    """
+    decoder = get_attr_wrapped_model(model, "decoder")
+    for layer in decoder.layers:
+        layer.self_attention.delete_chunk_key_value_cache(micro_batch_index)
+        indexer = getattr(layer.self_attention.core_attention, 'indexer', None)
+        if indexer is not None and hasattr(indexer, 'delete_chunk_indexer_key_cache'):
+            indexer.delete_chunk_indexer_key_cache(micro_batch_index)
+
+    if mtp_num_layers is None or mtp_num_layers == 0:
+        return
+    if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+        return
+    mtp_layers = get_attr_wrapped_model(model, "mtp")
+    for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
+        mtp_layer.transformer_layer.self_attention.delete_chunk_key_value_cache(
+            micro_batch_index
+        )
+        indexer = getattr(
+            mtp_layer.transformer_layer.self_attention.core_attention, 'indexer', None
+        )
+        if indexer is not None and hasattr(indexer, 'delete_chunk_indexer_key_cache'):
+            indexer.delete_chunk_indexer_key_cache(micro_batch_index)
+
+
+def clear_key_value_cache(model, mtp_num_layers):
+    """Clear all attention key-value caches (chunkpipe, M-26).
+
+    Migrated from AIAK: used in forward-only scenarios (validation/inference)
+    to reset all attention caches after processing a complete sequence.
+    """
+    decoder = get_attr_wrapped_model(model, "decoder")
+    for layer in decoder.layers:
+        layer.self_attention.clear_chunk_key_value_cache()
+        indexer = getattr(layer.self_attention.core_attention, 'indexer', None)
+        if indexer is not None and hasattr(indexer, 'clear_chunk_indexer_key_cache'):
+            indexer.clear_chunk_indexer_key_cache()
+
+    if mtp_num_layers is None or mtp_num_layers == 0:
+        return
+    if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+        return
+    mtp_layers = get_attr_wrapped_model(model, "mtp")
+    for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
+        mtp_layer.transformer_layer.self_attention.clear_chunk_key_value_cache()
+        indexer = getattr(
+            mtp_layer.transformer_layer.self_attention.core_attention, 'indexer', None
+        )
+        if indexer is not None and hasattr(indexer, 'clear_chunk_indexer_key_cache'):
+            indexer.clear_chunk_indexer_key_cache()
+
+
+def forward_backward_no_pipelining_with_chunkpipe(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,  # unused
+    micro_batch_size: int,  # unused
+    decoder_seq_length: Optional[int] = None,  # unused
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+):
+    """Run forward and backward passes with no pipeline parallelism (chunkpipe).
+
+    Migrated from AIAK (M-26): sequences are split into chunks that flow as
+    schedule units; a group's chunks all forward, then backward in LIFO order
+    (the KV cache chains chunks of a group forward and un-chains them in
+    backward).
+
+    Two modes:
+      - Pretrain: fixed chunk_num_per_seq, groups of identical size.
+      - SFT: dynamic chunk_group_size per group, discovered after the first
+        forward_step; composite groups support unequal DP (a composite holds
+        several real groups; chunk_idx_in_group resets per real group and
+        backward replays them LIFO via the stored idx so each real group's
+        KV-chain reset triggers correctly).
+    """
+    config = get_model_config(model)
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+
+    model_type = get_model_type(model)
+
+    forward_data_store = []
+    input_tensor, output_tensor_grad = None, None
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+
+    cp_group_size = parallel_state.get_context_parallel_world_size()
+    is_sft_chunkpipe = config.sft_chunkpipe_mode
+
+    if not is_sft_chunkpipe:
+        # ========== Pretrain logic: fixed chunk groups ==========
+        assert (
+            num_microbatches % config.chunk_num_per_seq == 0
+        ), "num microbatches should be divided by num chunks"
+        num_sequences = num_microbatches // config.chunk_num_per_seq
+
+        chunkpipe_forward_microbatch = 0
+        with no_sync_func():
+            for seq_index in range(num_sequences - 1):
+                chunk_losses = []
+                config.chunkpipe_forward = True
+                for chunk_index in range(config.chunk_num_per_seq):
+                    config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+                    config.chunkpipe_chunk_idx_in_group = chunk_index
+                    output_tensor, num_tokens = forward_step(
+                        forward_step_func,
+                        data_iterator,
+                        model,
+                        num_microbatches,
+                        input_tensor,
+                        forward_data_store,
+                        config,
+                        cp_group_size,
+                        collect_non_loss_data,
+                        is_first_microbatch=check_first_val_step(
+                            first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                        ),
+                        current_microbatch=chunkpipe_forward_microbatch,
+                    )
+                    total_num_tokens += num_tokens.item()
+                    output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+                    chunk_losses.append(output_and_microbatch)
+                    chunkpipe_forward_microbatch += 1
+
+                # Backward in reverse order of forward.
+                if not forward_only:
+                    config.chunkpipe_forward = False
+                    for chunk_index in range(config.chunk_num_per_seq):
+                        output_and_microbatch = chunk_losses.pop()
+                        config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                        config.chunkpipe_chunk_idx_in_group = (
+                            config.chunk_num_per_seq - 1 - chunk_index
+                        )
+                        backward_step(
+                            input_tensor,
+                            output_and_microbatch[0],
+                            output_tensor_grad,
+                            model_type,
+                            config,
+                        )
+                        remove_key_value_cache(
+                            model, output_and_microbatch[1], config.mtp_num_layers
+                        )
+                else:
+                    clear_key_value_cache(model, config.mtp_num_layers)
+
+        # Last sequence: computation outside the no_sync context (want to
+        # synchronize gradients).
+        chunk_losses = []
+        config.chunkpipe_forward = True
+        for chunk_index in range(config.chunk_num_per_seq):
+            config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            config.chunkpipe_chunk_idx_in_group = chunk_index
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size,
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                ),
+                current_microbatch=chunkpipe_forward_microbatch,
+            )
+            total_num_tokens += num_tokens.item()
+            output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+            chunk_losses.append(output_and_microbatch)
+            chunkpipe_forward_microbatch += 1
+
+        if not forward_only:
+            config.chunkpipe_forward = False
+            for chunk_index in range(config.chunk_num_per_seq):
+                output_and_microbatch = chunk_losses.pop()
+                config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                config.chunkpipe_chunk_idx_in_group = (
+                    config.chunk_num_per_seq - 1 - chunk_index
+                )
+                backward_step(
+                    input_tensor,
+                    output_and_microbatch[0],
+                    output_tensor_grad,
+                    model_type,
+                    config,
+                )
+                remove_key_value_cache(
+                    model, output_and_microbatch[1], config.mtp_num_layers
+                )
+        else:
+            clear_key_value_cache(model, config.mtp_num_layers)
+
+    else:
+        # ========== SFT dynamic group_size scheduling ==========
+        # A "composite group" is the unit the sampler hands one rank in one
+        # pipeline step: config.chunkpipe_component_sizes = [c1, c2, ...] where
+        # each c_i is one real source group's size; total chunks = sum(c_i).
+        # Equal-DP callers emit trivial composites [group_size]; unequal-DP
+        # composites contain multiple real groups whose chunk_idx_in_group
+        # resets per real group, and backward replays them LIFO via the stored
+        # idx so each real group's KV-chain reset triggers correctly.
+        chunkpipe_forward_microbatch = 0
+        microbatch_idx = 0  # total micro-batches consumed so far
+
+        last_group_losses = None
+        last_group_total_chunks = 0
+
+        def _forward_one_chunk(chunk_idx_in_group, is_first_global):
+            """Forward one chunk; return (output, mb_id, chunk_idx, real_group_size)."""
+            nonlocal chunkpipe_forward_microbatch, total_num_tokens
+            config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size,
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, is_first_global
+                ),
+                current_microbatch=chunkpipe_forward_microbatch,
+            )
+            total_num_tokens += num_tokens.item()
+            # Snapshot real_group_size set by get_batch so backward can restore
+            # it — for heterogeneous composites the config value changes
+            # between real groups and backward must replay the original.
+            real_group_size = config.chunkpipe_current_group_size
+            result = (
+                output_tensor,
+                chunkpipe_forward_microbatch,
+                chunk_idx_in_group,
+                real_group_size,
+            )
+            chunkpipe_forward_microbatch += 1
+            return result
+
+        def _backward_one_chunk(chunk_losses):
+            """Backward one chunk (LIFO) and free its KV cache.
+
+            The stored chunk_idx_in_group and real_group_size are restored so
+            downstream layers (MLA/Attention/Router) see the original
+            per-real-group state when detecting "last chunk in group"
+            boundaries. Stack-pop ordering naturally yields per-real-group
+            LIFO; chunk_idx_in_group == 0 (each real group's first-forwarded
+            chunk) is the last popped per real group and is the canonical
+            grad-ready / KV-reset boundary.
+            """
+            popped = chunk_losses.pop()
+            config.chunkpipe_backward_microbatch = popped[1]
+            config.chunkpipe_chunk_idx_in_group = popped[2]
+            config.chunkpipe_current_group_size = popped[3]
+            backward_step(input_tensor, popped[0], output_tensor_grad, model_type, config)
+            remove_key_value_cache(model, popped[1], config.mtp_num_layers)
+
+        def _backward_group(chunk_losses, total_chunks, sync_last_only=False):
+            """Backward all chunks of a composite in reverse order.
+
+            When sync_last_only is True, the first total_chunks-1 chunks run
+            inside no_sync_func() so only the very last chunk triggers DDP
+            grad-ready notifications — avoids register_grad_ready firing
+            multiple times on the same parameter within one composite when
+            overlap_grad_reduce is enabled.
+            """
+            config.chunkpipe_forward = False
+            if sync_last_only and total_chunks > 1:
+                with no_sync_func():
+                    for _ in range(total_chunks - 1):
+                        _backward_one_chunk(chunk_losses)
+                _backward_one_chunk(chunk_losses)
+            else:
+                for _ in range(total_chunks):
+                    _backward_one_chunk(chunk_losses)
+
+        # Phase 1: all composites inside no_sync (except the last's backward).
+        with no_sync_func():
+            while microbatch_idx < num_microbatches:
+                # Forward the first chunk (idx 0 of real-group 0): this
+                # invocation lets get_batch populate config with the composite
+                # descriptor and the current real-group size.
+                config.chunkpipe_forward = True
+                is_first_global = (chunkpipe_forward_microbatch == 0)
+                chunk_losses = [_forward_one_chunk(0, is_first_global)]
+
+                # Read the composite descriptor written by get_batch; fall back
+                # to a single real group when the composite path is inactive.
+                components = list(getattr(config, 'chunkpipe_component_sizes', None) or [])
+                if not components:
+                    components = [config.chunkpipe_current_group_size or 1]
+                first_size = components[0]
+
+                # Remaining chunks of the first real group.
+                for ci in range(1, first_size):
+                    chunk_losses.append(_forward_one_chunk(ci, False))
+
+                # Subsequent real groups: chunk_idx_in_group resets to 0 at
+                # each real-group boundary.
+                for real_size in components[1:]:
+                    for ci in range(real_size):
+                        chunk_losses.append(_forward_one_chunk(ci, False))
+
+                total_chunks = sum(components)
+                microbatch_idx += total_chunks
+
+                if microbatch_idx >= num_microbatches:
+                    last_group_losses = chunk_losses
+                    last_group_total_chunks = total_chunks
+                    break
+
+                # Non-last composite: backward inside no_sync.
+                if not forward_only:
+                    _backward_group(chunk_losses, total_chunks)
+                else:
+                    if total_chunks > 1:
+                        clear_key_value_cache(model, config.mtp_num_layers)
+
+        # Phase 2: last composite's backward — only the final chunk (reverse
+        # chunk_idx_in_group == 0 of real-group 0) runs outside no_sync.
+        if last_group_losses is not None:
+            if not forward_only:
+                _backward_group(
+                    last_group_losses, last_group_total_chunks, sync_last_only=True
+                )
+            else:
+                if last_group_total_chunks > 1:
+                    clear_key_value_cache(model, config.mtp_num_layers)
+
+    # Common finalization.
+    if config.finalize_model_grads_func is not None and not forward_only:
+        config.finalize_model_grads_func(
+            [model], total_num_tokens if config.calculate_per_token_loss else None
+        )
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+    if getattr(config, 'enable_cuda_graph', False):
+        create_cudagraphs()
+
+    return forward_data_store
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -735,6 +1096,19 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    if getattr(config, "enable_chunkpipe", False):
+        return forward_backward_no_pipelining_with_chunkpipe(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            forward_only=forward_only,
+            collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step,
+        )
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
