@@ -8,13 +8,33 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
     FineGrainedActivationOffloadingInterface as off_interface,
+    get_fine_grained_offloading_context,
+    set_offload_tag,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
+
+
+def maybe_set_offload_tag(tensor_name: str, tensor: Optional[torch.Tensor], config):
+    """Set the offload tag on `tensor` if its name is selected in config.offload_tensors.
+
+    Migrated from AIAK (M-13-3): when --offload-tensors is set, the offloading
+    checker only offloads tensors carrying the tag.
+    """
+    if tensor is None:
+        return
+    if (
+        getattr(config, "fine_grained_activation_offloading", False)
+        and getattr(config, "offload_tensors", None)
+        and tensor_name in config.offload_tensors
+    ):
+        set_offload_tag(tensor)
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):
@@ -100,6 +120,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                # M-13-3: merged offload group spanning dispatched_input and
+                # pre_mlp_layernorm_output (AIAK "dispatched-pre_mlp_layernorm" group).
+                offload_tensor_group = bool(
+                    layer.config.fine_grained_activation_offloading and layer.config.offload_tensors
+                )
+                if offload_tensor_group:
+                    hidden_states = fine_grained_offloading_group_start(
+                        hidden_states, name="dispatched-pre_mlp_layernorm"
+                    )
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
                 node.layer_state.mlp_norm_manager = mlp_norm_manager
                 if layer.recompute_pre_mlp_layernorm:
@@ -126,11 +155,26 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         )
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
-                shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-                local_tokens, probs = layer.mlp.preprocess(
-                    pre_mlp_layernorm_output, probs, routing_map
-                )
+                if offload_tensor_group:
+                    # Keep the reference so the mlp slot can tag it and force-release
+                    # it at the group commit.
+                    node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
+                    # Hooks must stay active for the route/preprocess consumers so the
+                    # tensors they save register to the merged group (AIAK #29 wiring).
+                    with get_fine_grained_offloading_context(True):
+                        shared_expert_output = layer.mlp.shared_experts_compute(
+                            pre_mlp_layernorm_output
+                        )
+                        probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                        local_tokens, probs = layer.mlp.preprocess(
+                            pre_mlp_layernorm_output, probs, routing_map
+                        )
+                else:
+                    shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                    probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                    local_tokens, probs = layer.mlp.preprocess(
+                        pre_mlp_layernorm_output, probs, routing_map
+                    )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
         hidden_states, local_tokens, probs, shared_expert_output = forward_func(
@@ -191,7 +235,44 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        # M-13-4: MoE three-way split — stage 1 (dispatch postprocess)
+        dispatched_input, tokens_per_expert, permuted_probs = (
+            layer.mlp.pre_routed_experts_compute(dispatched_tokens, dispatched_probs)
+        )
+
+        # M-13-3: tag the whitelisted tensors before the expert GEMMs save them
+        offload_tensor_group = bool(
+            layer.config.fine_grained_activation_offloading and layer.config.offload_tensors
+        )
+        if offload_tensor_group:
+            maybe_set_offload_tag('dispatched_input', dispatched_input, layer.config)
+            maybe_set_offload_tag(
+                'pre_mlp_layernorm_output',
+                getattr(node.layer_state, 'pre_mlp_layernorm_output', None),
+                layer.config,
+            )
+
+        # stage 2 (experts) — hooks active so expert saves register to the merged group
+        with get_fine_grained_offloading_context(offload_tensor_group):
+            expert_output, _ = layer.mlp.routed_experts_compute(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
+
+        # stage 3 (combine preprocess)
+        expert_output = layer.mlp.post_routed_experts_compute(expert_output)
+
+        # commit the merged group: offload the tagged tensors, force-release the
+        # layernorm output (its consumers have all run by now)
+        if offload_tensor_group:
+            pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
+            expert_output = fine_grained_offloading_group_commit(
+                expert_output,
+                name="dispatched-pre_mlp_layernorm",
+                forced_released_tensors=(
+                    [pre_mlp_layernorm_output] if pre_mlp_layernorm_output is not None else []
+                ),
+            )
+            node.layer_state.pre_mlp_layernorm_output = None
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.

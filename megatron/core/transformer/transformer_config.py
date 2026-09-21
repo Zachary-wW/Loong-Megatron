@@ -1380,6 +1380,17 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    offload_tensors: Optional[list[str]] = None
+    """Tensors to offload to CPU during forward pass and reload during backward pass.
+    When set, only tensors carrying the offload tag (set by the callables wiring)
+    are offloaded; when unset, all tensors passing the module-level checks are.
+    choices: "dispatched_input", "pre_mlp_layernorm_output".
+    "dispatched_input": the output of the pre_routed_experts_compute() stage of the
+    MoE three-way split, i.e. the routed token data entering routed_experts_compute().
+    "pre_mlp_layernorm_output": the output of pre_mlp_layernorm, i.e. the input of
+    shared_experts_compute().
+    """
+
     delay_offload_until_cuda_graph: bool = False
     """If True, delay the offload until the CUDA graph is executed for minimal CPU overhead.
     For more details, see the documentation:
@@ -2012,6 +2023,18 @@ class TransformerConfig(ModelParallelConfig):
                     "attn_proj cannot be set to offload_modules alone without core_attn "
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
+                )
+
+            # Validate offload_tensors if specified
+            if self.offload_tensors:
+                allowed_tensors = {
+                    "dispatched_input",
+                    "pre_mlp_layernorm_output",
+                }
+                invalid_tensors = set(self.offload_tensors) - allowed_tensors
+                assert not invalid_tensors, (
+                    f'Invalid choices for offload_tensors: {invalid_tensors}. '
+                    f'Allowed tensors are: {allowed_tensors}'
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
                 offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
