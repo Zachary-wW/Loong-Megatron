@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
+    _kwargs_from_config,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
@@ -508,6 +509,19 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
+            # Migrated from AIAK (M-03-2): DeepSpeed CPU Adam with fallback.
+            CPUAdam = AdamW
+            if config.use_deepspeed_cpu_adam:
+                try:
+                    from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+                    CPUAdam = DeepSpeedCPUAdam
+                except ImportError:
+                    warnings.warn(
+                        "DeepSpeed CPU Adam is not available (import failed). "
+                        "Falling back to PyTorch AdamW"
+                    )
+                    config.use_deepspeed_cpu_adam = False
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
@@ -523,6 +537,15 @@ def _get_megatron_optimizer_based_on_param_groups(
                     bias_correction=True,
                     fused=True,  # this flag is used to improve the performance of the cpu optimizer
                 )
+            elif config.optimizer == 'muon' and HAVE_EMERGING_OPTIMIZERS:
+                # Migrated from AIAK (M-03-1): Muon + CPU offload path. The
+                # community Muon class (external emerging-optimizers package)
+                # serves as both the GPU and CPU optimizer class here.
+                from .emerging_optimizers import TensorParallelMuon
+
+                gpu_optimizer_cls = TensorParallelMuon
+                cpu_optimizer_cls = TensorParallelMuon
+                optimizer_defaults = _kwargs_from_config(TensorParallelMuon, "muon", config)
             else:
                 gpu_optimizer_cls = SGD
                 cpu_optimizer_cls = CPUSGD
@@ -537,6 +560,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                 overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
+                grad_streaming=config.optimizer_offload_grad_streaming,
+                grad_streaming_bucket_bytes=(
+                    config.optimizer_offload_grad_streaming_bucket_mb * 1024 * 1024
+                ),
+                contiguous_state=config.optimizer_cpu_offload_contiguous_state,
                 param_update_in_fp32=True,
                 **optimizer_defaults,
             )
