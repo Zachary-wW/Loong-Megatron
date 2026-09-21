@@ -1085,21 +1085,25 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
+        # chunkpipe (M-26, migrated from AIAK): rolling and truncation are
+        # handled by the caller (the MTP block's layer loop) to preserve the
+        # full sequence with next-batch tokens across MTP layers.
+        if not getattr(self.config, 'enable_chunkpipe', False):
+            # Calc logits for the current Multi-Token Prediction (MTP) layers.
+            input_ids, _ = roll_tensor(
+                input_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            position_ids, _ = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         if padding_mask is not None:
             padding_mask, _ = roll_tensor(
                 padding_mask,
@@ -1827,11 +1831,54 @@ class MultiTokenPredictionBlock(MegatronModule):
                 # the detached view so mtp_detach_heads holds for each head.
                 hidden_states_main = hidden_states
 
+        # chunkpipe (M-26, migrated from AIAK): manage rolling at the block
+        # level to preserve the full input_ids (with appended next-batch
+        # tokens) across MTP layers — each iteration rolls the full copy left
+        # by 1 and truncates to chunksize for the layer's embedding, keeping
+        # the full rolled version for the next iteration so rolls chain.
+        full_input_ids = input_ids
+        full_position_ids = position_ids
+        # SFT chunkpipe MTP: the full tensor may span [chunksize + mtp_num_layers]
+        # after preprocessing appends bridge tokens; cu_seqlens_q only describes
+        # the current base chunk and would leave the trailing positions
+        # unrolled, breaking the bridge token between chunk boundaries — treat
+        # the window as contiguous for rolling in that case.
+        roll_packed_seq_params = packed_seq_params
+        if (
+            getattr(self.config, 'sft_chunkpipe_mode', False)
+            and full_input_ids.size(-1) > self.config.chunksize
+        ):
+            roll_packed_seq_params = None
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+            if getattr(self.config, 'enable_chunkpipe', False):
+                # Roll the full sequence (including next-batch tokens) left by 1.
+                full_input_ids, _ = roll_tensor(
+                    full_input_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=roll_packed_seq_params,
+                )
+                full_position_ids, _ = roll_tensor(
+                    full_position_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=roll_packed_seq_params,
+                )
+                # Truncate to chunk_size for this layer's embedding; clone so
+                # the full tensors are not corrupted in-place downstream.
+                chunk_size = self.config.chunksize
+                layer_input_ids = full_input_ids[:, :chunk_size].clone()
+                layer_position_ids = full_position_ids[:, :chunk_size].clone()
+            else:
+                layer_input_ids = input_ids
+                layer_position_ids = position_ids
             hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
-                input_ids=input_ids,
-                position_ids=position_ids,
+                input_ids=layer_input_ids,
+                position_ids=layer_position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
