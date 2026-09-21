@@ -1157,7 +1157,13 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    # mHC (M-24, migrated from AIAK): with multiple PP stages, intermediate
+    # communications carry n-stream tensors. Simplified approach — proper VPP
+    # support may need more complex logic.
+    mhc_hidden_dim = config.hidden_size
+    if config.enable_hyper_connections and parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        mhc_hidden_dim = config.hidden_size * config.num_residual_streams
+    tensor_shape = [seq_length, micro_batch_size, mhc_hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2096,11 +2102,20 @@ def get_tensor_shapes(
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    is_recv: Optional[bool] = None,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
 ):
     """Determine tensor shapes for pipeline communication.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
+
+    For hyper connections (mHC, M-24, migrated from AIAK), intermediate
+    pipeline stages communicate n-stream tensors with dimension
+    hidden_size * num_residual_streams:
+    - recv: stages with rank > 0 receive n-stream from the previous stage
+    - send: stages with rank < pp_size-1 send n-stream to the next stage
     """
     tensor_shapes = []
 
@@ -2116,7 +2131,25 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    # mHC (M-24): n-stream dimension for intermediate PP communication.
+    hidden_dim = config.hidden_size
+    if (
+        config.enable_hyper_connections
+        and pp_rank is not None
+        and pp_size is not None
+        and pp_size > 1
+    ):
+        use_nstream = False
+        if is_recv is True and pp_rank > 0:
+            # Receiving from the previous stage (which sends n*C)
+            use_nstream = True
+        elif is_recv is False and pp_rank < pp_size - 1:
+            # Sending to the next stage (send n*C)
+            use_nstream = True
+        if use_nstream:
+            hidden_dim = config.hidden_size * config.num_residual_streams
+
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_dim))
     return tensor_shapes
 
 
@@ -2268,6 +2301,8 @@ def forward_backward_pipelining_without_interleaving(
     else:
         backward_func = backward_step
 
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2275,6 +2310,9 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        is_recv=True,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2283,6 +2321,9 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        is_recv=False,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(

@@ -27,6 +27,11 @@ from megatron.core.transformer.module import GraphableMegatronModule, MegatronMo
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -378,8 +383,27 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            # mHC (M-24, migrated from AIAK): learned output-contract parameters.
+            # head_fn projects [s, b, n*C] -> [s, b, C] via F.linear, so its shape
+            # is [n, n*C]; base is [n]; scale is [1] (broadcasts). Created only on
+            # the PP rank that owns final_layernorm — creating them on other ranks
+            # would leave ownerless params under multi-stage PP.
+            if self.config.enable_hyper_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.ones(1))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+
+        if self.config.enable_hyper_connections:
+            self.num_residual_streams = self.config.num_residual_streams
 
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
@@ -592,6 +616,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # mHC (M-24, migrated from AIAK): expand hidden states at the start of
+        # the block. Only the first PP stage expands; subsequent stages receive
+        # the n-stream tensor from the previous stage.
+        if self.config.enable_hyper_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -644,6 +676,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                # mHC (M-24, migrated from AIAK): unified recompute blocks. Only
+                # when training with hyper connections and
+                # recompute_hyper_connections enabled.
+                use_mhc_recompute = (
+                    torch.is_grad_enabled()
+                    and self.config.enable_hyper_connections
+                    and self.config.recompute_hyper_connections
+                )
+                mhc_manager = MHCBlockRecomputeManager() if use_mhc_recompute else None
+                mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
+                num_layers = len(self.layers)
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -660,6 +703,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    # mHC (M-24): a layer is the last of its recompute block if
+                    # 1. it is the final layer of the block, or
+                    # 2. mhc_recompute_layer_num is set and (l_no + 1) is a
+                    #    multiple of it (l_no is 0-indexed).
+                    is_last_in_transformer_block = (l_no == num_layers - 1)
+                    is_last_in_recompute_block = is_last_in_transformer_block
+                    if use_mhc_recompute and mhc_recompute_layer_num is not None:
+                        is_last_in_recompute_block = (
+                            is_last_in_transformer_block
+                            or ((l_no + 1) % mhc_recompute_layer_num == 0)
+                        )
+
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -675,7 +730,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            mhc_recompute_manager=mhc_manager,
+                            is_last_layer_in_recompute_block=is_last_in_recompute_block,
                         )
+
+                    # mHC (M-24): a recompute block ended (but not the block's
+                    # final layer) — the next layers get a fresh manager.
+                    if (
+                        use_mhc_recompute
+                        and is_last_in_recompute_block
+                        and not is_last_in_transformer_block
+                    ):
+                        mhc_manager = MHCBlockRecomputeManager()
 
                     if (
                         torch.is_grad_enabled()
@@ -687,6 +753,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+
+        # mHC (M-24, migrated from AIAK): contract the n*C streams back to [s, b, C]
+        # before the final layernorm. When MTP is enabled, also return the
+        # pre-contraction multi-stream tensor as the MTP input.
+        mhc_multistream = None
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            if self.config.mtp_num_layers is not None and self.config.mtp_num_layers > 0:
+                mhc_multistream = hidden_states
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.num_residual_streams,
+                eps=getattr(self.config, "layernorm_epsilon", 1e-6),
+            )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -702,6 +784,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
+
+        # mHC (M-24): with mHC + MTP, return both the contracted [s, b, C] (for
+        # lm_head) and the pre-contraction multi-stream [s, b, n*C] (for the MTP
+        # input).
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states
