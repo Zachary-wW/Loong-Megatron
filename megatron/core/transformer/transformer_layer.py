@@ -889,6 +889,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states, context = self._forward_attention(
                 *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
             )
+        # FlushPendingGradAccum (ECHO overlap, M-31): identity in forward; its
+        # backward submits the deferred echo-expert wgrad add_() to moe_a2a_stream.
+        # Placed here (after attention, before the MLP) so its backward overlaps
+        # with the attention backward on moe_a2a_stream rather than with the
+        # small LN/residual ops in between.
+        if getattr(self.config, 'moe_echo_expert_dispatch_overlap', False):
+            from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum
+
+            hidden_states = FlushPendingGradAccum.apply(hidden_states)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),

@@ -392,6 +392,22 @@ class MoELayer(BaseMoELayer):
             )
             self.home_expert_indices = list(range(self.num_home_experts))
             self.experts.free_expert_parameters(self.echo_expert_indices)
+            # Overlap mode (migrated from AIAK, M-31): one class-level A2A
+            # stream + event set shared by every MoE layer of the process, plus
+            # the deferred echo-wgrad accumulation list flushed by
+            # FlushPendingGradAccum (inserted in transformer_layer).
+            if config.moe_echo_expert_dispatch_overlap and not hasattr(
+                MoELayer, 'moe_a2a_stream'
+            ):
+                MoELayer.moe_a2a_stream = torch.cuda.Stream()
+                MoELayer.fc1_expert_dispatch_event = torch.cuda.Event()
+                MoELayer.fc2_expert_dispatch_event = torch.cuda.Event()
+                MoELayer.token_dispatch_event = torch.cuda.Event()
+                MoELayer.token_combine_event = torch.cuda.Event()
+                MoELayer.grad_combine_event = torch.cuda.Event()
+                MoELayer.dispatch_bwd_event = torch.cuda.Event()
+                MoELayer.combine_bwd_event = torch.cuda.Event()
+                MoELayer.pending_expert_wgrads = []
         else:
             self.experts = self.submodules.experts(
                 self.num_local_experts,
@@ -949,12 +965,6 @@ class MoELayer(BaseMoELayer):
         through this layer's community stage methods (preprocess / dispatch /
         routed-experts three-way split / combine / postprocess).
         """
-        if self.config.moe_echo_expert_dispatch_overlap:
-            raise NotImplementedError(
-                "moe_echo_expert_dispatch_overlap is not yet wired on the v0.19.2 base "
-                "(requires experts.forward_with_dispatch_overlap and the moe_a2a_stream "
-                "machinery); follow-up to the M-31 Phase 2 port."
-            )
         residual = hidden_states
 
         # Step 1: Routing
@@ -1024,29 +1034,83 @@ class MoELayer(BaseMoELayer):
             ).sum(dim=[0, 2])
             GLOBAL_MOE_ROUTING_TRACKER.add_data(self.layer_number, "tokens_per_rank", tokens_per_rank)
 
-        # Step 3: Expert weight dispatch for the echo experts
+        # Step 3: Expert weight dispatch for the echo experts.
+        # Overlap mode (migrated from AIAK, M-31): only CPU-side preprocess
+        # here; the actual GPU weight dispatch is launched inside
+        # experts.forward_with_dispatch_overlap AFTER the token A2A completes,
+        # so it overlaps with the home GEMMs only — never with the token A2A
+        # (two concurrent A2As would contend for the NIC).
+        overlap_dispatch = self.config.moe_echo_expert_dispatch_overlap and hasattr(
+            MoELayer, 'moe_a2a_stream'
+        )
+        if overlap_dispatch:
+            torch.cuda.current_stream().wait_stream(MoELayer.moe_a2a_stream)
         fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
         fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
         fc1_expert_dispatch_metadata.buffer_idx = 0
         fc2_expert_dispatch_metadata.buffer_idx = 1
 
-        fc1_expert_weights = self.experts.get_expert_weights("fc1", self.home_expert_indices)
-        dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
-            fc1_expert_dispatch_metadata,
-            *fc1_expert_weights,
-        )
-        self.experts.set_expert_weights("fc1", dispatched_fc1_weights, self.echo_expert_indices)
+        if not overlap_dispatch:
+            # Original synchronous dispatch path.
+            fc1_expert_weights = self.experts.get_expert_weights("fc1", self.home_expert_indices)
+            dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
+                fc1_expert_dispatch_metadata,
+                *fc1_expert_weights,
+            )
+            self.experts.set_expert_weights("fc1", dispatched_fc1_weights, self.echo_expert_indices)
 
-        fc2_expert_weights = self.experts.get_expert_weights("fc2", self.home_expert_indices)
-        dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
-            fc2_expert_dispatch_metadata,
-            *fc2_expert_weights,
-        )
-        self.experts.set_expert_weights("fc2", dispatched_fc2_weights, self.echo_expert_indices)
+            fc2_expert_weights = self.experts.get_expert_weights("fc2", self.home_expert_indices)
+            dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
+                fc2_expert_dispatch_metadata,
+                *fc2_expert_weights,
+            )
+            self.experts.set_expert_weights("fc2", dispatched_fc2_weights, self.echo_expert_indices)
 
         # Steps 4-6: token flow over the re-routed map, through this layer's
         # standard stage methods (latent projection included in preprocess).
         def dispatch_and_compute(hidden_states, probs):
+            if overlap_dispatch:
+                # Token dispatch preprocess + A2A + postprocess on moe_a2a_stream
+                # so all A2A traffic serializes on one stream.
+                with torch.cuda.stream(MoELayer.moe_a2a_stream):
+                    MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
+                    hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                        hidden_states, rerouting_map, probs
+                    )
+                    dispatched_input, probs = self.token_dispatcher.token_dispatch(
+                        hidden_states, probs
+                    )
+                    dispatched_input, tokens_per_expert, permuted_probs = (
+                        self.token_dispatcher.dispatch_postprocess(dispatched_input, probs)
+                    )
+                MoELayer.token_dispatch_event.record()
+                torch.cuda.default_stream().wait_event(MoELayer.token_dispatch_event)
+                # Expert compute: home GEMMs on the default stream overlap with
+                # the echo weight dispatch launched inside.
+                expert_output, mlp_bias = self.experts.forward_with_dispatch_overlap(
+                    dispatched_input,
+                    tokens_per_expert,
+                    permuted_probs,
+                    len(self.home_expert_indices),
+                    self.home_expert_indices,
+                    self.echo_expert_indices,
+                    self.expert_dispatcher,
+                    fc1_expert_dispatch_metadata,
+                    fc2_expert_dispatch_metadata,
+                    MoELayer.moe_a2a_stream,
+                    MoELayer.fc1_expert_dispatch_event,
+                    MoELayer.fc2_expert_dispatch_event,
+                )
+                # Token combine (on moe_a2a_stream, after all expert GEMMs).
+                with torch.cuda.stream(MoELayer.moe_a2a_stream):
+                    MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
+                    output = self.token_dispatcher.combine_preprocess(expert_output)
+                    output = self.token_dispatcher.token_combine(output)
+                MoELayer.token_combine_event.record()
+                torch.cuda.default_stream().wait_event(MoELayer.token_combine_event)
+                output = self.token_dispatcher.combine_postprocess(output)
+                return output, mlp_bias
+
             hidden_states, probs = self.preprocess(hidden_states, probs, rerouting_map)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self._routed_experts_compute_fused(dispatched_input, probs)
@@ -1157,6 +1221,52 @@ class MoELayer(BaseMoELayer):
             if self.config.moe_echo_log_file is not None:
                 with open(self.config.moe_echo_log_file, "a") as f:
                     f.write(log_line + "\n")
+
+
+class FlushPendingGradAccum(torch.autograd.Function):
+    """Identity in forward; in backward, submits the deferred echo-expert wgrad
+    add_() to moe_a2a_stream (migrated from AIAK, M-31 overlap mode).
+
+    Inserted into the autograd graph between the attention half and the MLP
+    half: its backward runs after the token dispatch/preprocess backwards are
+    already submitted to moe_a2a_stream, so appending the add_() there puts it
+    at the end of the stream queue — after all backward A2A ops — with no
+    extra synchronization required.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        """Return the input unchanged in the forward pass."""
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Flush pending expert weight gradients during backward."""
+        # MoELayer is resolved via this module's globals at call time — a local
+        # import inside an autograd backward can trigger Python's import lock
+        # in PyTorch's C++ autograd threads (pybind11 exception-state issues).
+        MoELayer_ = _get_local_moe_layer()
+        pending = getattr(MoELayer_, 'pending_expert_wgrads', None)
+        if pending:
+            with torch.cuda.stream(MoELayer_.moe_a2a_stream):
+                # grad_combine_event was recorded on moe_a2a_stream after the
+                # last combine_with_unpermute A2A; FIFO already orders these,
+                # the wait is a safety net.
+                MoELayer_.moe_a2a_stream.wait_event(MoELayer_.grad_combine_event)
+                # wgrad_home accumulates into main_grad on the DEFAULT stream
+                # (gradient-accumulation fusion inside the home GEMM backward);
+                # wgrad_echo (below) runs on moe_a2a_stream — serialize them or
+                # the two add_() calls can overlap and corrupt main_grad.
+                MoELayer_.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
+                for weight, wgrad in pending:
+                    weight.main_grad.add_(wgrad)
+            pending.clear()
+        return grad_output
+
+
+def _get_local_moe_layer():
+    """Return the MoELayer class defined in this module."""
+    return MoELayer
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):
