@@ -2,6 +2,7 @@
 
 import fnmatch
 from dataclasses import dataclass, field
+import warnings
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -365,6 +366,27 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    optimizer_offload_grad_streaming: bool = False
+    """If True, stream gradients to CPU through two bounded pinned staging
+    arenas (bucketed waves) instead of keeping a persistent full-size pinned
+    grad mirror (saves 4 bytes/param of host RAM). Migrated from AIAK (M-32);
+    implies overlap_cpu_optimizer_d2h_h2d."""
+
+    optimizer_offload_grad_streaming_bucket_mb: int = 4096
+    """Bucket (wave) size in MiB for gradient streaming; two arenas of
+    max(bucket, largest param) bytes are allocated."""
+
+    optimizer_cpu_offload_contiguous_state: bool = False
+    """If True, place the CPU-offloaded optimizer state (fp32 master params,
+    exp_avg, exp_avg_sq) in per-buffer contiguous pinned arenas laid out in
+    the distributed optimizer's dp_zero world (unpadded) order, with per-param
+    state tensors as views. Migrated from AIAK (M-32)."""
+
+    use_deepspeed_cpu_adam: bool = True
+    """If True, use DeepSpeed CPU Adam implementation instead of Torch CPU Adam.
+    Migrated from AIAK (M-03-2); falls back to Torch AdamW when deepspeed is
+    not importable."""
+
     ################
     # Miscellaneous
     ################
@@ -437,6 +459,26 @@ class OptimizerConfig:
 
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
+
+            # Migrated from AIAK (#75): DeepSpeed CPUAdam requires FP32 moment
+            # states for CPU-offloaded FP32 master params — force the dtypes
+            # instead of failing at runtime.
+            if (
+                self.optimizer_cpu_offload
+                and self.optimizer == 'adam'
+                and self.use_deepspeed_cpu_adam
+                and (
+                    self.exp_avg_dtype != torch.float32
+                    or self.exp_avg_sq_dtype != torch.float32
+                )
+            ):
+                warnings.warn(
+                    "DeepSpeed CPUAdam requires FP32 Adam moment states for CPU-offloaded "
+                    "FP32 master params. Forcing exp_avg_dtype and exp_avg_sq_dtype to "
+                    "torch.float32."
+                )
+                self.exp_avg_dtype = torch.float32
+                self.exp_avg_sq_dtype = torch.float32
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.
