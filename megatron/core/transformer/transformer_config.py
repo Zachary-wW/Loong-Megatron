@@ -526,6 +526,53 @@ class TransformerConfig(ModelParallelConfig):
     """If True, uses bias dropout fusion."""
 
     apply_rope_fusion: bool = False
+
+    ####################
+    # chunkpipe related (migrated from AIAK, M-26)
+    ####################
+    enable_chunkpipe: bool = False
+    """When set to true, split sequences into multiple chunks that are pipelined
+    as independent schedule units (1M-context support)."""
+
+    chunksize: int = 0
+    """Size of each chunk (tokens per chunk)."""
+
+    chunk_num_per_seq: int = 0
+    """Number of chunks per sequence, calculated as seq_length // chunksize."""
+
+    keep_activations_chunks: int = 0
+    """Number of chunks of which activations will be retained."""
+
+    chunkpipe_forward_microbatch: int = 0
+    """Microbatch count for the chunkpipe forward (runtime, scheduler-managed)."""
+
+    chunkpipe_backward_microbatch: int = 0
+    """Microbatch count for the chunkpipe backward (runtime, scheduler-managed)."""
+
+    chunkpipe_current_group_size: int = 0
+    """Runtime mutable field. The chunk group size of the group currently being
+    processed by the scheduler. For pretrain this equals chunk_num_per_seq; for
+    SFT it varies per group (1 for binpacked, >1 for long sequences)."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime mutable field. The 0-based index of the current chunk within its
+    group. Set by the scheduler before each forward_step — avoids relying on
+    chunkpipe_forward_microbatch % group_size, which breaks when group sizes
+    vary across groups in SFT."""
+
+    chunk_keys: Optional[dict] = None
+    """Runtime cache for attention keys across chunks of a group."""
+
+    chunk_values: Optional[dict] = None
+    """Runtime cache for attention values across chunks of a group."""
+
+    chunkpipe_forward: bool = False
+    """Runtime flag: chunkpipe forward in progress."""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether chunkpipe runs in SFT mode (dynamic group_size). Enabled when
+    training_phase == 'sft' and enable_chunkpipe is True."""
+
     """If True, use fused RoPE kernel."""
 
     use_fused_weighted_squared_relu: bool = False
@@ -2373,6 +2420,11 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion for multi-latent attention only supports training. "
                     "It is experimental and may change in future versions."
                 )
+                # Migrated from AIAK (M-26): chunkpipe runs attention chunk-by-chunk
+                # with its own RoPE application per chunk; the fused rope kernel
+                # does not fit that flow.
+                if self.enable_chunkpipe:
+                    self.apply_rope_fusion = False
             else:
                 if self.rotary_interleaved:
                     if not is_te_min_version("2.3.0"):

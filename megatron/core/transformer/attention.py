@@ -24,6 +24,8 @@ from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -754,6 +756,150 @@ class Attention(MegatronModule, ABC):
                     self.layer_number - pp_layer_offset
                 )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
+
+    def setup_chunkpipe_kv_cache_config(self) -> None:
+        """Configure chunkpipe key-value cache sizing and bookkeeping (M-26).
+
+        Migrated from AIAK: cache size is derived from the pipeline schedule —
+        how many chunks can be in flight before a rank's own backward releases
+        them. Must be called once at init when chunkpipe is enabled.
+        """
+        self.num_chunks_per_seq = self.config.chunk_num_per_seq
+
+        pipeline_world_size = get_pipeline_model_parallel_world_size()
+        pipeline_rank = get_pipeline_model_parallel_rank()
+        if (
+            self.config.sft_chunkpipe_mode
+            and self.config.virtual_pipeline_model_parallel_size is not None
+        ):
+            # SFT + VPP: all sequences in one VP group means VP0 holds all
+            # entries until VP1's backward completes. Max concurrent cache per
+            # VP stage = num_microbatches - num_sequences (non-last-chunk
+            # entries only).
+            num_mb = getattr(self.config, 'chunkpipe_num_microbatches', 0)
+            num_seq = num_mb // self.num_chunks_per_seq
+            self.kv_cache_chunk_size = num_mb - num_seq
+        elif self.config.virtual_pipeline_model_parallel_size is not None:
+            self.kv_cache_chunk_size = (
+                (pipeline_world_size - pipeline_rank - 1) * 2
+                + self.num_chunks_per_seq * self.config.virtual_pipeline_model_parallel_size
+            )
+        else:
+            self.kv_cache_chunk_size = (
+                (pipeline_world_size - pipeline_rank - 1) * 2 + self.num_chunks_per_seq
+            )
+
+        self.micro_batch_to_cache_chunk_map = {}
+        self.empty_chunk_indices = list(range(self.kv_cache_chunk_size))
+
+    def init_chunk_key_value_cache(self) -> None:
+        """Allocate the chunk key/value cache tensors (M-26, migrated from AIAK).
+
+        Shape: [kv_cache_chunk_size * chunksize, micro_batch_size,
+        num_query_groups_per_partition, hidden_size_per_attention_head].
+        Call after setup_chunkpipe_kv_cache_config().
+        """
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        micro_batch_size = getattr(self.config, 'micro_batch_size', 0)
+        assert micro_batch_size > 0, (
+            "chunkpipe KV cache requires config.micro_batch_size (set by the "
+            "scheduler at runtime)."
+        )
+        total_cache_tokens = self.kv_cache_chunk_size * self.config.chunksize
+        cache_shape = (
+            total_cache_tokens,
+            micro_batch_size,
+            self.num_query_groups_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+
+        self.key_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+        self.value_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
+
+        self.key_cache_grad = {}
+        self.value_cache_grad = {}
+
+    def is_enable_grad_chunkpipe(self):
+        """Whether gradient hooks should be registered during chunkpipe forward (M-26).
+
+        Returns False when the forward itself carries grad; True when grad is
+        disabled in forward (recompute will rebuild it).
+        """
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError(
+                "This method is valid only for Chunkpipe, please check "
+                "config.enable_chunkpipe=True"
+            )
+
+        # Forward recomputation before the backward pass: grad enabled.
+        if not self.config.chunkpipe_forward:
+            return True
+
+        # Inference: grad always disabled.
+        if not self.training:
+            return False
+
+        # During the last `keep_activations_chunks` chunks of a group, grad
+        # should be enabled.
+        if self.config.sft_chunkpipe_mode:
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+            effective_group = self.config.chunkpipe_current_group_size
+        else:
+            current_chunk_idx = (
+                self.config.chunkpipe_forward_microbatch % self.num_chunks_per_seq
+            )
+            effective_group = self.num_chunks_per_seq
+        return current_chunk_idx + self.config.keep_activations_chunks >= effective_group
+
+    def clear_chunk_key_value_cache(self) -> None:
+        """Reset the chunk key-value cache bookkeeping to the empty state (M-26).
+
+        Memory stays allocated for reuse; every chunk becomes available and the
+        micro-batch -> cache-chunk map is emptied.
+        """
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError(
+                "Chunk key-value cache operations require chunkpipe to be enabled. "
+                "Please check your configuration."
+            )
+        self.empty_chunk_indices = list(range(self.kv_cache_chunk_size))
+        self.micro_batch_to_cache_chunk_map.clear()
+
+    def delete_chunk_key_value_cache(self, micro_batch_index: int) -> None:
+        """Release one micro-batch's cache chunk back to the free list (M-26)."""
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError(
+                "Chunk key-value cache operations require chunkpipe to be enabled. "
+                "Please check your configuration."
+            )
+        if micro_batch_index not in self.micro_batch_to_cache_chunk_map:
+            return
+        cache_chunk_index = self.micro_batch_to_cache_chunk_map.pop(micro_batch_index)
+        self.empty_chunk_indices.append(cache_chunk_index)
+
+    def check_kv_cache_grad_consumed(self):
+        """Assert the cache grads were fully consumed by a group's backward (M-26).
+
+        In SFT chunkpipe, each group's backward must consume all cache grads
+        accumulated during that group's forward; leftovers indicate a LIFO
+        order violation that would silently drop gradients.
+        """
+        if self.key_cache_grad:
+            orphan_keys = list(self.key_cache_grad.keys())
+            self.key_cache_grad.clear()
+            assert False, (
+                f"[ChunkPipe] Orphan key_cache_grad entries {orphan_keys} remain after "
+                f"group backward. layer={self.layer_number}"
+            )
+        if self.value_cache_grad:
+            orphan_keys = list(self.value_cache_grad.keys())
+            self.value_cache_grad.clear()
+            assert False, (
+                f"[ChunkPipe] Orphan value_cache_grad entries {orphan_keys} remain after "
+                f"group backward. layer={self.layer_number}"
+            )
 
     @abstractmethod
     def get_query_key_value_tensors(
