@@ -2131,6 +2131,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    enable_chunkpipe: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2216,7 +2217,8 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            if create_attention_mask_in_dataloader:
+            if create_attention_mask_in_dataloader and not enable_chunkpipe:
+                # chunkpipe (M-26): no full-length [1,1,S,S] mask broadcast.
                 _broadcast(batch['attention_mask'])
             if is_hybrid_cp:
                 _broadcast(batch['local_cp_size'])
@@ -2232,7 +2234,8 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            if create_attention_mask_in_dataloader:
+            if create_attention_mask_in_dataloader and not enable_chunkpipe:
+                # chunkpipe (M-26): no full-length [1,1,S,S] mask broadcast.
                 _broadcast(batch['attention_mask'])
 
         elif is_pipeline_last_stage:
@@ -2246,7 +2249,8 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            if create_attention_mask_in_dataloader:
+            if create_attention_mask_in_dataloader and not enable_chunkpipe:
+                # chunkpipe (M-26): no full-length [1,1,S,S] mask broadcast.
                 _broadcast(batch['attention_mask'])
 
         elif has_cu_seqlens:
@@ -2286,7 +2290,10 @@ def get_batch_on_this_tp_rank(
             max_seqlen = torch.empty(
                 micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
             )
-        if create_attention_mask_in_dataloader:
+        if create_attention_mask_in_dataloader and not enable_chunkpipe:
+            # chunkpipe (M-26, migrated from AIAK): the attention mask shape
+            # [1, 1, S, S] at full sequence length would OOM — the chunk-level
+            # mask is generated inside the attention module instead.
             attention_mask = torch.empty(
                 (micro_batch_size, 1, seq_length, seq_length),
                 dtype=torch.bool,
