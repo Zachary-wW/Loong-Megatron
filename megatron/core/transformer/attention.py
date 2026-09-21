@@ -901,6 +901,175 @@ class Attention(MegatronModule, ABC):
                 f"group backward. layer={self.layer_number}"
             )
 
+    def append_chunk_key_value_cache(self, key: Tensor, value: Tensor) -> None:
+        """Append the current chunk's key/value to the chunk cache (M-26).
+
+        Migrated from AIAK: only caches during the forward pass and skips the
+        last chunk of a group (its KV is never consumed by a later chunk).
+        """
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError(
+                "Chunk key-value cache operations require chunkpipe to be enabled. "
+                "Please check your configuration."
+            )
+        if not self.config.chunkpipe_forward:
+            return
+
+        current_microbatch = self.config.chunkpipe_forward_microbatch
+
+        # Skip caching if this is the last chunk in the sequence.
+        skip_cache = False
+        if self.config.sft_chunkpipe_mode:
+            if (
+                self.config.chunkpipe_chunk_idx_in_group
+                >= self.config.chunkpipe_current_group_size - 1
+            ):
+                skip_cache = True
+        else:
+            if (current_microbatch + 1) % self.num_chunks_per_seq == 0:
+                skip_cache = True
+        if skip_cache:
+            return
+
+        if not self.empty_chunk_indices:
+            raise RuntimeError(
+                "No available cache chunks. Consider increasing cache size or "
+                "clearing old entries."
+            )
+        available_chunk_id = self.empty_chunk_indices.pop(0)
+        self.micro_batch_to_cache_chunk_map[current_microbatch] = available_chunk_id
+
+        cache_indices = torch.arange(self.config.chunksize, device=key.device) + (
+            available_chunk_id * self.config.chunksize
+        )
+        self.key_cache[cache_indices, :, :, :] = key
+        self.value_cache[cache_indices, :, :, :] = value
+
+    def concat_cached_chunk_key_value(self, key, value, attention_mask):
+        """Concatenate the cached key/value chunks with the current chunk (M-26).
+
+        Migrated from AIAK: gives the attention mechanism full sequence context
+        across chunk boundaries — the current chunk attends to all previously
+        cached chunks of its group plus itself. Registers per-chunk grad hooks
+        during the recompute window so the backward of chunk k accumulates its
+        contribution into the cached K/V of earlier chunks. The attention mask
+        is rebuilt as an upper-triangular chunk-local mask so autoregressive
+        causality holds over the concatenated length.
+        """
+        if not self.config.enable_chunkpipe:
+            raise RuntimeError("Chunk concatenation requires chunkpipe to be enabled.")
+
+        is_forward = self.config.chunkpipe_forward
+        microbatch_idx = (
+            self.config.chunkpipe_forward_microbatch
+            if is_forward
+            else self.config.chunkpipe_backward_microbatch
+        )
+        if self.config.sft_chunkpipe_mode:
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+        else:
+            current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
+        start_microbatch_idx = microbatch_idx - current_chunk_idx
+
+        total_concatenated_tokens = (current_chunk_idx + 1) * self.config.chunksize
+        micro_batch_size = getattr(self.config, 'micro_batch_size', 0)
+        concatenated_shape = (
+            total_concatenated_tokens,
+            micro_batch_size,
+            self.num_query_groups_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        concatenated_key = torch.zeros(
+            concatenated_shape, device=self.key_cache.device, dtype=self.key_cache.dtype
+        )
+        concatenated_value = torch.zeros(
+            concatenated_shape, device=self.key_cache.device, dtype=self.key_cache.dtype
+        )
+
+        def key_cache_hook_fn(chunk_index):
+            """Accumulate the current chunk's loss gradient wrt a cached key."""
+
+            def hook_fn(grad):
+                if chunk_index not in self.key_cache_grad:
+                    self.key_cache_grad[chunk_index] = grad
+                else:
+                    self.key_cache_grad[chunk_index] += grad
+                return grad
+
+            return hook_fn
+
+        def value_cache_hook_fn(chunk_index):
+            """Accumulate the current chunk's loss gradient wrt a cached value."""
+
+            def hook_fn(grad):
+                if chunk_index not in self.value_cache_grad:
+                    self.value_cache_grad[chunk_index] = grad
+                else:
+                    self.value_cache_grad[chunk_index] += grad
+                return grad
+
+            return hook_fn
+
+        current_pos = 0
+        for prev_chunk_idx in range(current_chunk_idx):
+            map_key = start_microbatch_idx + prev_chunk_idx
+            if map_key not in self.micro_batch_to_cache_chunk_map:
+                raise RuntimeError(
+                    f"[ChunkPipe] KeyError: map key {map_key} not found. "
+                    f"microbatch_idx={microbatch_idx} is_forward={is_forward} "
+                    f"current_chunk_idx={current_chunk_idx} "
+                    f"start={start_microbatch_idx} "
+                    f"map keys={sorted(self.micro_batch_to_cache_chunk_map.keys())} "
+                    f"chunk_idx_in_group={getattr(self.config, 'chunkpipe_chunk_idx_in_group', 'N/A')} "
+                    f"group_size={getattr(self.config, 'chunkpipe_current_group_size', 'N/A')} "
+                    f"layer={self.layer_number}"
+                )
+            cache_chunk_idx = self.micro_batch_to_cache_chunk_map[map_key]
+            chunk_indices = torch.arange(
+                self.config.chunksize, device=self.key_cache.device
+            ) + (cache_chunk_idx * self.config.chunksize)
+            cached_key = self.key_cache[chunk_indices, :, :, :]
+            cached_value = self.value_cache[chunk_indices, :, :, :]
+
+            # Grad hooks for the backward pass (recompute window only).
+            if self.is_enable_grad_chunkpipe():
+                cached_key.requires_grad = True
+                cached_value.requires_grad = True
+                cached_key.register_hook(key_cache_hook_fn(prev_chunk_idx))
+                cached_value.register_hook(value_cache_hook_fn(prev_chunk_idx))
+
+            concatenated_key[
+                current_pos : current_pos + self.config.chunksize, :, :, :
+            ] = cached_key
+            concatenated_value[
+                current_pos : current_pos + self.config.chunksize, :, :, :
+            ] = cached_value
+            current_pos += self.config.chunksize
+
+        # The current chunk's keys and values.
+        concatenated_key[
+            current_pos : current_pos + self.config.chunksize, :, :, :
+        ] = key
+        concatenated_value[
+            current_pos : current_pos + self.config.chunksize, :, :, :
+        ] = value
+
+        # Adjust the attention mask for autoregressive (causal) attention.
+        adjusted_mask = None
+        if attention_mask is not None:
+            chunksize = self.config.chunksize
+            mask_org = torch.ones(
+                chunksize,
+                total_concatenated_tokens,
+                dtype=torch.bool,
+                device=self.key_cache.device,
+            )
+            mask_index = current_chunk_idx * chunksize + 1
+            mask_org.triu_(diagonal=mask_index)
+            adjusted_mask = mask_org.view(1, 1, chunksize, total_concatenated_tokens)
+
+        return concatenated_key, concatenated_value, adjusted_mask
+
     @abstractmethod
     def get_query_key_value_tensors(
         self,
@@ -1697,6 +1866,92 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        # chunkpipe (M-26, migrated from AIAK): cache this chunk's K/V, then
+        # attend over the concatenated K/V of all chunks of the group. Grad
+        # hooks combine each cached chunk's gradient contributions from the
+        # later chunks' backwards (LIFO order); the mask switches to
+        # causal_bottom_right over the concatenated length (AIAK 2467452's GQA
+        # precision form).
+        if self.config.enable_chunkpipe:
+
+            def key_hook_fn(grad):
+                """Combine the key gradients of subsequent chunks into this chunk's."""
+                if self.config.sft_chunkpipe_mode:
+                    chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                    is_last = (
+                        chunks_in_current_sequence
+                        >= self.config.chunkpipe_current_group_size - 1
+                    )
+                else:
+                    chunks_in_current_sequence = (
+                        self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    )
+                    is_last = (chunks_in_current_sequence == self.num_chunks_per_seq - 1)
+                if is_last:
+                    return grad
+                if self.config.sft_chunkpipe_mode:
+                    if chunks_in_current_sequence in self.key_cache_grad:
+                        grad_from_prev_chunk = self.key_cache_grad.pop(
+                            chunks_in_current_sequence
+                        )
+                        return grad + grad_from_prev_chunk
+                    assert False, (
+                        f"[ChunkPipe] key_cache_grad[{chunks_in_current_sequence}] not "
+                        f"available during backward. This indicates LIFO order violation "
+                        f"in VPP backward scheduling. layer={self.layer_number}, "
+                        f"bwd_mb={self.config.chunkpipe_backward_microbatch}"
+                    )
+                grad_from_prev_chunk = self.key_cache_grad.pop(chunks_in_current_sequence)
+                return grad + grad_from_prev_chunk
+
+            def value_hook_fn(grad):
+                """Combine the value gradients of subsequent chunks into this chunk's."""
+                if self.config.sft_chunkpipe_mode:
+                    chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                    is_last = (
+                        chunks_in_current_sequence
+                        >= self.config.chunkpipe_current_group_size - 1
+                    )
+                else:
+                    chunks_in_current_sequence = (
+                        self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                    )
+                    is_last = (chunks_in_current_sequence == self.num_chunks_per_seq - 1)
+                if is_last:
+                    return grad
+                if self.config.sft_chunkpipe_mode:
+                    if chunks_in_current_sequence in self.value_cache_grad:
+                        grad_from_prev_chunk = self.value_cache_grad.pop(
+                            chunks_in_current_sequence
+                        )
+                        return grad + grad_from_prev_chunk
+                    assert False, (
+                        f"[ChunkPipe] value_cache_grad[{chunks_in_current_sequence}] not "
+                        f"available during backward. This indicates LIFO order violation "
+                        f"in VPP backward scheduling. layer={self.layer_number}, "
+                        f"bwd_mb={self.config.chunkpipe_backward_microbatch}"
+                    )
+                grad_from_prev_chunk = self.value_cache_grad.pop(chunks_in_current_sequence)
+                return grad + grad_from_prev_chunk
+
+            if self.is_enable_grad_chunkpipe():
+                key.register_hook(key_hook_fn)
+                value.register_hook(value_hook_fn)
+
+            # Cache this chunk's key/value.
+            self.append_chunk_key_value_cache(key, value)
+
+            # Attend over the concatenated K/V of the whole group.
+            key, value, attention_mask = self.concat_cached_chunk_key_value(
+                key, value, attention_mask
+            )
+            if not self.config.sft_chunkpipe_mode or (
+                self.config.chunkpipe_current_group_size > 1
+                and self.config.chunkpipe_chunk_idx_in_group > 0
+            ):
+                attn_mask_type = AttnMaskType.causal_bottom_right
+                packed_seq_params = None
 
         # ==================================
         # core attention computation
