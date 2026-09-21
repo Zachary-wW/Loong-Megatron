@@ -381,6 +381,22 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    kda_safe_gate: bool = False
+    """Whether the KDA kernel should use bounded gate values."""
+
+    kda_lower_bound: Optional[float] = None
+    """Optional lower bound for KDA's bounded gate values."""
+
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+
+    Only valid without chunkwise CP: padding a chunk-local causal-conv input changes the
+    sequence seen by later chunks and therefore changes the GDN recurrence numerics.
+    """
+
     ####################
     # initialization
     ####################
@@ -1063,6 +1079,17 @@ class TransformerConfig(ModelParallelConfig):
     # Context Parallel
     ##################
     cp_comm_type: Optional[Union[str, List[str]]] = None
+
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks
+    (DS V4 / experimental attention variants, M-30)."""
+
+    linear_cp_mode: Optional[str] = "chunkwise"
+    """Context-parallel execution mode for linear-attention layers (e.g. GDN).
+
+    Independent of cp_comm_type, which only controls standard attention.
+    Can be "chunkwise" or "headwise".
+    """
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
