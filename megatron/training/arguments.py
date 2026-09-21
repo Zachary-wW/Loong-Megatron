@@ -1836,10 +1836,22 @@ def validate_args(args, defaults={}):
             "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
             "as the hybrid device optimizer reuses the code path of this flag."
         )
-        assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
-            "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
-            "must be used in conjunction with `--fp8-recipe delayed`."
-        )
+        # Migrated from AIAK (M-10): fp8-param-gather + optimizer CPU offload
+        # is now supported for the blockwise recipe — the FP32 masters of the
+        # FP8 params live in the CPU optimizer as zero-size GPU proxies
+        # (config._uses_fp8_cpu_offload_main_params). The delayed-only
+        # restriction no longer applies:
+        # assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
+        #     "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
+        #     "must be used in conjunction with `--fp8-recipe delayed`."
+        # )
+        if args.fp8_param_gather and args.optimizer_offload_fraction != 1.0:
+            print_rank_0(
+                "WARNING: fp8-param-gather with partial optimizer CPU offload "
+                "does not use the fp8 CPU master path; FP32 master mirrors of "
+                "FP8 params stay on GPU. Use --optimizer-offload-fraction 1.0 "
+                "for the full fp8 CPU master offload."
+            )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"

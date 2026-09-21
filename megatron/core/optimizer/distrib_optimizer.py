@@ -34,7 +34,10 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.cpu_offloading import (
+    FP8CPUOffloadProxyInfo,
+    HybridDeviceOptimizer,
+)
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -73,6 +76,17 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+
+def _uses_cpu_offloaded_fp32_master_for_fp8_param(
+    config: OptimizerConfig, model_param: torch.Tensor
+) -> bool:
+    """Return whether this FP8 param keeps its FP32 optimizer master shard on CPU.
+
+    Migrated from AIAK (M-10): the combo gating lives on
+    OptimizerConfig._uses_fp8_cpu_offload_main_params().
+    """
+    return config._uses_fp8_cpu_offload_main_params() and is_float8tensor(model_param)
 
 
 class Range:
@@ -400,8 +414,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
+                    # Migrated from AIAK (M-10/#86): with the fp8 master CPU
+                    # offload combo, this param becomes a zero-size proxy —
+                    # the FP32 master shard is owned by the CPU optimizer and
+                    # the real blockwise FP8 weight stays in model_param (no
+                    # GPU fp32 mirror).
+                    uses_cpu_offloaded_fp32_master_for_fp8 = (
+                        _uses_cpu_offloaded_fp32_master_for_fp8_param(config, model_param)
+                    )
+
                     # Generate sharded model param.
-                    if (
+                    if uses_cpu_offloaded_fp32_master_for_fp8:
+                        shard_model_param = torch.empty(
+                            (0,), device=model_param.device, dtype=torch.bfloat16
+                        ).detach()
+                        tensor_parallel.copy_tensor_model_parallel_attributes(
+                            shard_model_param, model_param
+                        )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
+                        copy_optimizer_param_metadata(shard_model_param, model_param)
+                        shard_model_param._fp8_cpu_offload_info = FP8CPUOffloadProxyInfo(
+                            blockwise_fp8_model_param=model_param,
+                            start_offset=param_range.start,
+                            shard_numel=param_range.size,
+                            data_parallel_group=self.data_parallel_group,
+                        )
+                    elif (
                         cls._is_distopt_quantized_param(model_param)
                         and config.fp8_recipe != "delayed"
                     ) or is_nvfp4tensor(model_param):
@@ -419,7 +457,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
-                    if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    if uses_cpu_offloaded_fp32_master_for_fp8:
+                        # Migrated from AIAK (M-10): the optimizer owns the master
+                        # shard and casts it back to the blockwise FP8 model param
+                        # after optimizer.step() — it stays in host memory.
+                        shard_main_param = None
+                    elif not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # If we use FP8 params to initialize FP32 main params (compared to using the
                         # bf16/fp16 params to initialize the main params), there will be a loss of
                         # precision at the beginning of training (this problem will not occur if the
@@ -788,9 +831,123 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
+            # Migrated from AIAK (M-10/#92): the optimizer owns the FP32 masters
+            # of the FP8 params and casts them back itself, which reduces amaxes
+            # over the DP group. Hand it the grad-buffer param order so that
+            # collective is issued identically on every rank; a rank that owns
+            # no shard of a given param still has to take part.
+            if config._uses_fp8_cpu_offload_main_params():
+                self.optimizer.set_fp8_cpu_offload_writeback_plan(
+                    self._get_ordered_fp8_model_params(), self.data_parallel_group
+                )
+            # Migrated from AIAK (M-32): arenas need the final gbuf layout and
+            # index maps — materialize here (safe no-op when disabled).
+            self._maybe_materialize_hdo_state_arenas()
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+    def _get_ordered_fp8_model_params(self):
+        """FP8 model params in grad-buffer order, i.e. identical on every DP rank.
+
+        Migrated from AIAK (M-10/#92). Unlike the per-rank optimizer groups, the
+        grad buffers are built from the model and so enumerate the same params in
+        the same order everywhere — this is what makes the FP8 master write-back a
+        well-formed collective; see
+        HybridDeviceOptimizer.set_fp8_cpu_offload_writeback_plan().
+        """
+        assert not self.ddp_config.use_megatron_fsdp, (
+            "FP8 CPU-offload master params are not supported with Megatron FSDP: "
+            "its buffers are already sharded, so they give no rank-invariant order."
+        )
+        return [
+            param
+            for buffer in self.buffers
+            for param in buffer.params
+            if is_float8tensor(param)
+        ]
+
+    def _build_hdo_state_arena_layout(self):
+        """Build the dp_zero world (unpadded) layout for the HDO state arenas.
+
+        Migrated from AIAK (M-32): mirrors the coordinate math of
+        get_parameter_state_dp_zero() — world offset of a param = cumulative
+        unpadded numel of preceding buckets + its gbuf_local start. Only
+        meaningful at DP=1, where the local shard of every bucket is the whole
+        bucket. Entries are emitted in bucket order so the arena migration's
+        transient stays bounded.
+        """
+        gbuf_numels = []
+        entries = []
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
+            gbuf_numels.append(self.buffers[gbuf_idx].numel_unpadded)
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                offset_in_world_tensors = 0
+                for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    gbuf_world_numel_unpadded = (
+                        self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
+                    )
+                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        group_index, group_order = self.model_param_group_index_map[model_param]
+                        orig_param = self.optimizer.param_groups[group_index]["params"][
+                            group_order
+                        ]
+                        local_range = param_range_map["gbuf_local"]
+                        start = offset_in_world_tensors + local_range.start
+                        numel = local_range.end - local_range.start
+                        assert (
+                            start + numel
+                            <= offset_in_world_tensors + gbuf_world_numel_unpadded
+                        ), "param extends into bucket padding"
+                        entries.append((orig_param, gbuf_idx, start, numel))
+                    offset_in_world_tensors += gbuf_world_numel_unpadded
+        return {"gbuf_numels_unpadded": gbuf_numels, "entries": entries}
+
+    def _maybe_materialize_hdo_state_arenas(self):
+        """Materialize contiguous CPU state arenas on the inner HDO.
+
+        Migrated from AIAK (M-32). Called at the end of __init__ and again after
+        the inner load_state_dict (whose HDO post-load hook rebuilds the
+        sub-optimizers, detaching everything from the arenas). Every
+        precondition failure is a safe no-op: the regular gather/scatter
+        checkpoint paths keep working.
+        """
+        if getattr(self, "is_stub_optimizer", False) or not isinstance(
+            self.optimizer, HybridDeviceOptimizer
+        ):
+            return
+        if not getattr(self.optimizer, "contiguous_state", False):
+            return
+        if self.data_parallel_group.size() != 1:
+            logger.warning(
+                "optimizer_cpu_offload_contiguous_state requires data-parallel size 1; "
+                "state arenas disabled (regular checkpoint path in use)."
+            )
+            return
+        if self.config.optimizer != 'adam':
+            logger.warning(
+                "optimizer_cpu_offload_contiguous_state only supports adam; "
+                "state arenas disabled."
+            )
+            return
+        if (
+            self.config.exp_avg_dtype != torch.float32
+            or self.config.exp_avg_sq_dtype != torch.float32
+        ):
+            logger.warning(
+                "optimizer_cpu_offload_contiguous_state requires fp32 exp_avg/exp_avg_sq; "
+                "state arenas disabled."
+            )
+            return
+        layout = self._build_hdo_state_arena_layout()
+        if self.optimizer.materialize_state_arenas(layout):
+            logger.info(
+                "HDO contiguous state arenas materialized "
+                f"({sum(layout['gbuf_numels_unpadded'])} elems x 3 keys, "
+                f"{len(layout['entries'])} params); legacy optimizer ckpt "
+                "save/load will use the zero-copy fast path."
+            )
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1058,6 +1215,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             {"state": state_dict_state, "param_groups": state_dict_param_groups}
         )
 
+        # Migrated from AIAK (M-32): the HDO post-load rebuild detaches all
+        # state from the arenas — re-materialize before any parameter state
+        # gets loaded.
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self._maybe_materialize_hdo_state_arenas()
+
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
@@ -1216,13 +1379,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
-                        # bf16 + HDO offload + precision-aware resume: loading only
-                        # stores state; the master param must also be copied back into
-                        # the sharded model param itself, else the main param keeps its
-                        # stale value (silent precision loss across resumes). Params
-                        # under fp8-CPU-offload carry their own fp32 mirror and are
-                        # excluded (full form lands with M-10's param_to_fp32_param).
-                        if not hasattr(sharded_model_param, "_fp8_cpu_offload_info"):
+                        # Migrated from AIAK (M-10, full form): fp8-CPU-offload
+                        # params have their FP32 master inside the CPU optimizer
+                        # (param_to_fp32_param) — copy there. Otherwise the
+                        # bf16+HDO resume fix: copy the master back into the
+                        # sharded model param itself, else the main param keeps
+                        # its stale value (silent precision loss across resumes).
+                        fp32_param = self.optimizer.param_to_fp32_param.get(
+                            sharded_model_param
+                        )
+                        if fp32_param is not None:
+                            fp32_param.data.copy_(
+                                v.to(device=fp32_param.device, dtype=fp32_param.dtype)
+                            )
+                            v = fp32_param
+                        elif not hasattr(sharded_model_param, "_fp8_cpu_offload_info"):
                             sharded_model_param.copy_(v)
                     else:
                         # copy_ into the existing state tensor instead of rebinding:

@@ -170,6 +170,13 @@ class OptimizerConfig:
     # Precision
     ##############
     fp8_recipe: Optional[str] = None
+
+    fp8_param_gather: bool = False
+    """Same as fp8_param in TransformerConfig and fp8_param_gather in
+    DistributedDataParallelConfig (migrated from AIAK, M-10): with the
+    optimizer CPU offload this combination routes the FP32 master shards of
+    blockwise-FP8 params into the CPU optimizer as zero-size GPU proxies
+    instead of sharded fp32 mirrors (halves master-weight HBM usage)."""
     """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
 
     fp16: bool = False
@@ -414,6 +421,22 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    def _uses_fp8_cpu_offload_main_params(self) -> bool:
+        """Whether blockwise FP8 CPU offload keeps FP32 master params in the CPU optimizer.
+
+        Migrated from AIAK (M-10): the full combo gating — full offload, adam,
+        distributed optimizer, blockwise fp8 with param gather, fp32 masters.
+        """
+        return (
+            self.optimizer_cpu_offload
+            and self.optimizer_offload_fraction == 1.0
+            and self.optimizer == "adam"
+            and self.use_distributed_optimizer
+            and self.fp8_recipe == "blockwise"
+            and self.fp8_param_gather
+            and self.main_params_dtype == torch.float32
+        )
+
     def __post_init__(self):
         """Check the validity of the config."""
 
@@ -428,7 +451,11 @@ class OptimizerConfig:
             and (
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
+                # Migrated from AIAK (M-10): plain cpu offload keeps the
+                # regular path; fp8 master CPU offload takes the no_fp8_or_ds
+                # path so the CPU optimizer owns the masters.
+                or (self.optimizer_cpu_offload and not self.fp8_param_gather)
+                or self._uses_fp8_cpu_offload_main_params()
             )
         )
 
