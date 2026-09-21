@@ -553,8 +553,11 @@ def get_next_batch_on_this_tp_rank(data_iterator):
            _broadcast(batch['position_ids'])
 
        elif mpu.is_pipeline_last_stage():
-           if args.num_nextn_predict_layers > 0 and mpu.get_tensor_model_parallel_world_size() > 1:
+           # MTP on the last stage consumes the next chunk's tokens AND position_ids
+           # (base_gpt_model.py:636-640), so both have to cross the TP broadcast here.
+           if (getattr(args, 'mtp_num_layers', 0) or 0) > 0 and mpu.get_tensor_model_parallel_world_size() > 1:
                _broadcast(batch['tokens'])
+               _broadcast(batch['position_ids'])
            _broadcast(batch['labels'])
            _broadcast(batch['loss_mask'])
            _broadcast(batch['attention_mask'])
@@ -598,11 +601,12 @@ def get_next_batch_on_this_tp_rank(data_iterator):
            _broadcast(position_ids)
 
        elif mpu.is_pipeline_last_stage():
-           if args.num_nextn_predict_layers > 0 and mpu.get_tensor_model_parallel_world_size() > 1:
+           if (getattr(args, 'mtp_num_layers', 0) or 0) > 0 and mpu.get_tensor_model_parallel_world_size() > 1:
                _broadcast(tokens)
+               _broadcast(position_ids)
            else:
                tokens = None
-           position_ids = None
+               position_ids = None
 
            _broadcast(labels)
            _broadcast(loss_mask)
