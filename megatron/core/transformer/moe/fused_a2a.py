@@ -1125,3 +1125,7 @@ if HAVE_HYBRIDEP:
 
 else:
     _expert_dispatch_buf_events = [None, None]
+    # Placeholder so module-level imports (token_dispatcher's ECHO dispatchers)
+    # resolve without deep_ep; the classes are only touched on the HAVE_HYBRIDEP
+    # path at runtime.
+    HybridEPExpertDispatch = None
