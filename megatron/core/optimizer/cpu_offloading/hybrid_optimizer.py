@@ -4,17 +4,6 @@ from typing import Dict
 
 import torch
 
-# Migrated from AIAK (M-03): the AIAK Muon implementation is NOT ported (the
-# community path goes through the external emerging-optimizers package, which
-# is strictly stronger — TP-aware/AdaptiveMuon/MuP). Import the community Muon
-# class lazily-optional so the HDO Muon offload path works when the package is
-# present; the AIAK-specific step(params_map) call site below is kept for that
-# class family and needs runtime verification (see commit message).
-try:
-    from ..emerging_optimizers import TensorParallelMuon as _Muon
-except Exception:  # pragma: no cover - external package not installed
-    _Muon = None
-
 from megatron.core.fp8_utils import (
     dequantize_fp8_tensor,
     get_fp8_cpu_offload_proxy_info,
@@ -412,10 +401,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 event.synchronize()
             t1 = time.monotonic()
             for optimizer, _ in wave:
-                if _Muon is not None and isinstance(optimizer, _Muon):
-                    optimizer.step(self.cpu_copys_map_gpu_param)
-                else:
-                    optimizer.step(closure)
+                optimizer.step(closure)
             t2 = time.monotonic()
             # Wave w fully consumed on this thread -> arena w%2 is free for
             # wave w+2. (Master copy-back reads masters, not grads.)
@@ -511,10 +497,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
                 d2h_event.synchronize()
-            if _Muon is not None and isinstance(cpu_optimizer, _Muon):
-                cpu_optimizer.step(self.cpu_copys_map_gpu_param)
-            else:
-                cpu_optimizer.step(closure)
+            cpu_optimizer.step(closure)
 
         # All CPU masters are final now: one rank-consistent FP8 write-back.
         self._writeback_fp8_cpu_offload_masters()

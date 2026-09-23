@@ -2829,6 +2829,10 @@ def _add_training_args(parser):
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
                        help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
+    group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false',
+                       dest='use_deepspeed_cpu_adam',
+                       help='Disable the DeepSpeed CPU Adam implementation used by '
+                            'optimizer CPU offload (falls back to PyTorch AdamW).')
     group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
                        help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
     group.add_argument('--dump-param-to-param-group-map', type=str, default=None,

@@ -1014,6 +1014,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert len(steps) == 1, f"steps: {optimizer.state}"
                     step = steps[0]
                     break
+                elif self.config.use_deepspeed_cpu_adam:
+                    # DeepSpeed CPU Adam keeps `step` as a plain number rather than a
+                    # tensor, so `.item()` above would fail; also skip empty states
+                    # (the shard may hold no parameters for this sub-optimizer).
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"] for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
         elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
             # Extract 'step', for TE FusedAdam support.
             steps = list(

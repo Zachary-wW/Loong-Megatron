@@ -65,7 +65,6 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
-    _kwargs_from_config,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
@@ -537,20 +536,23 @@ def _get_megatron_optimizer_based_on_param_groups(
                     bias_correction=True,
                     fused=True,  # this flag is used to improve the performance of the cpu optimizer
                 )
-            elif config.optimizer == 'muon' and HAVE_EMERGING_OPTIMIZERS:
-                # Migrated from AIAK (M-03-1): Muon + CPU offload path. The
-                # community Muon class (external emerging-optimizers package)
-                # serves as both the GPU and CPU optimizer class here.
-                from .emerging_optimizers import TensorParallelMuon
-
-                gpu_optimizer_cls = TensorParallelMuon
-                cpu_optimizer_cls = TensorParallelMuon
-                optimizer_defaults = _kwargs_from_config(TensorParallelMuon, "muon", config)
-            else:
+            elif config.optimizer == 'sgd':
                 gpu_optimizer_cls = SGD
                 cpu_optimizer_cls = CPUSGD
                 optimizer_defaults = dict(
                     lr=config.lr, weight_decay=config.weight_decay, momentum=config.sgd_momentum
+                )
+            else:
+                # M-03 assessment: AIAK's Muon + CPU-offload path relied on its own
+                # MuonDistMeta / global-buffer machinery (muon.py + distrib_optimizer.py),
+                # which is deliberately not ported — the community Muon lives in the
+                # external emerging-optimizers package and has no CPU-offload variant.
+                # Fail loudly instead of silently training with SGD; adapt later if the
+                # combination is ever needed.
+                raise NotImplementedError(
+                    f"--optimizer {config.optimizer} is not supported together with "
+                    "--optimizer-cpu-offload: the community implementation has no "
+                    "CPU-offload path for it (see the M-03 assessment)"
                 )
             optimizer = HybridDeviceOptimizer(
                 param_groups,
