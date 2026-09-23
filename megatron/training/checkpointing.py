@@ -168,7 +168,13 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
-    _compare('add_position_embedding', default=True)
+    # Migrated from AIAK (M-05): the RoPE-based models this stack trains all run
+    # with add_position_embedding=False (it is set from the model config, and the
+    # flag no longer drives the model structure — LanguageModelEmbedding derives
+    # it from position_embedding_type).  Old checkpoints that predate this arg do
+    # not record it, so the fallback has to match the common value or loading
+    # aborts on the assert below.
+    _compare('add_position_embedding', default=False)
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
