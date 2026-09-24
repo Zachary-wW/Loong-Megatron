@@ -35,7 +35,6 @@ except ImportError:
         HAVE_APEX_OR_TE = False
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
-from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import _is_deepspeed_cpu_adam
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -74,40 +73,6 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
-
-
-def _step_value(value: int | float | torch.Tensor) -> int | float:
-    """Normalize Torch tensor and DeepSpeed scalar optimizer steps."""
-    return value.item() if isinstance(value, torch.Tensor) else value
-
-
-def _extract_hdo_step(optimizer: HybridDeviceOptimizer) -> int | float | None:
-    """Extract one consistent step from HDO CPU/GPU sub-optimizers.
-
-    DeepSpeedCPUAdam stores ``state['step']`` as a Python integer while Torch
-    Adam stores a tensor. Empty sub-optimizers are ignored.
-    """
-    steps = set()
-    for sub_optimizer in optimizer.sub_optimizers:
-        if isinstance(sub_optimizer, (torch.optim.Adam, torch.optim.AdamW)) or (
-            _is_deepspeed_cpu_adam(sub_optimizer)
-        ):
-            sub_steps = {
-                _step_value(state["step"])
-                for state in sub_optimizer.state.values()
-                if "step" in state
-            }
-        else:
-            # TE/Apex advance group counters; any parameter-level copy injected
-            # during checkpoint restoration is stale after the first update.
-            sub_steps = {
-                _step_value(group["step"])
-                for group in sub_optimizer.param_groups
-                if group["params"] and "step" in group
-            }
-        steps.update(sub_steps)
-    assert len(steps) <= 1, f"Inconsistent optimizer steps: {steps}"
-    return next(iter(steps), None)
 
 
 class Range:
@@ -868,14 +833,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
-        # HDO may combine integer CPU steps with tensor or param-group GPU steps,
-        # independently of whether TE/Apex is installed.
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            step = _extract_hdo_step(self.optimizer)
-        elif not HAVE_APEX_OR_TE:
+        # Extract 'step', for non-Apex/TE support.
+        if not HAVE_APEX_OR_TE:
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            step = None
+            for optimizer in self.optimizer.sub_optimizers:
+                if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"].item() for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
+                elif self.config.use_deepspeed_cpu_adam:
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"] for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
         elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
             # Extract 'step', for TE FusedAdam support.
             steps = list(
@@ -894,7 +873,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
         for param_group in state_dict["optimizer"]["param_groups"]:
             del param_group["params"]
-            if not HAVE_APEX_OR_TE and not isinstance(self.optimizer, HybridDeviceOptimizer):
+            if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
             elif (
@@ -1050,7 +1029,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict_state = inner_state_dict["state"]
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE and not isinstance(self.optimizer, HybridDeviceOptimizer):
+        if not HAVE_APEX_OR_TE:
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
             step = torch.tensor(steps[0], dtype=torch.float)
@@ -1067,7 +1046,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if len(steps) != 0:
                 assert len(steps) == 1, f"steps: {steps}"
                 step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
-                for v in state_dict_state.values():
+                for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
         # Optimizer.
@@ -2242,6 +2221,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
@@ -2354,6 +2335,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [

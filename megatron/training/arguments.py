@@ -2786,9 +2786,6 @@ def _add_training_args(parser):
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
                        help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
-    group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false',
-                       dest='use_deepspeed_cpu_adam', default=True,
-                       help='Use torch.optim.AdamW instead of optional DeepSpeed CPU Adam for offloaded Adam updates.')
     group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
                        help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
     group.add_argument('--dump-param-to-param-group-map', type=str, default=None,
@@ -2799,6 +2796,8 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false', dest='use_deepspeed_cpu_adam',
+                       help='Disable Deepspeed CPU Adam implementation.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')

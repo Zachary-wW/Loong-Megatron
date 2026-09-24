@@ -1,16 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
-import sys
 from collections import defaultdict
 from typing import Dict
 
 import torch
 
-
-def _is_deepspeed_cpu_adam(optimizer: torch.optim.Optimizer) -> bool:
-    """Identify the optional backend without importing DeepSpeed for Torch users."""
-    module = sys.modules.get("deepspeed.ops.adam")
-    optimizer_type = getattr(module, "DeepSpeedCPUAdam", None)
-    return optimizer_type is not None and isinstance(optimizer, optimizer_type)
+_CPU_ADAM_STATE_KEYS = {"exp_avg", "exp_avg_sq", "adamw_exp_avg", "adamw_exp_avg_sq"}
 
 
 def _param_generator(cpu_optimizer):
@@ -339,7 +333,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._update_fp32_params_by_new_state()
         self._move_new_state_to_right_device()
 
-    def _sync_hdo_param_groups_to_sub_optimizers(self, preserve_step: bool = True):
+    @staticmethod
+    def _move_cpu_optimizer_state_tensor(param, key, value):
+        if key in _CPU_ADAM_STATE_KEYS and value.is_floating_point():
+            # CPU Adam kernels expect moment buffers to match the CPU master param dtype.
+            return value.to(device="cpu", dtype=param.dtype)
+        return value.to("cpu")
+
+    def _sync_hdo_param_groups_to_sub_optimizers(self):
         """Sync HDO new param_groups attribute (e.g. lr, wd, etc.) to sub-optimizers."""
         param_in_param_group_index = {}
         for i, group in enumerate(self.param_groups):
@@ -358,39 +359,22 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 update_group_attrs = self.param_groups[group_id].copy()
                 del update_group_attrs["params"]
                 new_group.update(update_group_attrs)
-                if preserve_step and "step" in group:
-                    # FusedAdam owns its live group counter. Do not reset it to
-                    # the HDO group's saved checkpoint value on every update.
-                    new_group["step"] = group["step"]
 
                 new_param_groups.append(new_group)
             optimizer.param_groups = new_param_groups
 
     def _move_new_state_to_right_device(self):
         for optimizer in self.sub_optimizers:
-            is_cpu_optimizer = optimizer is not self.gpu_optimizer
-            is_deepspeed = _is_deepspeed_cpu_adam(optimizer)
             for param, state in optimizer.state.items():
                 for k, v in state.items():
-                    orig_param = self.inner_param_to_orig_param.get(param, param)
-                    if is_cpu_optimizer and is_deepspeed:
-                        if k == "step":
-                            # DeepSpeed's native CPU kernel expects a Python integer,
-                            # including when resuming a Torch-Adam checkpoint.
-                            self.state[orig_param][k] = state[k] = int(
-                                v.item() if isinstance(v, torch.Tensor) else v
-                            )
-                            continue
-                        if k in ("exp_avg", "exp_avg_sq"):
-                            # Checkpoints can contain lower-precision moments even
-                            # though CPU Adam computes on FP32 master parameters.
-                            v = v.float()
                     if not isinstance(v, torch.Tensor):
                         continue
-                    if is_cpu_optimizer:
-                        self.state[orig_param][k] = state[k] = v.to("cpu")
+                    orig_param = self.inner_param_to_orig_param.get(param, param)
+                    if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
+                        v = self._move_cpu_optimizer_state_tensor(param, k, v)
                     else:
-                        self.state[orig_param][k] = state[k] = v.to("cuda")
+                        v = v.to("cuda")
+                    self.state[orig_param][k] = state[k] = v
 
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
@@ -458,7 +442,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # reinitialize the sub-optimizers to regenerate the new parameters and
             # cpu copy pairs.
             self._init_sub_optimizers()
-            self._sync_hdo_param_groups_to_sub_optimizers(preserve_step=False)
+            self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
 
         self.register_load_state_dict_post_hook(post_load_state_dict_hook)

@@ -351,12 +351,6 @@ class OptimizerConfig:
     use_torch_optimizer_for_cpu_offload: bool = False
     """If True, use torch.optim.Optimizer for CPU offload."""
 
-    use_deepspeed_cpu_adam: bool = True
-    """Prefer DeepSpeed CPU Adam for offloaded Adam updates, with an import-time
-    fallback to torch.optim.AdamW. Explicit torch-only offload takes precedence.
-    DeepSpeed is optional and is not imported when this option is disabled.
-    """
-
     overlap_cpu_optimizer_d2h_h2d: bool = False
     """
     When set to `True`, this flag enables overlapping of the CPU optimizer
@@ -371,6 +365,9 @@ class OptimizerConfig:
 
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
+
+    use_deepspeed_cpu_adam: bool = True
+    """If True, use DeepSpeed CPU Adam implementation instead of Torch CPU Adam."""
 
     ################
     # Miscellaneous
@@ -402,20 +399,6 @@ class OptimizerConfig:
     def __post_init__(self):
         """Check the validity of the config."""
 
-        if (
-            self.optimizer_cpu_offload
-            and self.optimizer == 'adam'
-            and self.use_deepspeed_cpu_adam
-            and not self.use_torch_optimizer_for_cpu_offload
-            and (self.exp_avg_dtype != torch.float32 or self.exp_avg_sq_dtype != torch.float32)
-        ):
-            warnings.warn(
-                "DeepSpeed CPU Adam uses FP32 moment states for offloaded FP32 master "
-                "parameters. Setting exp_avg_dtype and exp_avg_sq_dtype to torch.float32."
-            )
-            self.exp_avg_dtype = torch.float32
-            self.exp_avg_sq_dtype = torch.float32
-
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
         # different for different training precision settings. FP8 cases require different
@@ -430,6 +413,23 @@ class OptimizerConfig:
                 or self.optimizer_cpu_offload
             )
         )
+
+        if (
+            self.optimizer_cpu_offload
+            and self.optimizer == 'adam'
+            and self.use_deepspeed_cpu_adam
+            and (
+                self.exp_avg_dtype != torch.float32
+                or self.exp_avg_sq_dtype != torch.float32
+            )
+        ):
+            warnings.warn(
+                "DeepSpeed CPUAdam requires FP32 Adam moment states for CPU-offloaded "
+                "FP32 master params. Forcing exp_avg_dtype and exp_avg_sq_dtype to "
+                "torch.float32."
+            )
+            self.exp_avg_dtype = torch.float32
+            self.exp_avg_sq_dtype = torch.float32
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
