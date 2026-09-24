@@ -447,6 +447,21 @@ def _get_param_groups_and_buffers(
     return param_groups, buffers
 
 
+def _get_cpu_adam_class(config: OptimizerConfig) -> type[torch.optim.Optimizer]:
+    """Resolve the optional CPU backend without changing the GPU optimizer class."""
+    if not config.use_deepspeed_cpu_adam or config.use_torch_optimizer_for_cpu_offload:
+        return CPUAdam
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+    except ImportError:
+        warnings.warn(
+            "DeepSpeed CPU Adam is unavailable (import failed); falling back to torch.optim.AdamW."
+        )
+        config.use_deepspeed_cpu_adam = False
+        return CPUAdam
+    return DeepSpeedCPUAdam
+
+
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -508,13 +523,9 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
-            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
-            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
-            if config.use_torch_optimizer_for_cpu_offload:
-                gpu_optimizer_cls = cpu_optimizer_cls
             if config.optimizer == 'adam':
-                gpu_optimizer_cls = Adam
-                cpu_optimizer_cls = CPUAdam
+                gpu_optimizer_cls = CPUAdam if config.use_torch_optimizer_for_cpu_offload else Adam
+                cpu_optimizer_cls = _get_cpu_adam_class(config)
                 optimizer_defaults = dict(
                     lr=config.lr,
                     weight_decay=config.weight_decay,
