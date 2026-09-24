@@ -848,6 +848,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert len(steps) == 1, f"steps: {optimizer.state}"
                     step = steps[0]
                     break
+                elif self.config.use_deepspeed_cpu_adam:
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"] for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
         elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
             # Extract 'step', for TE FusedAdam support.
             steps = list(
@@ -2214,6 +2221,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
@@ -2326,6 +2335,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             world_tensor = torch.nn.functional.pad(
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
+                            if world_tensor.dtype != recv_tensor.dtype:
+                                world_tensor = world_tensor.to(recv_tensor.dtype)
                             assert world_tensor.numel() == gbuf_world_numel
                             gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [
