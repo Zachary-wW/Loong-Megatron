@@ -1315,7 +1315,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
                         key: torch.zeros(
-                            (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
+                            (buffer_numel_unpadded,),
+                            dtype=self._get_state_key_dtype(key),
+                            device="cpu",
                         )
                         for key in ("param",) + self.optimizer_state_keys
                     }
@@ -1338,7 +1340,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         assert gbuf_world_numel_unpadded <= gbuf_world_numel
 
                         local_shards = {
-                            key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
+                            key: torch.zeros(
+                                (gbuf_local_numel,),
+                                dtype=self._get_state_key_dtype(key),
+                                device="cpu",
+                            )
                             for key in ("param",) + self.optimizer_state_keys
                         }
 
@@ -1362,7 +1368,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 device = "cpu" if use_gloo_comm else torch.cuda.current_device()
                                 recv_tensors = [
                                     torch.zeros(
-                                        (gbuf_local_numel,), dtype=torch.float32, device=device
+                                        (gbuf_local_numel,),
+                                        dtype=self._get_state_key_dtype(key),
+                                        device=device,
                                     )
                                     for _ in range(data_parallel_world_size)
                                 ]
@@ -2194,7 +2202,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Contiguous local shards (received from DP rank 0).
                         recv_tensor = torch.zeros(
-                            (gbuf_local_numel,), dtype=torch.float32, device="cpu"
+                            (gbuf_local_numel,),
+                            dtype=self._get_state_key_dtype(key),
+                            device="cpu",
                         )
 
                         # Scatter tensor list.
@@ -2308,7 +2318,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Contiguous local shards (received from DP rank 0).
                         recv_tensor = torch.zeros(
-                            (gbuf_local_numel,), dtype=torch.float32, device="cpu"
+                            (gbuf_local_numel,),
+                            dtype=self._get_state_key_dtype(key),
+                            device="cpu",
                         )
 
                         # Scatter tensor list.
