@@ -365,6 +365,9 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    use_deepspeed_cpu_adam: bool = True
+    """If True, use DeepSpeed CPU Adam implementation instead of Torch CPU Adam."""
+
     ################
     # Miscellaneous
     ################
