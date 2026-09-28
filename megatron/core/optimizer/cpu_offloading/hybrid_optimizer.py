@@ -4,6 +4,8 @@ from typing import Dict
 
 import torch
 
+_CPU_ADAM_STATE_KEYS = {"exp_avg", "exp_avg_sq", "adamw_exp_avg", "adamw_exp_avg_sq"}
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -331,6 +333,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._update_fp32_params_by_new_state()
         self._move_new_state_to_right_device()
 
+    @staticmethod
+    def _move_cpu_optimizer_state_tensor(param, key, value):
+        if key in _CPU_ADAM_STATE_KEYS and value.is_floating_point():
+            # CPU Adam kernels expect moment buffers to match the CPU master param dtype.
+            return value.to(device="cpu", dtype=param.dtype)
+        return value.to("cpu")
+
     def _sync_hdo_param_groups_to_sub_optimizers(self):
         """Sync HDO new param_groups attribute (e.g. lr, wd, etc.) to sub-optimizers."""
         param_in_param_group_index = {}
@@ -362,9 +371,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                         continue
                     orig_param = self.inner_param_to_orig_param.get(param, param)
                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
-                        self.state[orig_param][k] = state[k] = v.to("cpu")
+                        v = self._move_cpu_optimizer_state_tensor(param, k, v)
                     else:
-                        self.state[orig_param][k] = state[k] = v.to("cuda")
+                        v = v.to("cuda")
+                    self.state[orig_param][k] = state[k] = v
 
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
