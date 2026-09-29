@@ -571,6 +571,7 @@ def save_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
+    save_arg: str = 'save',
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -611,7 +612,7 @@ def save_checkpoint(
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
-    save_dir = args.save
+    save_dir = getattr(args, save_arg)
     if non_persistent_ckpt:
         if args.non_persistent_ckpt_type == 'global':
             ckpt_type = CheckpointType.GLOBAL
@@ -1012,7 +1013,7 @@ def save_checkpoint(
                     f.write('release' if release else str(iteration))
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
+                    f'checkpoint from iteration {int(iteration):7d} to {save_dir} '
                     f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
