@@ -3396,6 +3396,8 @@ def _add_mla_args(parser):
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+    group.add_argument('--original-max-position-embeddings', type=int, default=4096,
+                       help="Original maximum position embeddings for YaRN RoPE in multi-latent attention.")
     group.add_argument(
         '--mla-down-proj-fusion',
         action='store_true',
