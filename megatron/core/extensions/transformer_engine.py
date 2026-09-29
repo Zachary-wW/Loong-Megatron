@@ -88,6 +88,19 @@ _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
 
 
+def _has_padding_attention_mask(attention_mask: Any) -> bool:
+    """Return whether a standard 4-D attention mask contains padded positions."""
+
+    masks = attention_mask if isinstance(attention_mask, (tuple, list)) else (attention_mask,)
+    return any(
+        mask is not None
+        and mask.dim() == 4
+        and mask.shape[-2] == 1
+        and bool(mask.any())
+        for mask in masks
+    )
+
+
 def _set_expert_parameter_attributes(
     module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
 ) -> None:
@@ -2033,7 +2046,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
         if self.te_forward_mask_type:
-            if qkv_format == "thd" and is_te_min_version("1.7.0"):
+            if (
+                qkv_format == "thd" and is_te_min_version("1.7.0")
+            ) or _has_padding_attention_mask(attention_mask):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
                 # so the only acceptable mask types are `padding_causal` and `padding`. These do not
                 # necessarily indicate there are padded tokens in the sequence.
