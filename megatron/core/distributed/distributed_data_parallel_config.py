@@ -97,6 +97,10 @@ class DistributedDataParallelConfig:
     Future updates will drop support for `use_custom_fsdp` to avoid confusion.
     """
 
+    force_turn_on_bucketing: bool = False
+    """Force parameter bucketing on all pipeline stages (normally disabled on
+    pp_rank > 0 and for non-first model chunks; migrated from AIAK, M-05-5)."""
+
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
