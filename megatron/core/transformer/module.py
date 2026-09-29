@@ -2,7 +2,7 @@
 
 """Megatron Module."""
 from functools import partial
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -536,3 +536,43 @@ class Float16Module(MegatronModule):
         self, state_dict, strict=True
     ):  # pylint: disable=missing-function-docstring
         self.module.load_state_dict(state_dict, strict=strict)
+
+
+def restore_fp16module_inputs_to_fp32(
+    instance: torch.nn.Module,
+    config: TransformerConfig,
+    weight_is_fp32: Callable[[torch.nn.Module], bool] = None,
+    keep_fp32_outputs: bool = False,
+):
+    """Register forward pre/post hooks that convert module inputs to fp32 when the
+    module's weight is fp32 (partial-module fp32 training, migrated from AIAK, M-17).
+
+    The forward pre-hook casts inputs up to fp32 so the fp32-weight module computes in
+    fp32; the post-hook casts outputs back to the training half precision unless
+    keep_fp32_outputs is set. Modules whose weight is not fp32 are untouched.
+    """
+    if weight_is_fp32 is None:
+        return
+
+    if config.fp16:
+
+        def float16_convertor(val):
+            return val.half()
+
+    elif config.bf16:
+
+        def float16_convertor(val):
+            return val.bfloat16()
+
+    if config.fp16 or config.bf16:
+
+        def forward_pre_hook_fn(module, inputs):
+            if weight_is_fp32(module):
+                return float16_to_fp32(inputs)
+
+        def forward_post_hook_fn(module, inputs, output):
+            return fp32_to_float16(output, float16_convertor)
+
+        instance.register_forward_pre_hook(forward_pre_hook_fn)
+        if not keep_fp32_outputs:
+            instance.register_forward_hook(forward_post_hook_fn)
