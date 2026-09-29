@@ -61,11 +61,12 @@ def initialize_megatron(
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
+    args = get_args()
+    if getattr(args, 'preprocess_data_on_cpu', False):
+        allow_no_cuda = True
     if not allow_no_cuda:
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
-
-    args = get_args()
 
     # set logging level
     setup_logging()
@@ -125,7 +126,7 @@ def initialize_megatron(
             )
 
         # Setup MoE aux loss scale value.
-        if args.num_experts is not None:
+        if args.num_experts is not None and not getattr(args, 'preprocess_data_on_cpu', False):
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 
             MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
@@ -267,7 +268,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
-    device_count = torch.cuda.device_count()
+    # Dataset preprocessing on CPU (migrated from AIAK, M-07-2) does not
+    # initialize CUDA or model-parallel communicators.
+    if getattr(args, 'preprocess_data_on_cpu', False):
+        device_count = 0
+        args.distributed_backend = "gloo"
+    else:
+        device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
         print_rank_0("torch distributed is already initialized, skipping initialization ...")
@@ -279,13 +286,18 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
-            torch.cuda.set_device(args.local_rank)
+            if getattr(args, 'preprocess_data_on_cpu', False):
+                print("CUDA not available, running on CPU")
+            else:
+                torch.cuda.set_device(args.local_rank)
             device_id = torch.device(f'cuda:{args.local_rank}')
         else:
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.cuda_graph_impl == "transformer_engine":
+        if args.cuda_graph_impl == "transformer_engine" and not getattr(
+            args, 'preprocess_data_on_cpu', False
+        ):
             torch.cuda.set_stream(torch.cuda.Stream())
 
         # Set flight recorder env vars if specified.
