@@ -26,6 +26,10 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    # How packed rows are assigned to context-parallel ranks:
+    # 'zigzag' = TE thd_get_partitioned_indices layout (default),
+    # 'contiguous' = rank r owns global rows [r * l_local, (r + 1) * l_local).
+    cp_partition_mode: str = 'zigzag'
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
