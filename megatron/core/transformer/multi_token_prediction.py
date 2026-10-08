@@ -1085,21 +1085,25 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
+        # For chunkpipe, rolling and truncation are handled by the caller
+        # (MultiTokenPredictionBlock.forward) to preserve the full sequence
+        # with next-batch tokens across MTP layers.
+        if not getattr(self.config, 'enable_chunkpipe', False):
+            # Calc logits for the current Multi-Token Prediction (MTP) layers.
+            input_ids, _ = roll_tensor(
+                input_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            position_ids, _ = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         if padding_mask is not None:
             padding_mask, _ = roll_tensor(
                 padding_mask,
@@ -1441,6 +1445,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
+        elif (
+            self.config.recompute_method is None
+            and getattr(self.config, 'enable_chunkpipe', False)
+        ):
+            # Chunkpipe may trigger recompute without the normal recompute config
+            # being set; in that case just checkpoint directly.
+            with outer_quantization_context:
+                outputs = checkpoint_handler()
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1496,7 +1508,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
-        if self.config.recompute_granularity == 'full' and self.training:
+        recompute_for_chunkpipe = False
+        if self.config.enable_chunkpipe:
+            chunk_num = (
+                self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
+            )
+            if chunk_num + self.config.keep_activations_chunks < self.config.chunk_num_per_seq:
+                recompute_for_chunkpipe = True
+
+        if (self.config.recompute_granularity == 'full' or recompute_for_chunkpipe) and self.training:
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -1822,11 +1842,46 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        # For chunkpipe, manage rolling at the block level to preserve the full
+        # input_ids (with appended next-batch tokens) across MTP layers: each
+        # iteration rolls the full copy left by 1, then truncates to chunksize
+        # for that layer's embedding, while keeping the full rolled version for
+        # the next iteration so subsequent rolls chain correctly.
+        if getattr(self.config, 'enable_chunkpipe', False):
+            full_input_ids = input_ids
+            full_position_ids = position_ids
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+
+            if getattr(self.config, 'enable_chunkpipe', False):
+                # Roll the full sequence (including next-batch tokens) left by 1.
+                full_input_ids, _ = roll_tensor(
+                    full_input_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                full_position_ids, _ = roll_tensor(
+                    full_position_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                # Truncate to chunksize for this layer's embedding. Clone so the
+                # downstream layers cannot corrupt full_input_ids in place.
+                chunk_size = self.config.chunksize
+                layer_input_ids = full_input_ids[:, :chunk_size].clone()
+                layer_position_ids = full_position_ids[:, :chunk_size].clone()
+            else:
+                layer_input_ids = input_ids
+                layer_position_ids = position_ids
+
             hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
-                input_ids=input_ids,
-                position_ids=position_ids,
+                input_ids=layer_input_ids,
+                position_ids=layer_position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
