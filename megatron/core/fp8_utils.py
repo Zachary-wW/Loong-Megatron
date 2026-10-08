@@ -74,10 +74,12 @@ except (ImportError, ModuleNotFoundError):
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
         TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
         TELinear,
+        TERowParallelGroupedLinear,
         TERowParallelLinear,
     )
 
@@ -87,8 +89,27 @@ if HAVE_TE:
         TERowParallelLinear,
         TELayerNormColumnParallelLinear,
     )
+
+    # Classes that receive selective-FP8 init/forward guards. This is a superset
+    # of TE_LINEAR_TYPES: the grouped-linear variants are the MoE expert layers
+    # used when `--moe-use-grouped-gemm` is set, and they need the same
+    # FP8/BF16 decision as the non-grouped linears. They are only defined for
+    # TE >= 2.0 and are None otherwise, so filter them out before any isinstance.
+    SELECTIVE_FP8_GUARDED_LINEAR_CLASSES = tuple(
+        cls
+        for cls in (
+            TELinear,
+            TEColumnParallelLinear,
+            TERowParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TEColumnParallelGroupedLinear,
+            TERowParallelGroupedLinear,
+        )
+        if cls is not None
+    )
 else:
     TE_LINEAR_TYPES = ()
+    SELECTIVE_FP8_GUARDED_LINEAR_CLASSES = ()
 
 try:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -272,12 +293,7 @@ if HAVE_TE:
 
 
     def _install_selective_fp8_guards() -> None:
-        linear_classes = (
-            TELayerNormColumnParallelLinear,
-            TEColumnParallelLinear,
-            TERowParallelLinear,
-            TELinear,  # MLA down-projection (parallel_mode='duplicated')
-        )
+        linear_classes = SELECTIVE_FP8_GUARDED_LINEAR_CLASSES
         for linear_cls in linear_classes:
             _wrap_init_with_selective_fp8_guard(linear_cls)
             _wrap_forward_with_selective_fp8_guard(linear_cls)
@@ -327,7 +343,7 @@ if HAVE_TE:
         """
         unguarded = []
         for name, module in model.named_modules():
-            if isinstance(module, TE_LINEAR_TYPES) and not hasattr(
+            if isinstance(module, SELECTIVE_FP8_GUARDED_LINEAR_CLASSES) and not hasattr(
                 module, "_selective_fp8_disabled"
             ):
                 unguarded.append((name, type(module).__name__))
