@@ -9,12 +9,21 @@ from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
+    set_offload_tag,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
+
+
+def maybe_set_offload_tag(tensor_name: str, tensor: torch.Tensor, config) -> None:
+    """Tag the tensor for tensor-level offloading when its name is selected."""
+    if config.fine_grained_activation_offloading and tensor_name in (
+        config.offload_tensors or []
+    ):
+        set_offload_tag(tensor)
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):
@@ -191,10 +200,27 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        dispatched_input_manager = off_interface(
+            'dispatched_input' in (layer.config.offload_tensors or []),
+            dispatched_tokens,
+            "dispatched_input",
+        )
+        if dispatched_input_manager.offload:
+            maybe_set_offload_tag('dispatched_input', dispatched_tokens, layer.config)
+        with dispatched_input_manager as dispatched_tokens:
+            (
+                dispatched_tokens,
+                tokens_per_expert,
+                permuted_probs,
+            ) = layer.mlp.pre_routed_experts_compute(dispatched_tokens, dispatched_probs)
+            expert_output, _ = layer.mlp.routed_experts_compute(
+                dispatched_tokens, tokens_per_expert, permuted_probs
+            )
+        expert_output = dispatched_input_manager.group_offload(expert_output)
+        expert_output = layer.mlp.post_routed_experts_compute(expert_output)
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
-        # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
+        # input to the routed experts, a ref is needed to prevent it from being freed.
         if enable_hybridep or enable_ncclep:
             tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
