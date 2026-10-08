@@ -2521,11 +2521,13 @@ def load_checkpoint(
             with load_ctx():
                 module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
+            # PyTorch reports the missing / unexpected keys through this exception when strict=True.
+            print(f"[load_state_dict strict={strict}] exception:\n{e}")
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 with load_ctx():
                     load_return = module.load_state_dict(state_dict, strict=False)
-                print(f'load_return: {load_return}')
+                print(f'[load_state_dict strict=False] return: {load_return}')
 
     # Megatron-FSDP DTensors are loaded into the model buffers in-place above.
     # Replaying the translated raw state dict through ``load_state_dict`` would

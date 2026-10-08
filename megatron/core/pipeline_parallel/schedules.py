@@ -567,7 +567,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
+    if (output_tensor[0].requires_grad) and (output_tensor[0].grad_fn is not None):
         if config.deallocate_pipeline_outputs:
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
