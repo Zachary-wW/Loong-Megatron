@@ -4651,6 +4651,12 @@ class AllGatherPipeline:
         else:
             buf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
 
+        if buf is None:
+            # No weight buffer was created for this bucket (e.g. the buffer is only
+            # created for parameters that require grad); nothing to free.
+            self.bucket_status[bucket_key] = BucketStatus.EMPTY
+            return
+
         buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
 
