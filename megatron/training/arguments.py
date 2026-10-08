@@ -1434,9 +1434,15 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
         else:
-            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
-                "Using tensor model parallelism or context parallelism require setting the environment variable " \
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
+            if getattr(args, 'preprocess_data_on_cpu', False):
+                print(
+                    "Skipping CUDA_DEVICE_MAX_CONNECTIONS checks because megatron "
+                    "preprocesses data on CPU"
+                )
+            else:
+                assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
+                    "Using tensor model parallelism or context parallelism require setting the environment variable " \
+                    "CUDA_DEVICE_MAX_CONNECTIONS to 1"
 
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
@@ -3206,6 +3212,10 @@ def _add_data_args(parser):
                        help='FIM PAD token')
     group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
                        help='FIM EOD token')
+    group.add_argument('--preprocess-data-on-cpu', action='store_true',
+                       default=False,
+                       help='If set, build dataset indices on CPU without GPUs '
+                       '(migrated from AIAK, M-07-2; pair with FAKE_GPU_COUNT).')
     return parser
 
 
