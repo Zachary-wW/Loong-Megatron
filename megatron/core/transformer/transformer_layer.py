@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import warnings
 from abc import ABC
@@ -447,6 +448,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        self.recompute_pre_mlp = False
         if self.config.recompute_granularity == 'selective':
             assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
@@ -514,6 +516,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
+            if "pre_mlp" in self.config.recompute_modules:
+                # pre_mlp checkpoints the whole attention half layer, which already
+                # covers the input layernorm; do not nest both checkpoints.
+                self.recompute_pre_mlp = True
+                self.recompute_input_layernorm = False
 
         self._set_offload_modules()
         self.off_interface = _get_offloading_interface()
@@ -751,7 +758,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        if self.recompute_pre_mlp:
+            hidden_states, context = self._checkpoint_pre_mlp_forward(*args, **kwargs)
+        else:
+            hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -759,6 +769,42 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
+
+    def _checkpoint_pre_mlp_forward(self, *args, **kwargs):
+        """Run the attention half layer under selective activation checkpointing.
+
+        Enabled by ``recompute_modules=["pre_mlp"]``. ``tensor_parallel.checkpoint``
+        accepts positional arguments only, so the attention arguments are bound
+        explicitly and keyword-only arguments are re-applied inside the closure.
+        """
+        signature = inspect.signature(self._forward_attention)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        positional = [
+            value
+            for name, value in bound.arguments.items()
+            if signature.parameters[name].kind is not inspect.Parameter.KEYWORD_ONLY
+        ]
+        keyword_only = {
+            name: value
+            for name, value in bound.arguments.items()
+            if signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        }
+
+        def custom(*inner_args):
+            return self._forward_attention(*inner_args, **keyword_only)
+
+        if self.config.fp8 or self.config.fp4:
+            from megatron.core.extensions.transformer_engine import te_checkpoint
+
+            return te_checkpoint(
+                custom,
+                False,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                self.tp_group,
+                *positional,
+            )
+        return tensor_parallel.checkpoint(custom, False, *positional)
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")

@@ -252,6 +252,12 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Recompute only the routed path (route -> dispatch -> experts -> combine) and
+        # keep the shared experts and postprocess outside the checkpoint.
+        self.routed_experts_recompute = (
+            config.recompute_granularity == 'selective'
+            and "routed_experts" in config.recompute_modules
+        )
 
         self.tp_group = pg_collection.tp
 
@@ -691,7 +697,34 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute and self.training:
+        def custom_forward_exclude_shared_experts(hidden_states, padding_mask=None):
+            probs, routing_map = self.route(hidden_states, padding_mask)
+            hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+            dispatched_input, probs = self.dispatch(hidden_states, probs)
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+            assert (
+                mlp_bias is None
+            ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+            output = self.combine(output)
+            return output, mlp_bias
+
+        if self.routed_experts_recompute and self.training:
+            if self.config.fp8 or self.config.fp4:
+                output, mlp_bias = te_checkpoint(
+                    custom_forward_exclude_shared_experts,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.tp_group,
+                    hidden_states,
+                    padding_mask,
+                )
+            else:
+                output, mlp_bias = tensor_parallel.checkpoint(
+                    custom_forward_exclude_shared_experts, False, hidden_states, padding_mask
+                )
+            shared_expert_output = self.shared_experts_compute(hidden_states)
+            outputs = self.postprocess(output, shared_expert_output), mlp_bias
+        elif self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,
