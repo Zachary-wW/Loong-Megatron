@@ -669,6 +669,63 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
+    """
+    Remove the key-value cache for a specific micro-batch index.
+
+    In chunked pipeline parallel training, each sequence is split into multiple micro-batches.
+    This function removes the attention key-value cache for a specific micro-batch after its backward pass.
+
+    Args:
+        model: The target model containing decoder layers and possibly MTP layers
+        micro_batch_index: Index of the micro-batch whose cache should be removed
+
+    Note:
+        This function iterates through all decoder layers and calls delete_chunk_key_value_cache
+        on each layer's self-attention module.
+    """
+    decoder = get_attr_wrapped_model(model, "decoder")
+    num_layers = len(decoder.layers)
+    for layer_idx in range(num_layers):
+        decoder.layers[layer_idx].self_attention.delete_chunk_key_value_cache(
+            micro_batch_index
+        )
+
+    if mtp_num_layers is None or mtp_num_layers == 0:
+        return
+    mtp_layers = get_attr_wrapped_model(model, "mtp")
+    for layer_idx in range(mtp_num_layers):
+        mtp_layers.layers[layer_idx].self_attention.delete_chunk_key_value_cache(
+            micro_batch_index
+        )
+
+
+def clear_key_value_cache(model, mtp_num_layers):
+    """
+    Clear all key-value caches in the model's attention layers.
+
+    Used in forward-only scenarios (like inference/validation) to reset all attention caches,
+    typically after processing a complete sequence to prepare for the next sequence.
+
+    Args:
+        model: The target model containing decoder layers and possibly MTP layers
+
+    Note:
+        This function iterates through all decoder layers and calls clear_chunk_key_value_cache
+        on each layer's self-attention module.
+    """
+    decoder = get_attr_wrapped_model(model, "decoder")
+    num_layers = len(decoder.layers)
+    for layer_idx in range(num_layers):
+        decoder.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
+
+    if mtp_num_layers == 0:
+        return
+    mtp_layers = get_attr_wrapped_model(model, "mtp")
+    for layer_idx in range(mtp_num_layers):
+        mtp_layers.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
+
+
 def _build_default_pg_collection() -> ProcessGroupCollection:
     """Build a ``ProcessGroupCollection`` from the global ``parallel_state`` defaults.
 
@@ -691,6 +748,147 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
         with_context_parallel=False, partial_data_parallel=False
     )
     return pg_collection
+
+
+def forward_backward_no_pipelining_with_chunkpipe(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,  # unused
+    micro_batch_size: int,  # unused
+    decoder_seq_length: int = None,  # unused
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Run forward and backward passes with no pipeline parallelism under chunkpipe.
+
+    Each original microbatch is split into `config.chunk_num_per_seq` chunks which
+    are forwarded in order and backwarded in reverse order, so that the attention
+    KV cache of the earlier chunks of the same sequence is still resident when a
+    later chunk runs.
+    """
+    if pg_collection is None:
+        pg_collection = _build_default_pg_collection()
+
+    config = get_model_config(model)
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+
+    forward_data_store = []
+    input_tensor, output_tensor_grad = None, None
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+
+    assert (
+        num_microbatches % config.chunk_num_per_seq == 0
+    ), "num microbatches should be divided by num chunks"
+    num_sequences = num_microbatches // config.chunk_num_per_seq
+
+    chunkpipe_forward_microbatch = 0
+    with no_sync_func():
+        for seq_index in range(num_sequences - 1):
+            chunk_losses = []
+            config.chunkpipe_forward = True
+            for chunk_index in range(config.chunk_num_per_seq):
+                config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+                output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    pg_collection.cp.size(),
+                    collect_non_loss_data,
+                    is_first_microbatch=check_first_val_step(
+                        first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                    ),
+                    current_microbatch=chunkpipe_forward_microbatch,
+                )
+                total_num_tokens += num_tokens
+                output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+                chunk_losses.append(output_and_microbatch)
+                chunkpipe_forward_microbatch += 1
+
+            # backward according to reverse direction of forward
+            if not forward_only:
+                config.chunkpipe_forward = False
+                for chunk_index in range(config.chunk_num_per_seq):
+                    output_and_microbatch = chunk_losses.pop()
+                    config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                    backward_step(
+                        input_tensor, output_and_microbatch[0], output_tensor_grad, config
+                    )
+
+                    # remove caches for key & values
+                    remove_key_value_cache(
+                        model, output_and_microbatch[1], config.mtp_num_layers
+                    )
+            else:
+                # clear keys & values cache
+                clear_key_value_cache(model, config.mtp_num_layers)
+
+    # Run computation for last microbatch out of context handler (want to
+    # synchronize gradients).
+    chunk_losses = []
+    config.chunkpipe_forward = True
+    for chunk_index in range(config.chunk_num_per_seq):
+        config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            pg_collection.cp.size(),
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+            ),
+            current_microbatch=chunkpipe_forward_microbatch,
+        )
+        total_num_tokens += num_tokens
+        output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+        chunk_losses.append(output_and_microbatch)
+        chunkpipe_forward_microbatch += 1
+
+    if not forward_only:
+        config.chunkpipe_forward = False
+        for chunk_index in range(config.chunk_num_per_seq):
+            output_and_microbatch = chunk_losses.pop()
+            config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+            backward_step(input_tensor, output_and_microbatch[0], output_tensor_grad, config)
+
+            # remove caches for key & values
+            remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
+    else:
+        # clear keys & values cache
+        clear_key_value_cache(model, config.mtp_num_layers)
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+        # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+        # data parallelism and layernorm all-reduce for sequence parallelism).
+        config.finalize_model_grads_func(
+            [model], total_num_tokens if config.calculate_per_token_loss else None
+        )
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+        create_cudagraphs()
+
+    return forward_data_store
 
 
 def forward_backward_no_pipelining(
@@ -732,6 +930,20 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    if config.enable_chunkpipe:
+        return forward_backward_no_pipelining_with_chunkpipe(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            forward_only=forward_only,
+            collect_non_loss_data=collect_non_loss_data,
+            first_val_step=first_val_step,
+            pg_collection=pg_collection,
+        )
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
@@ -957,6 +1169,38 @@ def get_pp_rank_microbatches(
         num_warmup_microbatches,
         num_microbatches_remaining,
     )
+
+
+def get_extended_schedule_table(
+    num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, num_chunks
+):
+    """Extended schedule table to support sequence chunking"""
+    schedule_table = []
+    microbatch_group_size_per_vp_stage = min(
+        microbatch_group_size_per_vp_stage,
+        int(parallel_state.get_pipeline_model_parallel_world_size() / num_chunks),
+    )
+    microbatch_group_size_per_vp_stage = max(microbatch_group_size_per_vp_stage, 1)
+    num_microbatches = int(num_microbatches / num_chunks)
+    for min_microbatch_id_in_group in range(
+        0, num_microbatches, microbatch_group_size_per_vp_stage
+    ):
+        if min_microbatch_id_in_group + microbatch_group_size_per_vp_stage >= num_microbatches:
+            # Last group
+            for model_chunk_id in range(num_model_chunks):
+                for microbatch_id in range(min_microbatch_id_in_group, num_microbatches):
+                    for chunk_id in range(num_chunks):
+                        schedule_table.append((microbatch_id, model_chunk_id, chunk_id))
+        else:
+            # Other groups
+            for model_chunk_id in range(num_model_chunks):
+                for microbatch_id in range(
+                    min_microbatch_id_in_group,
+                    min_microbatch_id_in_group + microbatch_group_size_per_vp_stage,
+                ):
+                    for chunk_id in range(num_chunks):
+                        schedule_table.append((microbatch_id, model_chunk_id, chunk_id))
+    return schedule_table
 
 
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
