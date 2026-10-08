@@ -558,9 +558,6 @@ class TopKRouter(Router):
         microbatch_key = chunkpipe_fwd_mb // chunk_num
 
         tokens_per_expert_chunk = routing_map.reshape(seq_length, -1).sum(dim=0)
-        tokens_per_expert_chunk = reduce_from_tensor_model_parallel_region(
-            tokens_per_expert_chunk, self.tp_cp_group
-        )
 
         if not hasattr(self, '_chunkpipe_full_tokens_per_expert_map'):
             self._chunkpipe_full_tokens_per_expert_map = {}
@@ -581,6 +578,11 @@ class TopKRouter(Router):
         Consumed on the first backward chunk of that sequence (backward runs in
         reverse, so that is the last backward chunk processed for it), which
         keeps the map from growing with the number of sequences.
+
+        Returns the tensor already reduced over the TP/CP group: the cached
+        value is kept unreduced and cloned before reducing, because
+        reduce_from_tensor_model_parallel_region may reduce in place and the
+        same entry is reused by every later backward chunk of the sequence.
         """
         chunk_num = self.config.chunk_num_per_seq
         microbatch_key = self._chunkpipe_microbatch_key()
@@ -588,7 +590,9 @@ class TopKRouter(Router):
         value = ftp_map.get(microbatch_key, None)
         if self._chunkpipe_chunk_index() == 0 and microbatch_key in ftp_map:
             del ftp_map[microbatch_key]
-        return value
+        if value is None:
+            return None
+        return reduce_from_tensor_model_parallel_region(value.clone(), self.tp_cp_group)
 
     def _apply_seq_aux_loss_chunkpipe(
         self,
@@ -616,9 +620,10 @@ class TopKRouter(Router):
         if full_tokens_per_expert is None:
             # Fallback: accumulation did not happen, use this chunk's statistics.
             full_tokens_per_expert = routing_map.reshape(seq_length, -1).sum(dim=0)
-        full_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-            full_tokens_per_expert, self.tp_cp_group
-        ).detach()
+            full_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                full_tokens_per_expert, self.tp_cp_group
+            )
+        full_tokens_per_expert = full_tokens_per_expert.detach()
 
         # Full-sequence parameters for correct scaling.
         full_seq_length = seq_length * chunk_num
