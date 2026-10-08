@@ -4,6 +4,16 @@ from typing import Dict
 
 import torch
 
+from megatron.core.fp8_utils import (
+    dequantize_fp8_tensor,
+    get_fp8_cpu_offload_proxy_info,
+    get_fp8_cpu_offload_proxy_numel,
+)
+
+# Device-side staging budget (bytes of FP32 master data) for one wave of the
+# FP8 CPU-offload master write-back.
+_FP8_WRITEBACK_STAGE_BYTES = 512 * 1024 * 1024
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -76,9 +86,147 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
+        # Rank-invariant FP8 master write-back plan; installed by the owner of
+        # the grad buffers (DistributedOptimizer). See
+        # set_fp8_cpu_offload_writeback_plan().
+        self._fp8_writeback_waves = None
+        self._fp8_writeback_group = None
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
+
+    def _get_high_prec_param_shard_for_fp8_proxy(self, proxy_param):
+        """Return this proxy's current high-precision model-param shard."""
+        info = get_fp8_cpu_offload_proxy_info(proxy_param)
+        assert info is not None, "Expected an FP8 CPU-offload proxy with metadata."
+        model_param = info.blockwise_fp8_model_param
+        start_offset = info.start_offset
+        shard_numel = info.shard_numel
+
+        high_precision_init_val = None
+        if hasattr(model_param, "get_high_precision_init_val"):
+            high_precision_init_val = model_param.get_high_precision_init_val()
+        if high_precision_init_val is not None:
+            return high_precision_init_val.view(-1)[start_offset : start_offset + shard_numel]
+
+        return dequantize_fp8_tensor(model_param).view(-1)[
+            start_offset : start_offset + shard_numel
+        ]
+
+    def _build_fp8_cpu_offload_master_param_shard(self, proxy_param):
+        """Build the optimizer-owned CPU FP32 master param shard for an FP8 proxy."""
+        info = get_fp8_cpu_offload_proxy_info(proxy_param)
+        assert info is not None, "Expected an FP8 CPU-offload proxy with metadata."
+        model_param_shard = self._get_high_prec_param_shard_for_fp8_proxy(proxy_param)
+        master_param = model_param_shard.detach().to(
+            device="cpu", dtype=torch.float32, copy=True
+        ).contiguous()
+        if self.pin_cpu_params:
+            master_param = master_param.pin_memory()
+        # Release the CPU bf16 high-precision init copy NOW — the master shard
+        # has already been built from it, so the init copy is dead weight.
+        # Without this, every FP8 weight keeps a CPU bf16 duplicate for the
+        # whole run, inflating host RAM by ~param_size per rank (e.g. ~240GB
+        # per node for full-size Kimi K2.6 8 ranks), which causes host OOM.
+        model_param = info.blockwise_fp8_model_param
+        if hasattr(model_param, "clear_high_precision_init_val"):
+            model_param.clear_high_precision_init_val()
+        return master_param
+
+    def set_fp8_cpu_offload_writeback_plan(
+        self, model_params, data_parallel_group, stage_bytes=_FP8_WRITEBACK_STAGE_BYTES
+    ):
+        """Register the rank-invariant plan for the FP8 master write-back.
+
+        Casting CPU FP32 master shards back into blockwise-FP8 model params
+        reduces amaxes over the data-parallel group, i.e. it is a COLLECTIVE
+        whose message shape is derived from the *list of model params passed in*
+        (see TE's cast_master_weights_to_fp8: "Each rank has a shard of the
+        master weights (possibly empty) and a full copy of the model weights").
+        Every rank must therefore pass the same params in the same order and
+        hand in None for the shards it does not own. A rank only ever sees the
+        params whose grad-buffer slice it owns, so the full ordered list has to
+        come from the caller (DistributedOptimizer, which owns the buffers).
+
+        The list is chunked into waves of at most `stage_bytes` of FP32 master
+        data so that staging host masters back to the device stays bounded --
+        offload exists to save device memory, so materializing every master at
+        once would defeat it. Wave boundaries are computed from the model params
+        alone, hence identical on every rank.
+        """
+        model_params = list(model_params)
+        waves = []
+        cur_wave = []
+        cur_bytes = 0
+        for model_param in model_params:
+            # FP32 upper bound: the shard this rank owns is at most the param.
+            nbytes = model_param.numel() * 4
+            if cur_wave and cur_bytes + nbytes > stage_bytes:
+                waves.append(cur_wave)
+                cur_wave = []
+                cur_bytes = 0
+            cur_wave.append(model_param)
+            cur_bytes += nbytes
+        if cur_wave:
+            waves.append(cur_wave)
+
+        self._fp8_writeback_waves = waves
+        self._fp8_writeback_group = data_parallel_group
+
+    def _collect_fp8_offload_master_shards(self):
+        """Map blockwise-FP8 model param -> (CPU FP32 master shard, start offset).
+
+        Rebuilt per step on purpose: load_state_dict re-runs
+        _init_sub_optimizers(), which hands out new master tensors.
+        """
+        shards = {}
+        for cpu_param, gpu_param in self.cpu_copys_map_gpu_param.items():
+            info = get_fp8_cpu_offload_proxy_info(gpu_param)
+            if info is not None:
+                shards[info.blockwise_fp8_model_param] = (cpu_param, info.start_offset)
+        return shards
+
+    def _writeback_fp8_cpu_offload_masters(self):
+        """Quantize all CPU FP32 master shards back into their FP8 model params.
+
+        Batched per wave, so the number of amax all-reduces and the size of each
+        one depend only on the rank-invariant plan. Issuing this per param (or
+        per sub-optimizer, as a step post-hook would) makes both depend on which
+        grad-buffer slice the rank happens to own, and NCCL then deadlocks with
+        no error message.
+        """
+        from megatron.core.fp8_utils import quantize_param_shard
+
+        shards = self._collect_fp8_offload_master_shards()
+        if self._fp8_writeback_waves is None:
+            assert not shards, (
+                "FP8 CPU-offload master shards exist but no write-back plan was "
+                "registered; set_fp8_cpu_offload_writeback_plan() must be called "
+                "after building the optimizer or the FP8 weights never get updated."
+            )
+            return
+
+        for wave in self._fp8_writeback_waves:
+            main_params = []
+            start_offsets = []
+            staged = []
+            for model_param in wave:
+                entry = shards.get(model_param)
+                if entry is None:
+                    # Not this rank's shard: join the collective contributing no
+                    # amax. TE skips the copy for a None master.
+                    main_params.append(None)
+                    start_offsets.append(None)
+                    continue
+                master, start_offset = entry
+                if not master.is_cuda:
+                    master = master.to(model_param.device, non_blocking=True)
+                    staged.append(master)
+                main_params.append(master)
+                start_offsets.append(start_offset)
+
+            quantize_param_shard(wave, main_params, start_offsets, self._fp8_writeback_group)
+            del staged
 
     def _set_sub_optimizer_grads(self):
         if self.param_update_in_fp32:
@@ -121,6 +269,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
+                        if get_fp8_cpu_offload_proxy_info(gpu_param) is not None:
+                            # FP8 masters are written back once per step() by
+                            # _writeback_fp8_cpu_offload_masters(): the cast is a
+                            # collective, so it must not be issued per
+                            # sub-optimizer (the param set is rank-dependent).
+                            continue
                         gpu_param.data.copy_(param.data, non_blocking=True)
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
@@ -172,6 +326,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if d2h_event is not None:
                 d2h_event.synchronize()
             cpu_optimizer.step(closure)
+
+        # All CPU masters are final now: one rank-consistent FP8 write-back.
+        self._writeback_fp8_cpu_offload_masters()
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
@@ -252,8 +409,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         params = []
         for group in self.param_groups:
             params.extend(group["params"])
-        params_total_numel = sum([param.numel() for param in params])
-        gpu_params_total_numel = sum([param.numel() for param in params if param.is_cuda])
+        params_total_numel = sum([get_fp8_cpu_offload_proxy_numel(param) for param in params])
+        gpu_params_total_numel = sum(
+            [get_fp8_cpu_offload_proxy_numel(param) for param in params if param.is_cuda]
+        )
         cpu_params_total_numel = params_total_numel - gpu_params_total_numel
         offload_threshold = gpu_params_total_numel * offload_fraction
         offload_params_numel = 0
@@ -270,12 +429,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in group["params"]:
                 orig_param = param
                 cpu_copy = False
-                if offload_params_numel < offload_threshold and param.is_cuda:
+                if get_fp8_cpu_offload_proxy_info(param) is not None:
+                    cpu_master_param = self._build_fp8_cpu_offload_master_param_shard(param)
+                    param = cpu_master_param
+                    offload_params_numel += param.numel()
+                    cpu_copy = True
+                elif offload_params_numel < offload_threshold and param.is_cuda:
                     param = param.detach().clone().cpu().pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
+                if self.param_update_in_fp32:
+                    # In the FP8 case the passed-in param_groups already hold the fp32 shard
+                    # main param, so register it as a self-reference instead of cloning.
+                    if param.dtype != torch.float32:
+                        param = param.detach().clone().float()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -378,7 +545,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         Update the fp32 parameters by the new parameters.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+            if get_fp8_cpu_offload_proxy_info(param) is not None:
+                model_param_shard = self._get_high_prec_param_shard_for_fp8_proxy(param)
+                fp32_param.data.copy_(
+                    model_param_shard.to(device=fp32_param.device, dtype=fp32_param.dtype)
+                )
+            else:
+                fp32_param.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
