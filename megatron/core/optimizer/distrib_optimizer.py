@@ -1209,8 +1209,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
+                    if self.config.store_param_remainders and self.config.bf16:
+                        v = v.to(torch.int16)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
+                    if v.dtype != torch.float32:
+                        v = v.to(torch.float32)
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
