@@ -1909,13 +1909,24 @@ def validate_args(args, defaults={}):
         )
         assert args.chunksize, "chunksize is not set"
         assert args.keep_activations_chunks >= 0, "keep activations chunks should >= 0"
-        if args.seq_length % args.chunksize != 0:
-            raise RuntimeError('seq_length is not divided by chunksize.')
 
         # Add chunk_num_per_seq parameter for chunkpipe
         args.chunk_num_per_seq = args.seq_length // args.chunksize
-        if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
-            raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        # training_phase is injected by the launcher (AIAK's SFT entry script sets
+        # it to 'sft'); nothing in this repo defines a --training-phase flag, so
+        # default to the pretrain semantics.
+        training_phase = getattr(args, 'training_phase', 'pretrain')
+        if training_phase != "sft":
+            # Pretrain: seq_length must be exactly divisible by chunksize, and
+            # chunk_num_per_seq must be divisible by the PP size.
+            if args.seq_length % args.chunksize != 0:
+                raise RuntimeError('seq_length is not divided by chunksize.')
+            if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
+                raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        # SFT: seq_length is the upper bound and chunk_num_per_seq the theoretical
+        # max, so no strict divisibility is required (SFT chunkpipe is no-PP only).
+        args.sft_chunkpipe_mode = training_phase == "sft"
+
         if args.chunk_num_per_seq < args.keep_activations_chunks:
             raise RuntimeError('num chunks to keep activations cannot larger than num chunks.')
 
@@ -2318,6 +2329,9 @@ def _add_network_size_args(parser):
         "chunk_keys",
         "chunk_values",
         "chunkpipe_forward",
+        "chunkpipe_current_group_size",
+        "chunkpipe_chunk_idx_in_group",
+        "sft_chunkpipe_mode",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
