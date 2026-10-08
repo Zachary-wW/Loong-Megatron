@@ -4701,6 +4701,12 @@ class AllGatherPipeline:
         # Retrieve the buffer associated with the DP-Shard PG
         # that backs the model compute weights.
         wbuf = self.get_fsdp_buffer(bucket_id, bwd)
+        if wbuf is None:
+            # No weight buffer exists for this bucket, so there is nothing to
+            # all-gather. Restore the EMPTY state instead of failing on the
+            # None buffer below.
+            self.bucket_status[bucket_key] = BucketStatus.EMPTY
+            return
 
         # Lazy release the unused buckets.
         self.recycle_unused_buckets()
