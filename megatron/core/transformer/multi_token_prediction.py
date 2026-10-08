@@ -256,7 +256,8 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # the unpadded cu_seqlens would produce wrong local boundaries.
         if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-        return _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group)
+        rolled_tensor = _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group)
+        return rolled_tensor, rolled_tensor.sum()
 
     rolled_tensor = tensor.clone()
 
