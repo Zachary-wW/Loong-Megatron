@@ -154,7 +154,14 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
-    if self.config.recompute_method == 'uniform':
+    if self.config.enable_chunkpipe:
+        # Chunkpipe checkpoints every layer individually so a chunk's
+        # activations can be released as soon as its micro-batch is consumed.
+        # recompute_method / recompute_num_layers are unset in this mode (see
+        # the chunkpipe validation in training/arguments.py).
+        for layer_idx in range(self.num_layers_per_pipeline_rank):
+            chunk_runner(layer_idx, layer_idx + 1, True)
+    elif self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
         layer_idx = 0
