@@ -533,6 +533,17 @@ class TransformerConfig(ModelParallelConfig):
     chunkpipe_backward_microbatch: int = 0
     """microbatch num for chunk pipe backward"""
 
+    chunkpipe_current_group_size: int = 0
+    """Runtime mutable field. The chunk_group_size of the group currently
+    being processed by the scheduler. For pretrain this equals chunk_num_per_seq;
+    for SFT it varies per group (1 for binpacked, >1 for long sequences)."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime mutable field. The index of the current chunk within its group
+    (0-based). Set by the scheduler before each forward_step. Avoids relying
+    on chunkpipe_forward_microbatch % group_size which breaks when group sizes
+    vary across groups in SFT."""
+
     chunk_keys: dict[int, Any] = None
     """caches for keys"""
 
@@ -541,6 +552,10 @@ class TransformerConfig(ModelParallelConfig):
 
     chunkpipe_forward: bool = False
     """chunkpipe forward"""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether chunkpipe is running in SFT mode (dynamic group_size).
+    Enabled when training_phase == 'sft' and enable_chunkpipe is True."""
 
     ####################
     # activation recomputation
