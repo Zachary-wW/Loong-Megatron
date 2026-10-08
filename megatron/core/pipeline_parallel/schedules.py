@@ -358,7 +358,19 @@ def forward_step_calc_loss(
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
+            if getattr(config, 'enable_chunkpipe', False):
+                # Chunkpipe runs chunk_num_per_seq times as many forward/backward
+                # steps for the same number of sequences, so the per-step loss
+                # scale has to be divided by the sequence count instead.
+                MoEAuxLossAutoScaler.set_loss_scale(
+                    loss_scale
+                    * cp_size_for_scaling
+                    / (num_microbatches / config.chunk_num_per_seq)
+                )
+            else:
+                MoEAuxLossAutoScaler.set_loss_scale(
+                    loss_scale * cp_size_for_scaling / num_microbatches
+                )
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -370,7 +382,12 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            if getattr(config, 'enable_chunkpipe', False):
+                MTPLossAutoScaler.set_loss_scale(
+                    loss_scale / (num_microbatches / config.chunk_num_per_seq)
+                )
+            else:
+                MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # Set the loss scale for any experimental attention-variant auxiliary loss.
     experimental_attention_variant_loss_scale_func = (
@@ -387,9 +404,18 @@ def forward_step_calc_loss(
             # changes, carry the scale per autograd context instead of via a
             # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
-            experimental_attention_variant_loss_scale_func(
-                loss_scale * cp_size_for_scaling / num_microbatches
-            )
+            if getattr(config, 'enable_chunkpipe', False):
+                # Chunkpipe issues chunk_num_per_seq times as many steps for the
+                # same number of sequences, so the divisor is the sequence count.
+                experimental_attention_variant_loss_scale_func(
+                    loss_scale
+                    * cp_size_for_scaling
+                    / (num_microbatches / config.chunk_num_per_seq)
+                )
+            else:
+                experimental_attention_variant_loss_scale_func(
+                    loss_scale * cp_size_for_scaling / num_microbatches
+                )
 
     return output_tensor, num_tokens
 
@@ -694,8 +720,8 @@ def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
     if mtp_num_layers is None or mtp_num_layers == 0:
         return
     mtp_layers = get_attr_wrapped_model(model, "mtp")
-    for layer_idx in range(mtp_num_layers):
-        mtp_layers.layers[layer_idx].self_attention.delete_chunk_key_value_cache(
+    for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
+        mtp_layer.mtp_model_layer.self_attention.delete_chunk_key_value_cache(
             micro_batch_index
         )
 
@@ -722,8 +748,8 @@ def clear_key_value_cache(model, mtp_num_layers):
     if mtp_num_layers == 0:
         return
     mtp_layers = get_attr_wrapped_model(model, "mtp")
-    for layer_idx in range(mtp_num_layers):
-        mtp_layers.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
+    for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
+        mtp_layer.mtp_model_layer.self_attention.clear_chunk_key_value_cache()
 
 
 def _build_default_pg_collection() -> ProcessGroupCollection:
