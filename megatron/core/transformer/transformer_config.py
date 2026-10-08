@@ -82,6 +82,11 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_connection_type: str = 'sequential'
+    """Connection type between MTP layers.
+    'sequential': each MTP layer takes the previous MTP layer's hidden states as input (chain).
+    'parallel': every MTP layer takes the main model's hidden states as input (fan-out)."""
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
@@ -1931,6 +1936,14 @@ class TransformerConfig(ModelParallelConfig):
                 "set at the same time with account_for_embedding_in_pipeline_split"
                 "and account_for_loss_in_pipeline_split"
             )
+
+        assert self.mtp_connection_type in (
+            'sequential',
+            'parallel',
+        ), (
+            "mtp_connection_type must be 'sequential' or 'parallel', "
+            f"but got {self.mtp_connection_type!r}."
+        )
 
         # PP layout
         if self.pipeline_model_parallel_layout is not None:

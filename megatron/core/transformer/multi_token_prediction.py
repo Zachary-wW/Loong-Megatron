@@ -1822,6 +1822,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        # Keep the main model's hidden states around for the `parallel` connection type,
+        # where every MTP layer receives these states instead of the previous layer's output.
+        hidden_states_main = hidden_states
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
@@ -1843,6 +1847,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
             hidden_states_list.append(hidden_states)
+            if self.config.mtp_connection_type == 'parallel':
+                # Fan-out: every MTP layer reads the main model's hidden states.
+                hidden_states = hidden_states_main
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
