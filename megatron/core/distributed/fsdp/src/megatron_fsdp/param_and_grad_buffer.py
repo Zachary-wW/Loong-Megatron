@@ -379,10 +379,13 @@ def build_data_parallel_buffer_index(
                 continue
             cand_remainder = cand_numel % chunk_size_factor
             if remainder + cand_remainder <= chunk_size_factor:
-                rhs_found = True
-                rhs_param_id, rhs_shape = cand_id, cand_shape
-                regular_params.remove(candidate)
-                break
+                # The remainder only fits when the whole RHS parameter still fits in the
+                # padding gap of the LHS grid; otherwise the two parameters would overlap.
+                if cand_numel <= full_aligned_size - numel:
+                    rhs_found = True
+                    rhs_param_id, rhs_shape = cand_id, cand_shape
+                    regular_params.remove(candidate)
+                    break
 
         # If we find a partner, place its remainder into the same grid.
         if rhs_found and rhs_param_id is not None and rhs_shape is not None:
