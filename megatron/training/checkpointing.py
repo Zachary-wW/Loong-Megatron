@@ -969,7 +969,7 @@ def save_checkpoint(
                 )
                 if args.log_progress and args.async_save:
                     append_to_progress_log(
-                        args.save,
+                        save_dir,
                         f'Saved async local checkpoint\tIteration: {iteration}',
                         barrier=False,
                     )
@@ -1020,7 +1020,7 @@ def save_checkpoint(
                 )
                 if args.log_progress and args.async_save:
                     append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                        save_dir, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
 
                 if save_retain_interval is not None:
@@ -1030,7 +1030,7 @@ def save_checkpoint(
                         and prev_iteration % save_retain_interval != 0
                     ):
                         checkpoint_name = get_checkpoint_name(
-                            args.save, iteration=prev_iteration, return_base_dir=True
+                            save_dir, iteration=prev_iteration, return_base_dir=True
                         )
                         # Don't delete if `checkpoint_name` is a symbolic link.
                         if os.path.islink(
@@ -1038,7 +1038,7 @@ def save_checkpoint(
                         ):  # TODO: Make this work with MSC remote paths?
                             print_rank_0(
                                 f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                f'at {args.save} since it is a symbolic link'
+                                f'at {save_dir} since it is a symbolic link'
                             )
                         else:
                             # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
@@ -1050,7 +1050,7 @@ def save_checkpoint(
                                 delete_process = ctx.Process(
                                     target=_async_delete_checkpoint_impl,
                                     args=(
-                                        args.save,
+                                        save_dir,
                                         prev_iteration,
                                         args.log_progress,
                                         True,
@@ -1065,7 +1065,7 @@ def save_checkpoint(
                             else:
                                 th = threading.Thread(
                                     target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, args.log_progress),
+                                    args=(save_dir, prev_iteration, args.log_progress),
                                 )
                                 th.start()
 
