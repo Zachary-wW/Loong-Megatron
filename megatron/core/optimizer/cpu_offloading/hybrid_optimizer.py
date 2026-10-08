@@ -251,10 +251,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 event.synchronize()
             t1 = time.monotonic()
             for optimizer, _ in wave:
-                if isinstance(optimizer, Muon):
-                    optimizer.step(self.cpu_copys_map_gpu_param)
-                else:
-                    optimizer.step(closure)
+                # The target never builds a Muon CPU sub-optimizer (the CPU
+                # offload path uses CPUAdam/CPUSGD), so the plain step call is
+                # the only shape needed here.
+                optimizer.step(closure)
             t2 = time.monotonic()
             # Wave w fully consumed on this thread -> arena w%2 is free for
             # wave w+2. (Master copy-back reads masters, not grads.)
