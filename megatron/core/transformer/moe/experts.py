@@ -634,9 +634,15 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
+        # When selective FP8 is active and this expert module was initialized without
+        # FP8 (decided at init time), the GEMMs run in BF16, so the FP8 padding /
+        # unpadding must be skipped as well.
+        need_fp8_padding = (self.config.fp8 or self.config.fp4) and not getattr(
+            self.linear_fc1, "_selective_fp8_disabled", False
+        )
         if skip_routed_expert_padding(self.config):
             pass
-        elif self.config.fp8 or self.config.fp4:
+        elif need_fp8_padding:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -768,9 +774,14 @@ class TEGroupedMLP(MegatronModule):
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         permuted_probs = permuted_probs.unsqueeze(-1)
+        # See _fused_forward: skip FP8 padding when selective FP8 left this expert
+        # module in BF16 at init time.
+        need_fp8_padding = (self.config.fp8 or self.config.fp4) and not getattr(
+            self.linear_fc1, "_selective_fp8_disabled", False
+        )
         if skip_routed_expert_padding(self.config):
             pass
-        elif self.config.fp8 or self.config.fp4:
+        elif need_fp8_padding:
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert

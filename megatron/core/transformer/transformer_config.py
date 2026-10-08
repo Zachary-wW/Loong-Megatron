@@ -636,6 +636,17 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers at the end of the model to keep in BF16 precision when
     first_last_layers_bf16 is True."""
 
+    selective_fp8: bool = False
+    """If True, enable selective FP8 training: only whitelisted modules
+    (determined by selective_fp8_allowed_ub_names) run in FP8, all other
+    modules (MLP, norms, etc.) stay in BF16. Each component's config
+    (e.g. LLM foundation, ViT image encoder) can independently set this
+    flag via its own YAML."""
+
+    selective_fp8_allowed_ub_names: Optional[List[str]] = None
+    """Userbuffer names (TE linear layer names) that are allowed to run in FP8 during
+    selective FP8 training. Defaults to empty (no modules enabled) if not specified."""
+
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
@@ -1396,6 +1407,16 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+
+        # Selective FP8 requires FP8 training, and the whitelist only matters with it.
+        if self.selective_fp8 and not self.fp8:
+            raise ValueError(
+                "selective_fp8 requires FP8 training to be enabled (fp8='e4m3' or 'hybrid')."
+            )
+        if self.selective_fp8_allowed_ub_names and not self.selective_fp8:
+            raise ValueError(
+                "selective_fp8_allowed_ub_names has no effect without selective_fp8."
+            )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
