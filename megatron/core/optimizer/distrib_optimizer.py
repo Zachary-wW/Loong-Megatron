@@ -1215,14 +1215,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            dst_tensors = {"param": main_param}
-            for k, v in optim_state.items():
-                if isinstance(v, torch.Tensor):
-                    dst_tensors[k] = v
-            for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
-                    continue
-                dst_tensors[key].copy_(tensors[key])
+            if isinstance(self.optimizer, HybridDeviceOptimizer):
+                for k, v in tensors.items():
+                    if k == "param":
+                        k = "master_param"
+                    optim_state[k] = v
+            else:
+                dst_tensors = {"param": main_param}
+                for k, v in optim_state.items():
+                    if isinstance(v, torch.Tensor):
+                        dst_tensors[k] = v
+                for key in dst_tensors:
+                    if not isinstance(tensors[key], torch.Tensor):
+                        continue
+                    dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -2355,6 +2361,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for model_param, tensors in recv_tensors.items():
                     self._set_main_param_and_optimizer_states(model_param, tensors)
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
+
     @torch.no_grad()
     def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
         """Load counterpart of sharded_param_state_fully_reshardable.
@@ -3072,10 +3081,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            self.optimizer.update_fp32_param_by_new_param()
-            return
-
         if self.ddp_config.use_megatron_fsdp:
             raise NotImplementedError(
                 "Megatron-FSDP does not implement a model-to-main parameter update."
@@ -3121,6 +3126,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             param_range.start : param_range.end
                         ]
                     shard_main_param.data.copy_(shard_model_param)
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # HDO uses shard params as its param_groups. In the bf16 case the shard params
+            # share storage with the model params and are already updated by the checkpoint
+            # load. In the fp8 case the shard params are fp32 copies that the load does not
+            # update, so copy the model params into them explicitly.
+            if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+                copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
+            self.optimizer.update_fp32_param_by_new_param()
+            return
 
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
