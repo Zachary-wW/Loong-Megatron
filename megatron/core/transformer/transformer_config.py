@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -511,6 +511,51 @@ class TransformerConfig(ModelParallelConfig):
     use_transformer_engine_op_fuser: bool = False
     """If True, submodules may use Transformer Engine's operation fuser
     API to enable advanced fusions."""
+
+    ####################
+    # chunkpipe related
+    ####################
+    enable_chunkpipe: bool = False
+    """when set to true, split sequence into multiple chunks"""
+
+    chunksize: int = 0
+    """size for each chunk"""
+
+    chunk_num_per_seq: int = 0
+    """number of chunks per sequence, calculated as seq_length // chunksize"""
+
+    keep_activations_chunks: int = 0
+    """num of chunks of which activations will be retained"""
+
+    chunkpipe_forward_microbatch: int = 0
+    """microbatch num for chunk pipe forward"""
+
+    chunkpipe_backward_microbatch: int = 0
+    """microbatch num for chunk pipe backward"""
+
+    chunkpipe_current_group_size: int = 0
+    """Runtime mutable field. The chunk_group_size of the group currently
+    being processed by the scheduler. For pretrain this equals chunk_num_per_seq;
+    for SFT it varies per group (1 for binpacked, >1 for long sequences)."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime mutable field. The index of the current chunk within its group
+    (0-based). Set by the scheduler before each forward_step. Avoids relying
+    on chunkpipe_forward_microbatch % group_size which breaks when group sizes
+    vary across groups in SFT."""
+
+    chunk_keys: dict[int, Any] = None
+    """caches for keys"""
+
+    chunk_values: dict[int, Any] = None
+    """caches for values"""
+
+    chunkpipe_forward: bool = False
+    """chunkpipe forward"""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether chunkpipe is running in SFT mode (dynamic group_size).
+    Enabled when training_phase == 'sft' and enable_chunkpipe is True."""
 
     ####################
     # activation recomputation
@@ -1297,6 +1342,9 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        self.chunk_keys = {}
+        self.chunk_values = {}
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -2168,6 +2216,10 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion for multi-latent attention only supports training. "
                     "It is experimental and may change in future versions."
                 )
+                if self.enable_chunkpipe:
+                    # Chunkpipe slices the sequence into chunks and applies RoPE per
+                    # chunk, which the fused kernel cannot express.
+                    self.apply_rope_fusion = False
             else:
                 if self.rotary_interleaved:
                     if not is_te_min_version("2.3.0"):

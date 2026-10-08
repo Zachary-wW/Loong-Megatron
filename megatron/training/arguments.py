@@ -1900,6 +1900,40 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
 
+    # Chunkpipe: sequence is split into fixed-size chunks and scheduled across
+    # pipeline stages, so the derived counts and the recompute settings have to
+    # be consistent before anything is built.
+    if args.enable_chunkpipe:
+        assert not args.create_attention_mask_in_dataloader, (
+            "chunkpipe requires --no-create-attention-mask-in-dataloader"
+        )
+        assert args.chunksize, "chunksize is not set"
+        assert args.keep_activations_chunks >= 0, "keep activations chunks should >= 0"
+
+        # Add chunk_num_per_seq parameter for chunkpipe
+        args.chunk_num_per_seq = args.seq_length // args.chunksize
+        # training_phase is injected by the launcher (AIAK's SFT entry script sets
+        # it to 'sft'); nothing in this repo defines a --training-phase flag, so
+        # default to the pretrain semantics.
+        training_phase = getattr(args, 'training_phase', 'pretrain')
+        if training_phase != "sft":
+            # Pretrain: seq_length must be exactly divisible by chunksize, and
+            # chunk_num_per_seq must be divisible by the PP size.
+            if args.seq_length % args.chunksize != 0:
+                raise RuntimeError('seq_length is not divided by chunksize.')
+            if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
+                raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
+        # SFT: seq_length is the upper bound and chunk_num_per_seq the theoretical
+        # max, so no strict divisibility is required (SFT chunkpipe is no-PP only).
+        args.sft_chunkpipe_mode = training_phase == "sft"
+
+        if args.chunk_num_per_seq < args.keep_activations_chunks:
+            raise RuntimeError('num chunks to keep activations cannot larger than num chunks.')
+
+        assert not args.recompute_granularity, "cannot set recompute_granularity under chunkpipe mode"
+        assert not args.recompute_method, "cannot set recompute method under chunkpipe mode"
+        assert not args.recompute_num_layers, "cannot set recompute layers under chunkpipe mode"
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2286,6 +2320,18 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # chunkpipe: runtime/derived state, not user-facing switches. The user-facing
+        # ones (--enable-chunkpipe / --chunksize / --keep-activations-chunks) are
+        # generated from their TransformerConfig fields.
+        "chunk_num_per_seq",
+        "chunkpipe_forward_microbatch",
+        "chunkpipe_backward_microbatch",
+        "chunk_keys",
+        "chunk_values",
+        "chunkpipe_forward",
+        "chunkpipe_current_group_size",
+        "chunkpipe_chunk_idx_in_group",
+        "sft_chunkpipe_mode",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
