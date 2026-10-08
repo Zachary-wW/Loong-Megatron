@@ -262,13 +262,16 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
-        if early_comm_launch and f_layer is not None:
-            with f_layer.get_low_precision_context():
-                f_input = f_layer.moe_dispatch.forward(f_input)
-
         if f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.pre_dispatch_computation.forward(f_input)
+
+        # `moe_dispatch` consumes the output of `pre_dispatch_computation` (local tokens and
+        # router probs), so the early launch can only move it ahead of the MLP backward --
+        # never ahead of `pre_dispatch_computation` itself.
+        if early_comm_launch and f_layer is not None:
+            with f_layer.get_low_precision_context():
+                f_input = f_layer.moe_dispatch.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
