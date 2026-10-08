@@ -79,6 +79,11 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_loss_scaling_factor_decay_ratio: Optional[float] = 1.0
+    """Weighting factor decay ratio for Multi-Token Prediction (MTP) loss.
+    The per-depth factor is ``mtp_loss_scaling_factor * decay_ratio ** depth``.
+    The default of 1.0 keeps the per-depth factor flat."""
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
