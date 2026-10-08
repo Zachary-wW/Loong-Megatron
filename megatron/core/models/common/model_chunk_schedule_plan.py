@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Any, Callable, Optional
 
 import torch
@@ -221,7 +222,14 @@ class TransformerLayerSchedulePlan:
         return self.layer.get_inner_quantization_context()
 
     @staticmethod
-    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
+    def run(
+        f_layer,
+        b_layer,
+        f_input=None,
+        b_grad=None,
+        is_last_layer_in_bwd=False,
+        early_comm_launch=False,
+    ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
@@ -241,6 +249,10 @@ class TransformerLayerSchedulePlan:
             b_grad (Tensor): Gradient for backward computation
             is_last_layer_in_bwd (bool):
                 Whether the current layer is the last layer in the backward pass.
+            early_comm_launch (bool):
+                Launch the dispatch communication ahead of the MLP backward. CUDA allows more
+                concurrent kernel launches when CUDA_DEVICE_MAX_CONNECTIONS is not 1, so the
+                dispatch is started before the sparse operator phase of the MLP backward.
 
         Returns:
             Functions or values for next iteration's computation
@@ -250,6 +262,10 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
+        if early_comm_launch and f_layer is not None:
+            with f_layer.get_low_precision_context():
+                f_input = f_layer.moe_dispatch.forward(f_input)
+
         if f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.pre_dispatch_computation.forward(f_input)
@@ -257,7 +273,7 @@ class TransformerLayerSchedulePlan:
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
 
-        if f_layer is not None:
+        if not early_comm_launch and f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
 
@@ -265,7 +281,11 @@ class TransformerLayerSchedulePlan:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
-        if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
+        if (
+            b_layer is not None
+            and not is_last_layer_in_bwd
+            and b_layer.config.ep_overlap_early_attn_memory_release
+        ):
             b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
@@ -276,7 +296,11 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_combine.forward(f_input)
 
-        if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+        if (
+            b_layer is not None
+            and not is_last_layer_in_bwd
+            and not b_layer.config.ep_overlap_early_attn_memory_release
+        ):
             b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
@@ -542,6 +566,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlapped_layers = min(f_num_layers, b_num_layers)
+        # Launch the dispatch communication ahead of the MLP backward when CUDA serializes
+        # kernel launches onto a single connection.
+        early_comm_launch = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1"
 
         f_layer = b_layer = None
         # combined forward and backward pass for overlapped layers
@@ -556,6 +583,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 f_input=f_input,
                 b_grad=b_grad,
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
+                early_comm_launch=early_comm_launch,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
@@ -567,7 +595,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             nvtx_msg = f"layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
             _, b_grad = TransformerLayerSchedulePlan.run(
-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                None,
+                b_layer,
+                b_grad=b_grad,
+                is_last_layer_in_bwd=(i == b_num_layers - 1),
+                early_comm_launch=early_comm_launch,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
@@ -578,7 +610,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_layer = f_schedule_plan.get_layer(i)
             nvtx_msg = f"layer_{i}f"
             nvtx_range_push(nvtx_msg)
-            f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
+            f_input, _ = TransformerLayerSchedulePlan.run(
+                f_layer, None, f_input=f_input, early_comm_launch=early_comm_launch
+            )
             nvtx_range_pop(nvtx_msg)
 
         if f_schedule_plan is not None and post_forward is not None:
@@ -587,6 +621,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, f_schedule_plan.vp_stage)
+
+        # Delay the first layer's pre_dispatch backward until the p2p forward communication has
+        # been issued, so the attention backward overlaps with the p2p comm.
+        if b_num_layers > 0:
+            assert b_layer is not None
+            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
         # so the p2p comm could be overlapped with the wgrad of pre_dispatch backward
