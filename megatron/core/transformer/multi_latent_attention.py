@@ -351,14 +351,19 @@ class MultiLatentAttention(Attention):
             (chunk_id * self.config.chunksize // tp_size)
         pos_cache_indices = torch.arange(self.config.chunksize) + (chunk_id * self.config.chunksize)
 
+        # When the 3rd dim of k_pos_emb is smaller than the cache, only write to
+        # the first corresponding indices.
+        k_pos_emb_head_num = k_pos_emb.size(2)
         if self.is_enable_grad_chunkpipe():
             # detach kv compressed tensors that enter the KV cache to prevent gradient tracking
             # of the same computational graph twice, which will result in runtime exception
             self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed.clone().detach()
-            self.key_pos_emb_cache[pos_cache_indices, :, :, :] = k_pos_emb.clone().detach()
+            self.key_pos_emb_cache[
+                pos_cache_indices, :, :k_pos_emb_head_num, :
+            ] = k_pos_emb.clone().detach()
         else:
             self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed
-            self.key_pos_emb_cache[pos_cache_indices, :, :, :] = k_pos_emb
+            self.key_pos_emb_cache[pos_cache_indices, :, :k_pos_emb_head_num, :] = k_pos_emb
 
     def recover_key_value_up_proj_tensors(self, normed_kv_compressed, k_pos_emb):
         """Recover full key and value tensors from compressed representations.
