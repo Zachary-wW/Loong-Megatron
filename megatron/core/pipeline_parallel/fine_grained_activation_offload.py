@@ -41,6 +41,46 @@ def _te_do_not_offload(tensor):
     )
 
 
+def _is_fp8_tensor(tensor):
+    """Return whether tensor is a Transformer Engine FP8 tensor wrapper."""
+    try:
+        from megatron.core.extensions.transformer_engine import Float8Tensor
+    except ImportError:  # pragma: no cover - Transformer Engine is optional
+        return False
+    return Float8Tensor is not None and isinstance(tensor, Float8Tensor)
+
+
+OFFLOAD_TAG = "_fine_grained_offload_tag"
+_OFFLOAD_TENSOR_MODE = None
+
+
+def offloading_checker(tensor):
+    """Return whether the tensor should be offloaded under the tensor-level selector.
+
+    When ``--offload-tensors`` is empty every candidate tensor is offloaded, matching the
+    module-level behaviour. When it is set, only tensors marked with :func:`set_offload_tag`
+    are offloaded.
+    """
+    global _OFFLOAD_TENSOR_MODE
+
+    if _OFFLOAD_TENSOR_MODE is None:
+        from megatron.training import get_args
+
+        _OFFLOAD_TENSOR_MODE = getattr(get_args(), 'offload_tensors', False)
+
+    if not _OFFLOAD_TENSOR_MODE:
+        return True
+
+    return bool(getattr(tensor, OFFLOAD_TAG, False)) and not isinstance(
+        tensor, torch.nn.Parameter
+    )
+
+
+def set_offload_tag(tensor):
+    """Mark the tensor as selected for tensor-level offloading."""
+    setattr(tensor, OFFLOAD_TAG, True)
+
+
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     """
     Print an ASCII table summarizing offload bytes across all ranks.
@@ -835,12 +875,25 @@ class ChunkOffloadHandler:
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
+        # FP8 tensors carry quantized metadata, so they are copied as a uint8 payload and
+        # restored through the TE wrapper. They bypass the CPU pool, which tracks raw tensors.
+        fp8_offload = _is_fp8_tensor(src_tensor)
+        use_cpu_pool = use_cpu_pool and not fp8_offload
+
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
         else:
             cpu_backup = torch.empty(
-                src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
+                src_tensor.shape,
+                dtype=torch.uint8 if fp8_offload else src_tensor.dtype,
+                device="cpu",
+                pin_memory=pin_memory,
             )
+
+        if fp8_offload:
+            from megatron.core.extensions.transformer_engine import Float8Tensor
+
+            cpu_backup = Float8Tensor.make_like(src_tensor, data=cpu_backup)
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
         state = (src_tensor.device, cpu_backup, use_cpu_pool)
@@ -850,8 +903,15 @@ class ChunkOffloadHandler:
         """Reload."""
         debug_rank("------reload")
         dev, cpu_backup, use_cpu_pool = state
+        fp8_offload = _is_fp8_tensor(cpu_backup)
         if non_blocking is None:
-            non_blocking = cpu_backup.is_pinned()
+            non_blocking = getattr(cpu_backup, "_data", cpu_backup).is_pinned()
+        if fp8_offload:
+            # `.to()` rebuilds the TE wrapper on device, preserving the FP8 metadata.
+            gpu_tensor = cpu_backup.to(dev, non_blocking=non_blocking)
+            if use_cpu_pool:
+                self.cpu_tensor_pool.free(cpu_backup)
+            return gpu_tensor
         gpu_tensor = torch.empty(
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
@@ -988,14 +1048,19 @@ class ChunkOffloadHandler:
         debug_rank("tensor_need_offloading_checker")
         if not self._can_manage_tensor_for_offload(tensor):
             return False
-        if _te_do_not_offload(tensor):
+        if not offloading_checker(tensor):
+            return False
+        # FP8 tensors are offloaded as a uint8 payload, so the TE do-not-offload marker
+        # (which exists because the wrapper cannot be copied into a plain buffer) does not apply.
+        fp8_offload = _is_fp8_tensor(tensor)
+        if not fp8_offload and _te_do_not_offload(tensor):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
         # Respect tensor's offload preference if specified
-        if getattr(tensor, "_TE_do_not_offload", False) or getattr(
-            tensor, "_do_not_offload", False
-        ):
+        if getattr(tensor, "_do_not_offload", False):
+            return False
+        if not fp8_offload and getattr(tensor, "_TE_do_not_offload", False):
             return False
         return True
 
