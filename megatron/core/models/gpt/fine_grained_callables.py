@@ -145,6 +145,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
+        if layer.config.moe_enable_echo:
+            raise ValueError(
+                "ECHO MoE is not currently supported by the fine-grained three-stage "
+                "overlap schedule; disable moe_enable_echo or use a non-overlap schedule."
+            )
+
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:

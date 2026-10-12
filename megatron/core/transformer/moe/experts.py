@@ -892,6 +892,11 @@ class TEGroupedMLP(MegatronModule):
 
         if self.config.moe_received_token_capacity is not None:
             actual_total = sum(tpe_list)
+            if actual_total > self.config.moe_received_token_capacity:
+                raise RuntimeError(
+                    "ECHO received token count exceeds moe_received_token_capacity: "
+                    f"received={actual_total}, capacity={self.config.moe_received_token_capacity}"
+                )
             permuted_local_hidden_states = permuted_local_hidden_states[:actual_total]
             permuted_probs = permuted_probs[:actual_total]
 
@@ -1075,6 +1080,13 @@ class TEGroupedMLP(MegatronModule):
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        if self.config.moe_received_token_capacity is not None:
+            actual_total = sum(tokens_per_expert)
+            if actual_total > self.config.moe_received_token_capacity:
+                raise RuntimeError(
+                    "ECHO received token count exceeds moe_received_token_capacity: "
+                    f"received={actual_total}, capacity={self.config.moe_received_token_capacity}"
+                )
         permuted_probs = permuted_probs.unsqueeze(-1)
         if skip_routed_expert_padding(self.config):
             pass

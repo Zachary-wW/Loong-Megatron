@@ -1708,17 +1708,16 @@ class MoERoutingTracker:
         )
 
     def dump_data(self, dir_path: str):
-        """Stack collected tensors and save one rank-local file."""
+        """Stack collected tensors and save one file for every EP rank."""
         for key_name, layers in self.data_dict.items():
             for moe_layer_number, data_list in layers.items():
                 layers[moe_layer_number] = torch.stack(data_list)
-        if self.ep_rank == 0:
-            os.makedirs(dir_path, exist_ok=True)
-            file_path = os.path.join(
-                dir_path,
-                f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth",
-            )
-            torch.save(self.data_dict, file_path)
+        os.makedirs(dir_path, exist_ok=True)
+        file_path = os.path.join(
+            dir_path,
+            f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth",
+        )
+        torch.save(self.data_dict, file_path)
 
     def clear_data(self):
         """Discard collected statistics."""
