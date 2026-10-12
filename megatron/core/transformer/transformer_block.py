@@ -621,7 +621,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         with rng_context, outer_quantization_context:
             # Forward pass.
-            if self.config.recompute_granularity == 'full' and self.training:
+            recompute_for_chunkpipe = False
+            native_recompute = False
+            if self.config.recompute_granularity == 'full':
+                native_recompute = True
+            if self.config.enable_chunkpipe:
+                chunk_num = (
+                    self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
+                )
+                if chunk_num + self.config.keep_activations_chunks < self.config.chunk_num_per_seq:
+                    recompute_for_chunkpipe = True
+
+            if (native_recompute or recompute_for_chunkpipe) and self.training:
                 checkpointed_result = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -707,6 +718,25 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return hidden_states, intermediate_hidden_states
 
         return hidden_states
+
+    def update_config(self, chunkpipe_forward, chunk_microbatch):
+        """
+        Update the chunkpipe configuration for pipeline parallelism.
+
+        This method configures chunk-based pipeline parallelism settings,
+        which controls how microbatches are chunked during forward or backward passes.
+
+        Args:
+            chunkpipe_forward (bool): If True, configure for forward pass chunking.
+                                     If False, configure for backward pass chunking.
+            chunk_microbatch (int): Number of microbatches to process in each chunk.
+        """
+        self.config.chunkpipe_forward = chunkpipe_forward
+        if chunkpipe_forward:
+            self.config.chunkpipe_forward_microbatch = chunk_microbatch
+        else:
+            self.config.chunkpipe_backward_microbatch = chunk_microbatch
+        return
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
