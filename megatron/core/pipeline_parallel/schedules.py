@@ -1293,15 +1293,24 @@ def get_pp_rank_microbatches(
 
 
 def get_extended_schedule_table(
-    num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, num_chunks
+    num_microbatches,
+    num_model_chunks,
+    microbatch_group_size_per_vp_stage,
+    num_chunks,
+    override_mgspvs=None,
 ):
     """Extended schedule table to support sequence chunking"""
     schedule_table = []
-    microbatch_group_size_per_vp_stage = min(
-        microbatch_group_size_per_vp_stage,
-        int(parallel_state.get_pipeline_model_parallel_world_size() / num_chunks),
-    )
-    microbatch_group_size_per_vp_stage = max(microbatch_group_size_per_vp_stage, 1)
+    if override_mgspvs is not None:
+        # SFT chunkpipe uses one full VP group so a dynamic sequence group is never
+        # split across VP block boundaries.
+        microbatch_group_size_per_vp_stage = override_mgspvs
+    else:
+        microbatch_group_size_per_vp_stage = min(
+            microbatch_group_size_per_vp_stage,
+            int(parallel_state.get_pipeline_model_parallel_world_size() / num_chunks),
+        )
+        microbatch_group_size_per_vp_stage = max(microbatch_group_size_per_vp_stage, 1)
     num_microbatches = int(num_microbatches / num_chunks)
     for min_microbatch_id_in_group in range(
         0, num_microbatches, microbatch_group_size_per_vp_stage
@@ -1542,6 +1551,7 @@ def forward_backward_pipelining_with_interleaving(
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
     num_model_chunks = len(model)
+
     (
         total_num_microbatches,
         are_all_microbatches_in_warmup,
@@ -2589,51 +2599,112 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
 
     disable_grad_sync()
 
+    is_sft_chunkpipe = config.sft_chunkpipe_mode
+    if is_sft_chunkpipe:
+        # VPP training does not necessarily clear every group during forward-only
+        # bookkeeping; each training iteration must start with an empty cache.
+        for model_chunk in model:
+            clear_key_value_cache(model_chunk, config.mtp_num_layers)
+
+        # Each VP stage consumes the external chunk stream independently, so group
+        # discovery and backward state are tracked per model chunk.
+        group_size_cache = [{} for _ in model]
+        forward_chunk_info = {}
+        chunkpipe_seq_counter = [0] * len(model)
+        forward_group_info = [[] for _ in model]
+        forward_chunk_queue = [{} for _ in model]
+        vp_bwd_group_queue = [{} for _ in model]
+        vp_bwd_pending_mb = [[] for _ in model]
+        backward_group_state = [{} for _ in model]
+        p2p_grad_queue = [[] for _ in model]
+
+        def _get_group_id_from_cache(mb_id, cached_group_sizes, fallback_group_size):
+            if not cached_group_sizes:
+                return mb_id // fallback_group_size
+            offset = 0
+            for group_id, group_size in sorted(cached_group_sizes.items()):
+                if mb_id < offset + group_size:
+                    return group_id
+                offset += group_size
+            return len(cached_group_sizes) + (mb_id - offset) // fallback_group_size
+
+        def _get_chunk_pos_from_cache(
+            mb_id, group_id, cached_group_sizes, fallback_group_size
+        ):
+            if not cached_group_sizes:
+                return mb_id % fallback_group_size
+            offset = 0
+            for known_group_id, group_size in sorted(cached_group_sizes.items()):
+                if known_group_id == group_id:
+                    return mb_id - offset
+                offset += group_size
+            return (mb_id - offset) % fallback_group_size
+
+        def _is_last_chunk_of_group_dynamic(
+            mb_id, cached_group_sizes, fallback_group_size
+        ):
+            offset = 0
+            for _, group_size in sorted(cached_group_sizes.items()):
+                if mb_id < offset + group_size:
+                    return mb_id == offset + group_size - 1
+                offset += group_size
+            return (mb_id - offset + 1) % fallback_group_size == 0
+
     num_chunks = config.chunk_num_per_seq
     # Model chunk IDs with synchronized grads
     synchronized_model_chunks = set()
 
-    input_tensors = [
-        [[] for _ in range(num_microbatches // num_chunks)] for _ in range(len(model))
-    ]
-    output_tensors = [
-        [[] for _ in range(num_microbatches // num_chunks)] for _ in range(len(model))
-    ]
+    if is_sft_chunkpipe:
+        input_tensors = [{} for _ in model]
+        output_tensors = [{} for _ in model]
+    else:
+        input_tensors = [
+            [[] for _ in range(num_microbatches // num_chunks)] for _ in range(len(model))
+        ]
+        output_tensors = [
+            [[] for _ in range(num_microbatches // num_chunks)] for _ in range(len(model))
+        ]
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     forward_data_store = []
     output_tensor_grads = None
     if not forward_only:
-        output_tensor_grads = [
-            [[] for _ in range(num_microbatches // num_chunks)] for _ in range(len(model))
-        ]
+        if is_sft_chunkpipe:
+            output_tensor_grads = [{} for _ in model]
+        else:
+            output_tensor_grads = [
+                [[] for _ in range(num_microbatches // num_chunks)] for _ in range(len(model))
+            ]
     else:
         output_tensor_grads = None
 
     pipeline_parallel_size = p2p_communicator.pp_group.size()
     pipeline_parallel_rank = p2p_communicator.pp_group.rank()
 
-    if (
-        config.microbatch_group_size_per_vp_stage > num_microbatches
-        or config.microbatch_group_size_per_vp_stage < pipeline_parallel_size
-    ):
-        msg = (
-            'The number of contiguous micro-batches in a virtual pipeline stage'
-            f'should range in [PP={pipeline_parallel_size} , M={num_microbatches}]'
-        )
-        raise ValueError(msg)
+    if not is_sft_chunkpipe:
+        if (
+            config.microbatch_group_size_per_vp_stage > num_microbatches
+            or config.microbatch_group_size_per_vp_stage < pipeline_parallel_size
+        ):
+            msg = (
+                'The number of contiguous micro-batches in a virtual pipeline stage'
+                f'should range in [PP={pipeline_parallel_size} , M={num_microbatches}]'
+            )
+            raise ValueError(msg)
 
-    # If the final micro-batch group has fewer micro-batches than pipeline-parallel size,
-    # the pipeline will have dependency bubbles.
-    final_microbatch_group_size = num_microbatches % config.microbatch_group_size_per_vp_stage
-    if 0 < final_microbatch_group_size < pipeline_parallel_size:
-        msg = 'The remainder of M (the total micro-batches) divided by N (number of '
-        msg += 'contiguous micro-batches in a virtual pipeline stage) should be 0, '
-        msg += 'or larger than or equal to the pipeline-parallel size, but it is '
-        msg += f'{final_microbatch_group_size}. '
-        msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
-        msg += 'and reduces throughput.'
-        raise RuntimeError(msg)
+        # If the final micro-batch group has fewer micro-batches than pipeline-parallel size,
+        # the pipeline will have dependency bubbles.
+        final_microbatch_group_size = (
+            num_microbatches % config.microbatch_group_size_per_vp_stage
+        )
+        if 0 < final_microbatch_group_size < pipeline_parallel_size:
+            msg = 'The remainder of M (the total micro-batches) divided by N (number of '
+            msg += 'contiguous micro-batches in a virtual pipeline stage) should be 0, '
+            msg += 'or larger than or equal to the pipeline-parallel size, but it is '
+            msg += f'{final_microbatch_group_size}. '
+            msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
+            msg += 'and reduces throughput.'
+            raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
 
@@ -2645,6 +2716,15 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
     num_model_chunks = len(model)
+    sft_effective_chunks = num_chunks
+    sft_table_mgspvs = None
+    if is_sft_chunkpipe and num_chunks > 1:
+        # Put all sequence groups in one VP group so a dynamic group is never
+        # split across a VP block boundary.
+        num_sequences = num_microbatches // num_chunks
+        sft_table_mgspvs = num_sequences
+        sft_effective_chunks = max((num_microbatches + num_chunks + 1) // 2, num_chunks)
+
     (
         total_num_microbatches,
         are_all_microbatches_in_warmup,
@@ -2658,7 +2738,7 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         overlap_moe_expert_parallel_comm=config.overlap_moe_expert_parallel_comm,
         p2p_communicator=p2p_communicator,
         enable_chunkpipe=config.enable_chunkpipe,
-        num_chunks=num_chunks,
+        num_chunks=sft_effective_chunks,
     )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -2686,7 +2766,11 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
     # microbatch_id         | 0 1 2 0 1 2 3 4 3 4
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
     schedule_table = get_extended_schedule_table(
-        num_microbatches, len(model), config.microbatch_group_size_per_vp_stage, num_chunks
+        num_microbatches,
+        len(model),
+        config.microbatch_group_size_per_vp_stage,
+        num_chunks,
+        override_mgspvs=sft_table_mgspvs,
     )
 
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
@@ -2708,7 +2792,12 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 virtual_microbatch_id % total_num_microbatches
             ]
         else:
-            model_chunk_id = int(virtual_microbatch_id / num_chunks % num_model_chunks)
+            if is_sft_chunkpipe:
+                model_chunk_id = model_chunk_id_table[
+                    virtual_microbatch_id % total_num_microbatches
+                ]
+            else:
+                model_chunk_id = int(virtual_microbatch_id / num_chunks % num_model_chunks)
             model_chunk_id = num_model_chunks - model_chunk_id - 1
         return model_chunk_id
 
@@ -2716,7 +2805,7 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         """Helper method to get the microbatch_id within model chunk given the iteration number."""
         if iteration_id >= total_num_microbatches:
             return -1
-        if not forward:
+        if not forward and not is_sft_chunkpipe:
             microbatch_id_in_model_chunk = int(iteration_id / num_chunks / num_model_chunks)
         else:
             microbatch_id_in_model_chunk = microbatch_id_table[iteration_id]
@@ -2825,6 +2914,26 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
 
         return recv, next_model_chunk_id, next_microbatch_id
 
+    def get_chunkpipe_forward_microbatch_for_virtual(virtual_microbatch_id: int) -> int:
+        """Map a forward schedule entry to its chunk-level forward microbatch id."""
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
+        chunk_id = get_sequence_id_in_microbatch(virtual_microbatch_id, forward=True)
+        return microbatch_id * num_chunks + chunk_id
+
+    def get_sft_received_forward_microbatch(virtual_microbatch_id: int) -> int:
+        """Return the forward microbatch whose activation is received at this step.
+
+        Pipeline P2P is staggered by PP-1. The first rank receives a tensor sent
+        PP-1 steps earlier; other ranks receive the next rank's current output.
+        """
+        stagger = pipeline_parallel_size - 1
+        sender_virtual_microbatch_id = (
+            virtual_microbatch_id - stagger
+            if is_pp_first_stage(pp_group)
+            else virtual_microbatch_id + 1
+        )
+        return get_chunkpipe_forward_microbatch_for_virtual(sender_virtual_microbatch_id)
+
     def forward_step_helper_preprocess(
         virtual_microbatch_id, model_chunk_id, microbatch_id, chunk_id
     ):
@@ -2849,8 +2958,12 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                     )
 
         # forward step
+        chunkpipe_forward_microbatch = microbatch_id * num_chunks + chunk_id
         if _is_vp_first_stage(vp_stage=model_chunk_id) and is_pp_first_stage(pp_group):
-            if len(input_tensors[model_chunk_id][microbatch_id]) == len(
+            if is_sft_chunkpipe:
+                if chunkpipe_forward_microbatch not in output_tensors[model_chunk_id]:
+                    input_tensors[model_chunk_id][chunkpipe_forward_microbatch] = None
+            elif len(input_tensors[model_chunk_id][microbatch_id]) == len(
                 output_tensors[model_chunk_id][microbatch_id]
             ):
                 input_tensors[model_chunk_id][microbatch_id].append(None)
@@ -2860,8 +2973,11 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         # This input buffering is needed to overlap the computation with the receipt of
         # the next inputs. To index the proper buffered inputs for forword_step, we use
         # microbatch_id offset with number of released microbatches that have completed backprop.
-        offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
-        input_tensor = input_tensors[model_chunk_id][microbatch_id][chunk_id]
+        if is_sft_chunkpipe:
+            input_tensor = input_tensors[model_chunk_id].get(chunkpipe_forward_microbatch)
+        else:
+            offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
+            input_tensor = input_tensors[model_chunk_id][microbatch_id][chunk_id]
 
         return input_tensor
 
@@ -2869,7 +2985,11 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         model_chunk_id, microbatch_id, chunk_id, output_tensor, num_tokens
     ):
         """Postprocess for forward_step_helper"""
-        output_tensors[model_chunk_id][microbatch_id].append(output_tensor)
+        chunkpipe_forward_microbatch = microbatch_id * num_chunks + chunk_id
+        if is_sft_chunkpipe:
+            output_tensors[model_chunk_id][chunkpipe_forward_microbatch] = output_tensor
+        else:
+            output_tensors[model_chunk_id][microbatch_id].append(output_tensor)
 
         nonlocal total_num_tokens
         total_num_tokens += num_tokens
@@ -2877,9 +2997,22 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         # If forward-only, no need to save tensors for a backward pass.
         if forward_only:
             # Release the tensor that have completed forward step.
-            input_tensors[model_chunk_id][microbatch_id].pop(0)
-            output_tensors[model_chunk_id][microbatch_id].pop()
-            if chunk_id == num_chunks - 1:
+            if is_sft_chunkpipe:
+                del input_tensors[model_chunk_id][chunkpipe_forward_microbatch]
+                del output_tensors[model_chunk_id][chunkpipe_forward_microbatch]
+                chunk_info = forward_chunk_info.get(
+                    (model_chunk_id, chunkpipe_forward_microbatch)
+                )
+                is_last_chunk = (
+                    chunk_info[0] + 1 == chunk_info[1]
+                    if chunk_info is not None
+                    else chunk_id == num_chunks - 1
+                )
+            else:
+                input_tensors[model_chunk_id][microbatch_id].pop(0)
+                output_tensors[model_chunk_id][microbatch_id].pop()
+                is_last_chunk = chunk_id == num_chunks - 1
+            if is_last_chunk:
                 clear_key_value_cache(model[model_chunk_id], config.mtp_num_layers)
 
         return
@@ -2899,6 +3032,26 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         if config.enable_chunkpipe:
             decoder = get_attr_wrapped_model(model[model_chunk_id], 'decoder')
             decoder.update_config(True, chunkpipe_forward_microbatch)
+            if is_sft_chunkpipe:
+                seq_idx = chunkpipe_seq_counter[model_chunk_id]
+                group_id = _get_group_id_from_cache(
+                    seq_idx, group_size_cache[model_chunk_id], config.chunk_num_per_seq
+                )
+                if group_id in group_size_cache[model_chunk_id]:
+                    config.chunkpipe_chunk_idx_in_group = _get_chunk_pos_from_cache(
+                        seq_idx,
+                        group_id,
+                        group_size_cache[model_chunk_id],
+                        config.chunk_num_per_seq,
+                    )
+                    if config.chunkpipe_chunk_idx_in_group > 0:
+                        config.chunkpipe_current_group_size = group_size_cache[
+                            model_chunk_id
+                        ][group_id]
+                else:
+                    # get_batch writes the true group size while forward_step runs;
+                    # until then conservatively expose this as the first chunk.
+                    config.chunkpipe_chunk_idx_in_group = 0
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -2921,6 +3074,53 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group),
         )
 
+        if is_sft_chunkpipe:
+            discovered_group_size = config.chunkpipe_current_group_size
+            seq_idx = chunkpipe_seq_counter[model_chunk_id]
+            group_id = _get_group_id_from_cache(
+                seq_idx, group_size_cache[model_chunk_id], config.chunk_num_per_seq
+            )
+            if discovered_group_size > 0 and group_id not in group_size_cache[model_chunk_id]:
+                group_size_cache[model_chunk_id][group_id] = discovered_group_size
+                group_offset = sum(
+                    group_size
+                    for known_group_id, group_size in sorted(
+                        group_size_cache[model_chunk_id].items()
+                    )
+                    if known_group_id < group_id
+                )
+                forward_group_info[model_chunk_id].append(
+                    (group_offset, discovered_group_size)
+                )
+
+            corrected_group_id = _get_group_id_from_cache(
+                seq_idx, group_size_cache[model_chunk_id], config.chunk_num_per_seq
+            )
+            corrected_chunk_idx = _get_chunk_pos_from_cache(
+                seq_idx,
+                corrected_group_id,
+                group_size_cache[model_chunk_id],
+                config.chunk_num_per_seq,
+            )
+            final_group_size = group_size_cache[model_chunk_id].get(
+                corrected_group_id, config.chunk_num_per_seq
+            )
+            config.chunkpipe_chunk_idx_in_group = corrected_chunk_idx
+            config.chunkpipe_current_group_size = final_group_size
+            forward_chunk_info[(model_chunk_id, chunkpipe_forward_microbatch)] = (
+                corrected_chunk_idx,
+                final_group_size,
+            )
+            if not forward_only:
+                forward_chunk_queue[model_chunk_id][chunkpipe_forward_microbatch] = (
+                    corrected_chunk_idx,
+                    final_group_size,
+                )
+                vp_bwd_group_queue[model_chunk_id].setdefault(
+                    corrected_group_id, []
+                ).append(chunkpipe_forward_microbatch)
+            chunkpipe_seq_counter[model_chunk_id] += 1
+
         forward_step_helper_postprocess(
             model_chunk_id, microbatch_id, chunk_id, output_tensor, num_tokens
         )
@@ -2936,6 +3136,35 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             enable_grad_sync()
             synchronized_model_chunks.add(model_chunk_id)
 
+        if is_sft_chunkpipe:
+            # The last VP stage chooses group order; all other VP stages follow the
+            # FIFO gradient stream sent by the next PP rank. This keeps P2P gradient
+            # messages aligned while preserving LIFO order inside each group.
+            if not vp_bwd_pending_mb[model_chunk_id]:
+                min_group_id = get_min_key(vp_bwd_group_queue[model_chunk_id])
+                chunks_in_group = vp_bwd_group_queue[model_chunk_id][min_group_id]
+                expected_group_size = group_size_cache[model_chunk_id].get(min_group_id)
+                if expected_group_size is not None and len(chunks_in_group) != expected_group_size:
+                    raise RuntimeError(
+                        "Attempting SFT chunkpipe backward on an incomplete group: "
+                        f"group={min_group_id}, chunks={len(chunks_in_group)}, "
+                        f"expected={expected_group_size}, vp_stage={model_chunk_id}, "
+                        f"pp_rank={pipeline_parallel_rank}"
+                    )
+                vp_bwd_pending_mb[model_chunk_id] = chunks_in_group
+                del vp_bwd_group_queue[model_chunk_id][min_group_id]
+
+            backward_microbatch = vp_bwd_pending_mb[model_chunk_id].pop()
+            if _is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group):
+                output_tensor_grads[model_chunk_id].setdefault(backward_microbatch, None)
+                output_tensor_grad = output_tensor_grads[model_chunk_id].pop(backward_microbatch)
+            else:
+                output_tensor_grad = p2p_grad_queue[model_chunk_id].pop(0)
+
+            input_tensor = input_tensors[model_chunk_id].pop(backward_microbatch)
+            output_tensor = output_tensors[model_chunk_id].pop(backward_microbatch)
+            return input_tensor, output_tensor, output_tensor_grad, backward_microbatch
+
         # pylint: disable=E0606
         if _is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group):
             if len(output_tensor_grads[model_chunk_id][microbatch_id]) == 0:
@@ -2944,7 +3173,7 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         output_tensor = output_tensors[model_chunk_id][microbatch_id].pop()
         output_tensor_grad = output_tensor_grads[model_chunk_id][microbatch_id].pop(0)
 
-        return input_tensor, output_tensor, output_tensor_grad
+        return input_tensor, output_tensor, output_tensor_grad, None
 
     def backward_step_helper_postprocess(virtual_microbatch_id):
         """Postprocess for backward_step_helper"""
@@ -2974,21 +3203,65 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         chunk_id = get_sequence_id_in_microbatch(virtual_microbatch_id, forward=False)
         chunkpipe_backward_microbatch = microbatch_id * num_chunks + chunk_id
 
-        input_tensor, output_tensor, output_tensor_grad = backward_step_helper_preprocess(
-            virtual_microbatch_id, model_chunk_id, microbatch_id
-        )
+        (
+            input_tensor,
+            output_tensor,
+            output_tensor_grad,
+            backward_microbatch,
+        ) = backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id)
 
         # chunkpipe needs the current chunk written back into the block config
         if config.enable_chunkpipe:
             decoder = get_attr_wrapped_model(model[model_chunk_id], 'decoder')
-            decoder.update_config(False, chunkpipe_backward_microbatch)
+            decoder.update_config(
+                False,
+                backward_microbatch
+                if is_sft_chunkpipe
+                else chunkpipe_backward_microbatch,
+            )
+
+        chunk_info = None
+        if is_sft_chunkpipe:
+            chunk_info = forward_chunk_queue[model_chunk_id].get(backward_microbatch)
+            if chunk_info is not None:
+                config.chunkpipe_chunk_idx_in_group = chunk_info[0]
+                config.chunkpipe_current_group_size = chunk_info[1]
 
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
-        # remove caches for key & values
-        remove_key_value_cache(
-            model[model_chunk_id], chunkpipe_backward_microbatch, config.mtp_num_layers
-        )
+        if is_sft_chunkpipe and chunk_info is not None:
+            chunk_idx, group_size = chunk_info
+            group_id = None
+            for candidate_id, (group_offset, known_group_size) in enumerate(
+                forward_group_info[model_chunk_id]
+            ):
+                if group_offset <= backward_microbatch < group_offset + known_group_size:
+                    group_id = candidate_id
+                    break
+
+            if group_id is not None:
+                completed_chunks = backward_group_state[model_chunk_id].setdefault(
+                    group_id, set()
+                )
+                completed_chunks.add(chunk_idx)
+                if len(completed_chunks) == group_size:
+                    decoder = get_attr_wrapped_model(model[model_chunk_id], "decoder")
+                    for layer in decoder.layers:
+                        layer.self_attention.check_kv_cache_grad_consumed()
+                    group_offset, _ = forward_group_info[model_chunk_id][group_id]
+                    for cache_microbatch in range(group_offset, group_offset + group_size):
+                        remove_key_value_cache(
+                            model[model_chunk_id], cache_microbatch, config.mtp_num_layers
+                        )
+        else:
+            # Pretrain or a missing SFT lookup uses the immediate chunk id.
+            remove_key_value_cache(
+                model[model_chunk_id],
+                backward_microbatch
+                if is_sft_chunkpipe
+                else chunkpipe_backward_microbatch,
+                config.mtp_num_layers,
+            )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -3065,24 +3338,31 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
-    input_tensors[0][0].append(
-        p2p_communicator.recv_forward(
+    if is_sft_chunkpipe:
+        input_tensors[0][0] = p2p_communicator.recv_forward(
             tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
         )
-    )
+    else:
+        input_tensors[0][0].append(
+            p2p_communicator.recv_forward(
+                tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
+            )
+        )
 
     fwd_wait_handles = None
     fwd_wait_recv_handles = None
     bwd_wait_handles = None
     bwd_wait_recv_handles = None
     if is_pp_first_stage(p2p_communicator.pp_group):
-        fwd_recv_buffer_size = (
+        fwd_recv_buffer_size = max(
+            1,
             num_chunks - pipeline_parallel_size + 1
         )
     else:
         fwd_recv_buffer_size = 1
     if is_pp_last_stage(p2p_communicator.pp_group):
-        bwd_recv_buffer_size = (
+        bwd_recv_buffer_size = max(
+            1,
             num_chunks - pipeline_parallel_size + 1
         )
     else:
@@ -3096,6 +3376,10 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
 
     for k in range(num_warmup_microbatches):
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
+
+        if not config.overlap_p2p_comm_warmup_flush and recv_prev_wait_handles:
+            recv_prev_wait_handle = recv_prev_wait_handles.pop(0)
+            recv_prev_wait_handle.wait()
 
         if config.overlap_p2p_comm_warmup_flush:
             if (
@@ -3178,15 +3462,24 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                         tensor_shape=tensor_shape,
                     )
                 )
-                output_tensor_grads[num_model_chunks - 1][0].append(output_tensor_grad)
+                if is_sft_chunkpipe:
+                    p2p_grad_queue[num_model_chunks - 1].append(output_tensor_grad)
+                else:
+                    output_tensor_grads[num_model_chunks - 1][0].append(output_tensor_grad)
             else:
                 input_tensor = p2p_communicator.send_forward_recv_forward(
                     output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape
                 )
             if recv_prev:
-                input_tensors[next_forward_model_chunk_id][
-                    next_forward_microbatch_id
-                ].append(input_tensor)
+                if is_sft_chunkpipe:
+                    received_forward_microbatch = get_sft_received_forward_microbatch(k)
+                    input_tensors[next_forward_model_chunk_id][
+                        received_forward_microbatch
+                    ] = input_tensor
+                else:
+                    input_tensors[next_forward_model_chunk_id][
+                        next_forward_microbatch_id
+                    ].append(input_tensor)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
         else:
             if not is_pp_first_stage(p2p_communicator.pp_group):
@@ -3219,9 +3512,15 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
 
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
             if recv_prev:
-                input_tensors[next_forward_model_chunk_id][
-                    next_forward_microbatch_id
-                ].append(fwd_recv_buffer[k % fwd_recv_buffer_size])
+                if is_sft_chunkpipe:
+                    received_forward_microbatch = get_sft_received_forward_microbatch(k)
+                    input_tensors[next_forward_model_chunk_id][
+                        received_forward_microbatch
+                    ] = fwd_recv_buffer[k % fwd_recv_buffer_size]
+                else:
+                    input_tensors[next_forward_model_chunk_id][
+                        next_forward_microbatch_id
+                    ].append(fwd_recv_buffer[k % fwd_recv_buffer_size])
                 fwd_recv_buffer[(k + 1) % fwd_recv_buffer_size] = None
 
         if config.overlap_p2p_comm:
@@ -3255,7 +3554,10 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                         recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
 
                 if recv_next:
-                    output_tensor_grads[num_model_chunks - 1][0].append(bwd_recv_buffer[-1])
+                    if is_sft_chunkpipe:
+                        p2p_grad_queue[num_model_chunks - 1].append(bwd_recv_buffer[-1])
+                    else:
+                        output_tensor_grads[num_model_chunks - 1][0].append(bwd_recv_buffer[-1])
     nvtx_range_pop(suffix="warmup")
 
     # Run 1F1B in steady state.
@@ -3350,9 +3652,17 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 # Put input_tensor and output_tensor_grad in data structures in the
                 # right location.
                 if recv_prev:
-                    input_tensors[next_forward_model_chunk_id][
-                        next_forward_microbatch_id
-                    ].append(fwd_recv_buffer[forward_k % fwd_recv_buffer_size])
+                    if is_sft_chunkpipe:
+                        received_forward_microbatch = get_sft_received_forward_microbatch(
+                            forward_k
+                        )
+                        input_tensors[next_forward_model_chunk_id][
+                            received_forward_microbatch
+                        ] = fwd_recv_buffer[forward_k % fwd_recv_buffer_size]
+                    else:
+                        input_tensors[next_forward_model_chunk_id][
+                            next_forward_microbatch_id
+                        ].append(fwd_recv_buffer[forward_k % fwd_recv_buffer_size])
                     fwd_recv_buffer[(forward_k + 1) % fwd_recv_buffer_size] = None
 
                 return output_tensor
@@ -3415,9 +3725,14 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 # right location.
 
                 if recv_next:
-                    output_tensor_grads[next_backward_model_chunk_id][
-                        next_backward_microbatch_id
-                    ].append(bwd_recv_buffer[backward_k % bwd_recv_buffer_size])
+                    if is_sft_chunkpipe:
+                        p2p_grad_queue[next_backward_model_chunk_id].append(
+                            bwd_recv_buffer[backward_k % bwd_recv_buffer_size]
+                        )
+                    else:
+                        output_tensor_grads[next_backward_model_chunk_id][
+                            next_backward_microbatch_id
+                        ].append(bwd_recv_buffer[backward_k % bwd_recv_buffer_size])
                     bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
                 return input_tensor_grad
 
@@ -3482,13 +3797,22 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             # Put input_tensor and output_tensor_grad in data structures in the
             # right location.
             if recv_prev:
-                input_tensors[next_forward_model_chunk_id][
-                    next_forward_microbatch_id
-                ].append(input_tensor)
+                if is_sft_chunkpipe:
+                    received_forward_microbatch = get_sft_received_forward_microbatch(forward_k)
+                    input_tensors[next_forward_model_chunk_id][
+                        received_forward_microbatch
+                    ] = input_tensor
+                else:
+                    input_tensors[next_forward_model_chunk_id][
+                        next_forward_microbatch_id
+                    ].append(input_tensor)
             if recv_next:
-                output_tensor_grads[next_backward_model_chunk_id][
-                    next_backward_microbatch_id
-                ].append(output_tensor_grad)
+                if is_sft_chunkpipe:
+                    p2p_grad_queue[next_backward_model_chunk_id].append(output_tensor_grad)
+                else:
+                    output_tensor_grads[next_backward_model_chunk_id][
+                        next_backward_microbatch_id
+                    ].append(output_tensor_grad)
 
     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
     nvtx_range_pop(suffix="steady")
@@ -3502,14 +3826,26 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 bwd_wait_handle.wait()
 
         if are_all_microbatches_in_warmup:
-            output_tensor_grads[num_model_chunks - 1][-1].append(
-                p2p_communicator.recv_backward(
-                    tensor_shape,
-                    is_last_stage=(
-                        _is_vp_last_stage(vp_stage=curr_vp_stage) and is_pp_last_stage(pp_group)
-                    ),
+            if is_sft_chunkpipe:
+                p2p_grad_queue[num_model_chunks - 1].append(
+                    p2p_communicator.recv_backward(
+                        tensor_shape,
+                        is_last_stage=(
+                            _is_vp_last_stage(vp_stage=curr_vp_stage)
+                            and is_pp_last_stage(pp_group)
+                        ),
+                    )
                 )
-            )
+            else:
+                output_tensor_grads[num_model_chunks - 1][-1].append(
+                    p2p_communicator.recv_backward(
+                        tensor_shape,
+                        is_last_stage=(
+                            _is_vp_last_stage(vp_stage=curr_vp_stage)
+                            and is_pp_last_stage(pp_group)
+                        ),
+                    )
+                )
         for k in range(num_microbatches_remaining, total_num_microbatches):
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
             if (
@@ -3588,9 +3924,14 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                     if "recv_next" in bwd_wait_handles:
                         recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
                 if recv_next:
-                    output_tensor_grads[next_backward_model_chunk_id][
-                        next_backward_microbatch_id
-                    ].append(bwd_recv_buffer[k % bwd_recv_buffer_size])
+                    if is_sft_chunkpipe:
+                        p2p_grad_queue[next_backward_model_chunk_id].append(
+                            bwd_recv_buffer[k % bwd_recv_buffer_size]
+                        )
+                    else:
+                        output_tensor_grads[next_backward_model_chunk_id][
+                            next_backward_microbatch_id
+                        ].append(bwd_recv_buffer[k % bwd_recv_buffer_size])
                     bwd_recv_buffer[(k + 1) % bwd_recv_buffer_size] = None
 
             else:
@@ -3599,9 +3940,12 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 )
 
                 if recv_next:
-                    output_tensor_grads[next_backward_model_chunk_id][
-                        next_backward_microbatch_id
-                    ].append(output_tensor_grad)
+                    if is_sft_chunkpipe:
+                        p2p_grad_queue[next_backward_model_chunk_id].append(output_tensor_grad)
+                    else:
+                        output_tensor_grads[next_backward_model_chunk_id][
+                            next_backward_microbatch_id
+                        ].append(output_tensor_grad)
 
         if send_prev_wait_handle is not None:
             send_prev_wait_handle.wait()
@@ -4189,10 +4533,59 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
 
     disable_grad_sync()
 
-    assert (
-        num_microbatches % config.chunk_num_per_seq == 0
-    ), "num microbatches should be divided by num chunks"
-    num_sequences = num_microbatches // config.chunk_num_per_seq
+    is_sft_chunkpipe = config.sft_chunkpipe_mode
+    group_size_cache = {}
+
+    def get_group_id_from_cache(mb_id):
+        if not group_size_cache:
+            return mb_id // config.chunk_num_per_seq
+        offset = 0
+        for group_id, group_size in sorted(group_size_cache.items()):
+            if mb_id < offset + group_size:
+                return group_id
+            offset += group_size
+        return len(group_size_cache) + (mb_id - offset) // config.chunk_num_per_seq
+
+    def get_chunk_pos_from_cache(mb_id, group_id):
+        if not group_size_cache:
+            return mb_id % config.chunk_num_per_seq
+        offset = 0
+        for known_group_id, group_size in sorted(group_size_cache.items()):
+            if known_group_id == group_id:
+                return mb_id - offset
+            offset += group_size
+        return (mb_id - offset) % config.chunk_num_per_seq
+
+    def is_last_chunk_of_group_dynamic(mb_id):
+        offset = 0
+        for _, group_size in sorted(group_size_cache.items()):
+            if mb_id < offset + group_size:
+                return mb_id == offset + group_size - 1
+            offset += group_size
+        return (mb_id - offset + 1) % config.chunk_num_per_seq == 0
+
+    def set_sft_forward_chunk_state(mb_id):
+        group_id = get_group_id_from_cache(mb_id)
+        config.chunkpipe_chunk_idx_in_group = get_chunk_pos_from_cache(mb_id, group_id)
+        if config.chunkpipe_chunk_idx_in_group > 0 and group_id in group_size_cache:
+            config.chunkpipe_current_group_size = group_size_cache[group_id]
+
+    def record_sft_group_size(mb_id):
+        discovered_group_size = config.chunkpipe_current_group_size
+        if discovered_group_size <= 0:
+            return
+        group_id = get_group_id_from_cache(mb_id)
+        if group_id not in group_size_cache:
+            group_size_cache[group_id] = discovered_group_size
+
+    if is_sft_chunkpipe:
+        # The external iterator supplies the actual number of chunks per group.
+        num_sequences = None
+    else:
+        assert (
+            num_microbatches % config.chunk_num_per_seq == 0
+        ), "num microbatches should be divided by num chunks"
+        num_sequences = num_microbatches // config.chunk_num_per_seq
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
@@ -4268,6 +4661,8 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         )
         config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
         config.chunkpipe_forward = True
+        if is_sft_chunkpipe:
+            set_sft_forward_chunk_state(chunkpipe_forward_microbatch)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -4285,11 +4680,17 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         )
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
+        if is_sft_chunkpipe:
+            record_sft_group_size(chunkpipe_forward_microbatch)
 
         if not forward_only:
             # All chunks of one sequence are grouped so the backward pass can
             # walk them in reverse order.
-            sequence_num = chunkpipe_forward_microbatch // config.chunk_num_per_seq
+            sequence_num = (
+                get_group_id_from_cache(chunkpipe_forward_microbatch)
+                if is_sft_chunkpipe
+                else chunkpipe_forward_microbatch // config.chunk_num_per_seq
+            )
             if sequence_num not in input_output_chunk_micro:
                 input_output_chunk_micro[sequence_num] = []
             input_output_chunk_micro[sequence_num].append(
@@ -4297,7 +4698,12 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
             )
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
         else:
-            if (chunkpipe_forward_microbatch + 1) % config.chunk_num_per_seq == 0:
+            is_last_chunk = (
+                is_last_chunk_of_group_dynamic(chunkpipe_forward_microbatch)
+                if is_sft_chunkpipe
+                else (chunkpipe_forward_microbatch + 1) % config.chunk_num_per_seq == 0
+            )
+            if is_last_chunk:
                 # Clear the caches of every chunk of this sequence.
                 clear_key_value_cache(model, config.mtp_num_layers)
         chunkpipe_forward_microbatch += 1
@@ -4324,6 +4730,8 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
 
         config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
         config.chunkpipe_forward = True
+        if is_sft_chunkpipe:
+            set_sft_forward_chunk_state(chunkpipe_forward_microbatch)
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -4343,6 +4751,8 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
         total_num_tokens += num_tokens
+        if is_sft_chunkpipe:
+            record_sft_group_size(chunkpipe_forward_microbatch)
 
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
@@ -4350,7 +4760,12 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
-            if (chunkpipe_forward_microbatch + 1) % config.chunk_num_per_seq == 0:
+            is_last_chunk = (
+                is_last_chunk_of_group_dynamic(chunkpipe_forward_microbatch)
+                if is_sft_chunkpipe
+                else (chunkpipe_forward_microbatch + 1) % config.chunk_num_per_seq == 0
+            )
+            if is_last_chunk:
                 # Clear the caches of every chunk of this sequence.
                 clear_key_value_cache(model, config.mtp_num_layers)
         else:
@@ -4359,7 +4774,11 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
             )
 
             # Add input_tensor and output_tensor to end of list.
-            sequence_num = chunkpipe_forward_microbatch // config.chunk_num_per_seq
+            sequence_num = (
+                get_group_id_from_cache(chunkpipe_forward_microbatch)
+                if is_sft_chunkpipe
+                else chunkpipe_forward_microbatch // config.chunk_num_per_seq
+            )
             if sequence_num not in input_output_chunk_micro:
                 input_output_chunk_micro[sequence_num] = []
             input_output_chunk_micro[sequence_num].append(
@@ -4384,6 +4803,15 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
 
             config.chunkpipe_forward = False
             config.chunkpipe_backward_microbatch = tmp_tuple[2]
+            if is_sft_chunkpipe:
+                backward_microbatch = tmp_tuple[2]
+                backward_group_id = get_group_id_from_cache(backward_microbatch)
+                config.chunkpipe_chunk_idx_in_group = get_chunk_pos_from_cache(
+                    backward_microbatch, backward_group_id
+                )
+                config.chunkpipe_current_group_size = group_size_cache.get(
+                    backward_group_id, config.chunk_num_per_seq
+                )
 
             input_tensor_grad = backward_func(
                 tmp_tuple[0], tmp_tuple[1], output_tensor_grad, config
@@ -4431,6 +4859,15 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
 
             config.chunkpipe_forward = False
             config.chunkpipe_backward_microbatch = tmp_tuple[2]
+            if is_sft_chunkpipe:
+                backward_microbatch = tmp_tuple[2]
+                backward_group_id = get_group_id_from_cache(backward_microbatch)
+                config.chunkpipe_chunk_idx_in_group = get_chunk_pos_from_cache(
+                    backward_microbatch, backward_group_id
+                )
+                config.chunkpipe_current_group_size = group_size_cache.get(
+                    backward_group_id, config.chunk_num_per_seq
+                )
 
             input_tensor_grad = backward_func(
                 tmp_tuple[0], tmp_tuple[1], output_tensor_grad, config

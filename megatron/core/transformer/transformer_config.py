@@ -557,6 +557,10 @@ class TransformerConfig(ModelParallelConfig):
     """Whether chunkpipe is running in SFT mode (dynamic group_size).
     Enabled when training_phase == 'sft' and enable_chunkpipe is True."""
 
+    chunkpipe_num_microbatches: int = 0
+    """Total chunk-level microbatches per training step in SFT chunkpipe mode.
+    Used to size the KV cache pool when VPP keeps a full VP group resident."""
+
     ####################
     # activation recomputation
     ####################

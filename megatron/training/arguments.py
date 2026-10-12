@@ -1924,8 +1924,27 @@ def validate_args(args, defaults={}):
             if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
                 raise RuntimeError('num chunks is not divided by pipeline model parallel size.')
         # SFT: seq_length is the upper bound and chunk_num_per_seq the theoretical
-        # max, so no strict divisibility is required (SFT chunkpipe is no-PP only).
+        # max; both PP=1 and PP>1 are supported.
         args.sft_chunkpipe_mode = training_phase == "sft"
+
+        if args.sft_chunkpipe_mode:
+            args.chunkpipe_num_microbatches = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size
+            )
+            # A sequence's chunks must all occur in one iteration because KV cache
+            # cannot be preserved across iterations. Inflate a too-small GBS to at
+            # least one theoretical maximum group. This does not increase peak
+            # activation memory: each step still processes MBS * chunksize tokens.
+            if args.chunkpipe_num_microbatches < args.chunk_num_per_seq:
+                args.global_batch_size = (
+                    args.chunk_num_per_seq * args.micro_batch_size * args.data_parallel_size
+                )
+                args.chunkpipe_num_microbatches = args.chunk_num_per_seq
+                print_rank_0(
+                    "[SFT ChunkPipe] global_batch_size auto-inflated to "
+                    f"{args.global_batch_size} to fit chunk_num_per_seq="
+                    f"{args.chunk_num_per_seq} chunks per iteration"
+                )
 
         if args.chunk_num_per_seq < args.keep_activations_chunks:
             raise RuntimeError('num chunks to keep activations cannot larger than num chunks.')
@@ -2332,6 +2351,7 @@ def _add_network_size_args(parser):
         "chunkpipe_current_group_size",
         "chunkpipe_chunk_idx_in_group",
         "sft_chunkpipe_mode",
+        "chunkpipe_num_microbatches",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
