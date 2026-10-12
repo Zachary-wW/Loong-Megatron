@@ -561,6 +561,15 @@ class TransformerConfig(ModelParallelConfig):
     """Total chunk-level microbatches per training step in SFT chunkpipe mode.
     Used to size the KV cache pool when VPP keeps a full VP group resident."""
 
+    chunkpipe_composite_group_size: int = 0
+    """Runtime mutable field. Total chunk count of the composite group currently
+    processed by the SFT scheduler. A composite group may contain multiple real
+    sequence groups so all DP ranks stay in lock step for MoE All-to-All."""
+
+    chunkpipe_component_sizes: Optional[list] = None
+    """Runtime mutable field. Real-group sizes inside the current SFT composite
+    group, e.g. [3, 2]. Empty or None means composite scheduling is inactive."""
+
     ####################
     # activation recomputation
     ####################

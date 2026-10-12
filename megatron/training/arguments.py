@@ -2352,6 +2352,8 @@ def _add_network_size_args(parser):
         "chunkpipe_chunk_idx_in_group",
         "sft_chunkpipe_mode",
         "chunkpipe_num_microbatches",
+        "chunkpipe_composite_group_size",
+        "chunkpipe_component_sizes",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")

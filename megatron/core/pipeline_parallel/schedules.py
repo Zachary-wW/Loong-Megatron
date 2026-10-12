@@ -923,10 +923,10 @@ def forward_backward_no_pipelining_with_chunkpipe(
         chunkpipe_forward_microbatch = 0
         microbatch_idx = 0
         last_group_losses = None
-        last_group_size = 0
+        last_group_total_chunks = 0
 
         def _forward_one_chunk(chunk_idx_in_group: int, is_first_global: bool):
-            """Forward one SFT chunk and return its output and microbatch id."""
+            """Forward one SFT chunk and capture its real-group state."""
             nonlocal chunkpipe_forward_microbatch, total_num_tokens
             config.chunkpipe_forward = True
             config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
@@ -947,15 +947,25 @@ def forward_backward_no_pipelining_with_chunkpipe(
                 current_microbatch=chunkpipe_forward_microbatch,
             )
             total_num_tokens += num_tokens
-            result = (output_tensor, chunkpipe_forward_microbatch)
+            # get_batch updates the real group size while each chunk is produced.
+            # Snapshot it so backward can replay heterogeneous composites such as
+            # [3, 2] without reading a stale size from a later real group.
+            real_group_size = config.chunkpipe_current_group_size
+            result = (
+                output_tensor,
+                chunkpipe_forward_microbatch,
+                chunk_idx_in_group,
+                real_group_size,
+            )
             chunkpipe_forward_microbatch += 1
             return result
 
-        def _backward_one_chunk(chunk_losses: list, chunk_idx_in_group: int):
+        def _backward_one_chunk(chunk_losses: list):
             """Backward one SFT chunk and release its KV cache."""
             output_and_microbatch = chunk_losses.pop()
             config.chunkpipe_backward_microbatch = output_and_microbatch[1]
-            config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
+            config.chunkpipe_chunk_idx_in_group = output_and_microbatch[2]
+            config.chunkpipe_current_group_size = output_and_microbatch[3]
             backward_step(
                 input_tensor, output_and_microbatch[0], output_tensor_grad, config
             )
@@ -963,53 +973,66 @@ def forward_backward_no_pipelining_with_chunkpipe(
                 model, output_and_microbatch[1], config.mtp_num_layers
             )
 
-        def _backward_group(chunk_losses: list, group_size: int, sync_last_only=False):
-            """Backward one SFT chunk group in reverse forward order.
+        def _backward_group(
+            chunk_losses: list, total_chunks: int, sync_last_only=False
+        ):
+            """Backward one SFT composite group in reverse forward order.
 
-            With overlap_grad_reduce, only the final backward chunk of a group may
-            leave no_sync; otherwise DDP registers grad-ready for shared parameters
-            once per chunk and duplicates the notification.
+            With overlap_grad_reduce, only the final backward chunk of a composite
+            may leave no_sync; otherwise DDP registers grad-ready for shared
+            parameters once per chunk and duplicates the notification.
             """
             config.chunkpipe_forward = False
-            if sync_last_only and group_size > 1:
+            if sync_last_only and total_chunks > 1:
                 with no_sync_func():
-                    for chunk_idx_in_group in range(group_size - 1, 0, -1):
-                        _backward_one_chunk(chunk_losses, chunk_idx_in_group)
-                _backward_one_chunk(chunk_losses, 0)
+                    for _ in range(total_chunks - 1):
+                        _backward_one_chunk(chunk_losses)
+                _backward_one_chunk(chunk_losses)
             else:
-                for chunk_idx_in_group in reversed(range(group_size)):
-                    _backward_one_chunk(chunk_losses, chunk_idx_in_group)
+                for _ in range(total_chunks):
+                    _backward_one_chunk(chunk_losses)
 
-        # The external SFT data pipeline writes chunkpipe_current_group_size while
-        # producing each group's first chunk. Forward that chunk before deriving
-        # how many chunks belong to the current group.
+        # The external SFT data pipeline writes the composite descriptor and each
+        # real group's size while producing chunks. A composite may contain
+        # multiple real groups when attention and MoE DP sizes differ.
         with no_sync_func():
             while microbatch_idx < num_microbatches:
                 config.chunkpipe_forward = True
                 is_first_global = chunkpipe_forward_microbatch == 0
                 chunk_losses = [_forward_one_chunk(0, is_first_global)]
-                group_size = config.chunkpipe_current_group_size or 1
+                component_sizes = list(
+                    getattr(config, 'chunkpipe_component_sizes', None) or []
+                )
+                if not component_sizes:
+                    component_sizes = [config.chunkpipe_current_group_size or 1]
 
-                for chunk_idx_in_group in range(1, group_size):
+                for chunk_idx_in_group in range(1, component_sizes[0]):
                     chunk_losses.append(_forward_one_chunk(chunk_idx_in_group, False))
 
-                microbatch_idx += group_size
+                for real_group_size in component_sizes[1:]:
+                    for chunk_idx_in_group in range(real_group_size):
+                        chunk_losses.append(_forward_one_chunk(chunk_idx_in_group, False))
+
+                total_chunks = sum(component_sizes)
+                microbatch_idx += total_chunks
                 if microbatch_idx >= num_microbatches:
                     last_group_losses = chunk_losses
-                    last_group_size = group_size
+                    last_group_total_chunks = total_chunks
                     break
 
                 if not forward_only:
-                    _backward_group(chunk_losses, group_size)
-                elif group_size > 1:
+                    _backward_group(chunk_losses, total_chunks)
+                elif total_chunks > 1:
                     clear_key_value_cache(model, config.mtp_num_layers)
 
-        # Run the last group outside no_sync so its backward can synchronize
+        # Run the last composite outside no_sync so its backward can synchronize
         # gradients, matching the fixed-size pretrain schedule.
         if last_group_losses is not None:
             if not forward_only:
-                _backward_group(last_group_losses, last_group_size, sync_last_only=True)
-            elif last_group_size > 1:
+                _backward_group(
+                    last_group_losses, last_group_total_chunks, sync_last_only=True
+                )
+            elif last_group_total_chunks > 1:
                 clear_key_value_cache(model, config.mtp_num_layers)
 
     if config.finalize_model_grads_func is not None and not forward_only:
