@@ -890,7 +890,6 @@ class MoELayer(BaseMoELayer):
                     with torch.cuda.nvtx.range("token_combine"):
                         output = self.token_dispatcher.combine_preprocess(expert_output)
                         output = self.combine(output)
-                        output = self.token_dispatcher.combine_postprocess(output)
                     MoELayer.token_combine_event.record()
                 # Default stream waits for combine A2A to complete before returning output.
                 torch.cuda.default_stream().wait_event(MoELayer.token_combine_event)
@@ -898,7 +897,6 @@ class MoELayer(BaseMoELayer):
                 with torch.cuda.nvtx.range("token_combine"):
                     output = self.token_dispatcher.combine_preprocess(expert_output)
                     output = self.combine(output)
-                    output = self.token_dispatcher.combine_postprocess(output)
             return output, mlp_bias, shared_expert_output
 
         if self.moe_layer_recompute:
