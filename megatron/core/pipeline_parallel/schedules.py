@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+from collections import deque
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -739,6 +740,8 @@ def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
 
     if mtp_num_layers is None or mtp_num_layers == 0:
         return
+    if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+        return
     mtp_layers = get_attr_wrapped_model(model, "mtp")
     for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
         mtp_layer.mtp_model_layer.self_attention.delete_chunk_key_value_cache(
@@ -766,6 +769,8 @@ def clear_key_value_cache(model, mtp_num_layers):
         decoder.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
 
     if mtp_num_layers == 0:
+        return
+    if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
         return
     mtp_layers = get_attr_wrapped_model(model, "mtp")
     for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
@@ -4639,6 +4644,53 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         if group_id not in group_size_cache:
             group_size_cache[group_id] = discovered_group_size
 
+    sft_chunk_info = {}
+    sft_mb_to_composite_id = {}
+    sft_current_composite_id = -1
+    sft_composite_cursor = deque()
+
+    def ensure_sft_chunk_info_after_forward(mb_id):
+        """Capture the real-group state produced by the external iterator."""
+        nonlocal sft_current_composite_id
+        component_sizes = list(getattr(config, 'chunkpipe_component_sizes', None) or [])
+        if not component_sizes:
+            component_sizes = [
+                getattr(config, 'chunkpipe_current_group_size', None)
+                or config.chunk_num_per_seq
+            ]
+
+        if not sft_composite_cursor:
+            sft_current_composite_id += 1
+            for real_group_size in component_sizes:
+                for chunk_idx in range(real_group_size):
+                    sft_composite_cursor.append((chunk_idx, real_group_size))
+
+        if sft_composite_cursor:
+            sft_chunk_info[mb_id] = sft_composite_cursor.popleft()
+            sft_mb_to_composite_id[mb_id] = sft_current_composite_id
+        else:
+            sft_chunk_info[mb_id] = (
+                getattr(config, 'chunkpipe_chunk_idx_in_group', 0),
+                getattr(
+                    config, 'chunkpipe_current_group_size', config.chunk_num_per_seq
+                ),
+            )
+            sft_mb_to_composite_id[mb_id] = sft_current_composite_id
+
+    def restore_sft_chunk_info_for_backward(mb_id):
+        """Replay the exact forward-time state for one SFT chunk."""
+        if mb_id in sft_chunk_info:
+            chunk_idx, real_group_size = sft_chunk_info[mb_id]
+            config.chunkpipe_chunk_idx_in_group = chunk_idx
+            config.chunkpipe_current_group_size = real_group_size
+            return
+
+        group_id = get_group_id_from_cache(mb_id)
+        config.chunkpipe_chunk_idx_in_group = get_chunk_pos_from_cache(mb_id, group_id)
+        config.chunkpipe_current_group_size = group_size_cache.get(
+            group_id, config.chunk_num_per_seq
+        )
+
     if is_sft_chunkpipe:
         # The external iterator supplies the actual number of chunks per group.
         num_sequences = None
@@ -4746,16 +4798,19 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
         if is_sft_chunkpipe:
+            ensure_sft_chunk_info_after_forward(chunkpipe_forward_microbatch)
             record_sft_group_size(chunkpipe_forward_microbatch)
 
         if not forward_only:
             # All chunks of one sequence are grouped so the backward pass can
             # walk them in reverse order.
             sequence_num = (
-                get_group_id_from_cache(chunkpipe_forward_microbatch)
+                sft_mb_to_composite_id.get(chunkpipe_forward_microbatch)
                 if is_sft_chunkpipe
                 else chunkpipe_forward_microbatch // config.chunk_num_per_seq
             )
+            if sequence_num is None:
+                sequence_num = get_group_id_from_cache(chunkpipe_forward_microbatch)
             if sequence_num not in input_output_chunk_micro:
                 input_output_chunk_micro[sequence_num] = []
             input_output_chunk_micro[sequence_num].append(
@@ -4821,6 +4876,7 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         )
         total_num_tokens += num_tokens
         if is_sft_chunkpipe:
+            ensure_sft_chunk_info_after_forward(chunkpipe_forward_microbatch)
             record_sft_group_size(chunkpipe_forward_microbatch)
 
         if forward_only:
@@ -4844,10 +4900,12 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
 
             # Add input_tensor and output_tensor to end of list.
             sequence_num = (
-                get_group_id_from_cache(chunkpipe_forward_microbatch)
+                sft_mb_to_composite_id.get(chunkpipe_forward_microbatch)
                 if is_sft_chunkpipe
                 else chunkpipe_forward_microbatch // config.chunk_num_per_seq
             )
+            if sequence_num is None:
+                sequence_num = get_group_id_from_cache(chunkpipe_forward_microbatch)
             if sequence_num not in input_output_chunk_micro:
                 input_output_chunk_micro[sequence_num] = []
             input_output_chunk_micro[sequence_num].append(
@@ -4873,14 +4931,7 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
             config.chunkpipe_forward = False
             config.chunkpipe_backward_microbatch = tmp_tuple[2]
             if is_sft_chunkpipe:
-                backward_microbatch = tmp_tuple[2]
-                backward_group_id = get_group_id_from_cache(backward_microbatch)
-                config.chunkpipe_chunk_idx_in_group = get_chunk_pos_from_cache(
-                    backward_microbatch, backward_group_id
-                )
-                config.chunkpipe_current_group_size = group_size_cache.get(
-                    backward_group_id, config.chunk_num_per_seq
-                )
+                restore_sft_chunk_info_for_backward(tmp_tuple[2])
             else:
                 config.chunkpipe_chunk_idx_in_group = (
                     config.chunkpipe_backward_microbatch % config.chunk_num_per_seq
@@ -4899,9 +4950,17 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
-                input_tensor = p2p_communicator.send_backward_recv_forward(
-                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
-                )
+                if i < parallel_state.get_pipeline_model_parallel_rank():
+                    input_tensor = p2p_communicator.recv_forward(
+                        recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                    )
+                    p2p_communicator.send_backward(
+                        input_tensor_grad, p2p_communicator.is_pp_first_stage
+                    )
+                else:
+                    input_tensor = p2p_communicator.send_backward_recv_forward(
+                        input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                    )
         chunkpipe_forward_microbatch += 1
 
     # Run cooldown backward passes.
@@ -4933,14 +4992,7 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
             config.chunkpipe_forward = False
             config.chunkpipe_backward_microbatch = tmp_tuple[2]
             if is_sft_chunkpipe:
-                backward_microbatch = tmp_tuple[2]
-                backward_group_id = get_group_id_from_cache(backward_microbatch)
-                config.chunkpipe_chunk_idx_in_group = get_chunk_pos_from_cache(
-                    backward_microbatch, backward_group_id
-                )
-                config.chunkpipe_current_group_size = group_size_cache.get(
-                    backward_group_id, config.chunk_num_per_seq
-                )
+                restore_sft_chunk_info_for_backward(tmp_tuple[2])
             else:
                 config.chunkpipe_chunk_idx_in_group = (
                     config.chunkpipe_backward_microbatch % config.chunk_num_per_seq
