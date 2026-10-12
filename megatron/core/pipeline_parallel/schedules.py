@@ -943,19 +943,34 @@ def forward_backward_no_pipelining_with_chunkpipe(
             chunkpipe_forward_microbatch += 1
             return result
 
-        def _backward_group(chunk_losses: list, group_size: int):
-            """Backward one SFT chunk group in reverse forward order."""
+        def _backward_one_chunk(chunk_losses: list, chunk_idx_in_group: int):
+            """Backward one SFT chunk and release its KV cache."""
+            output_and_microbatch = chunk_losses.pop()
+            config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+            config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
+            backward_step(
+                input_tensor, output_and_microbatch[0], output_tensor_grad, config
+            )
+            remove_key_value_cache(
+                model, output_and_microbatch[1], config.mtp_num_layers
+            )
+
+        def _backward_group(chunk_losses: list, group_size: int, sync_last_only=False):
+            """Backward one SFT chunk group in reverse forward order.
+
+            With overlap_grad_reduce, only the final backward chunk of a group may
+            leave no_sync; otherwise DDP registers grad-ready for shared parameters
+            once per chunk and duplicates the notification.
+            """
             config.chunkpipe_forward = False
-            for chunk_idx_in_group in reversed(range(group_size)):
-                output_and_microbatch = chunk_losses.pop()
-                config.chunkpipe_backward_microbatch = output_and_microbatch[1]
-                config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
-                backward_step(
-                    input_tensor, output_and_microbatch[0], output_tensor_grad, config
-                )
-                remove_key_value_cache(
-                    model, output_and_microbatch[1], config.mtp_num_layers
-                )
+            if sync_last_only and group_size > 1:
+                with no_sync_func():
+                    for chunk_idx_in_group in range(group_size - 1, 0, -1):
+                        _backward_one_chunk(chunk_losses, chunk_idx_in_group)
+                _backward_one_chunk(chunk_losses, 0)
+            else:
+                for chunk_idx_in_group in reversed(range(group_size)):
+                    _backward_one_chunk(chunk_losses, chunk_idx_in_group)
 
         # The external SFT data pipeline writes chunkpipe_current_group_size while
         # producing each group's first chunk. Forward that chunk before deriving
@@ -985,7 +1000,7 @@ def forward_backward_no_pipelining_with_chunkpipe(
         # gradients, matching the fixed-size pretrain schedule.
         if last_group_losses is not None:
             if not forward_only:
-                _backward_group(last_group_losses, last_group_size)
+                _backward_group(last_group_losses, last_group_size, sync_last_only=True)
             elif last_group_size > 1:
                 clear_key_value_cache(model, config.mtp_num_layers)
 
