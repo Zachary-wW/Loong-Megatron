@@ -145,6 +145,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
+        if layer.config.moe_enable_echo:
+            raise ValueError(
+                "ECHO MoE is not currently supported by the fine-grained three-stage "
+                "overlap schedule; disable moe_enable_echo or use a non-overlap schedule."
+            )
+
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
@@ -160,10 +166,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
+        metadata = token_dispatcher.metadata
         if enable_deepep or enable_hybridep or enable_ncclep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to pre_dispatch_computation submodule
-            token_dispatcher._comm_manager.token_probs = probs
+            metadata.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
 
@@ -185,18 +192,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             post dispatch->experts->combine preprocess
         """
         dispatched_probs = node.layer_state.dispatched_probs
-        token_dispatcher = layer.mlp.token_dispatcher
+        metadata = layer.mlp.token_dispatcher.metadata
         if enable_deepep or enable_hybridep or enable_ncclep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
-            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
+            metadata.dispatched_probs = dispatched_probs
 
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep or enable_ncclep:
-            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
+            tokens_per_expert = metadata.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
         if layer.recompute_pre_mlp_layernorm:

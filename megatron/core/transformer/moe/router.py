@@ -857,6 +857,19 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
+        if self.config.moe_router_force_hotspot_ratio > 0.0:
+            # Benchmark hook: force a controlled fraction of tokens toward the first
+            # EP rank so ECHO can be evaluated without waiting for organic hotspots.
+            num_experts = logits.size(-1)
+            original_shape = logits.shape
+            flattened_logits = logits.reshape(-1, num_experts).clone()
+            num_hotspot_tokens = int(
+                flattened_logits.size(0) * self.config.moe_router_force_hotspot_ratio
+            )
+            experts_per_ep_rank = num_experts // self.config.expert_model_parallel_size
+            flattened_logits[:num_hotspot_tokens, :experts_per_ep_rank] += 1.0e4
+            logits = flattened_logits.reshape(original_shape)
+
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks
             logits = apply_biased_logits(
