@@ -2568,11 +2568,14 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
     # virtual_microbatch_id in [0, total_num_microbatches)
 
     config = get_model_config(model[0])
-    if p2p_communicator is None and pg_collection is None:
-        p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
+    if config.overlap_moe_expert_parallel_comm:
+        raise ValueError(
+            "chunkpipe does not currently support overlap_moe_expert_parallel_comm; "
+            "disable one of these options"
         )
+    if p2p_communicator is None and pg_collection is None:
         pg_collection = _build_default_pg_collection()
+        p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=config)
         tp_group = pg_collection.tp
         cp_group = pg_collection.cp
         cp_size = cp_group.size()
@@ -3259,32 +3262,22 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 synchronized_model_chunks.add(grad_sync_chunk_id)
         disable_grad_sync()
 
-    def backward_step_helper(virtual_microbatch_id):
-        """Helper method to run backward step with model split into chunks"""
-        nonlocal output_tensor_grads
-        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
-        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=False)
-        chunk_id = get_sequence_id_in_microbatch(virtual_microbatch_id, forward=False)
-        chunkpipe_backward_microbatch = microbatch_id * num_chunks + chunk_id
+    def prepare_backward_chunk_state(
+        model_chunk_id, chunk_id, chunkpipe_backward_microbatch, backward_microbatch
+    ):
+        """Set block/config state before a chunkpipe backward step."""
+        if not config.enable_chunkpipe:
+            return None
 
-        (
-            input_tensor,
-            output_tensor,
-            output_tensor_grad,
-            backward_microbatch,
-        ) = backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id)
-
-        # chunkpipe needs the current chunk written back into the block config
-        if config.enable_chunkpipe:
-            decoder = get_attr_wrapped_model(model[model_chunk_id], 'decoder')
-            decoder.update_config(
-                False,
-                backward_microbatch
-                if is_sft_chunkpipe
-                else chunkpipe_backward_microbatch,
-            )
-            if not is_sft_chunkpipe:
-                config.chunkpipe_chunk_idx_in_group = chunk_id
+        decoder = get_attr_wrapped_model(model[model_chunk_id], 'decoder')
+        decoder.update_config(
+            False,
+            backward_microbatch
+            if is_sft_chunkpipe
+            else chunkpipe_backward_microbatch,
+        )
+        if not is_sft_chunkpipe:
+            config.chunkpipe_chunk_idx_in_group = chunk_id
 
         chunk_info = None
         if is_sft_chunkpipe:
@@ -3292,9 +3285,16 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             if chunk_info is not None:
                 config.chunkpipe_chunk_idx_in_group = chunk_info[0]
                 config.chunkpipe_current_group_size = chunk_info[1]
+        return chunk_info
 
-        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-
+    def cleanup_backward_chunk(
+        model_chunk_id,
+        chunk_id,
+        backward_microbatch,
+        chunkpipe_backward_microbatch,
+        chunk_info,
+    ):
+        """Release chunkpipe KV cache after a backward step."""
         if is_sft_chunkpipe and chunk_info is not None:
             chunk_idx, group_size = chunk_info
             group_id = None
@@ -3320,7 +3320,6 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                             model[model_chunk_id], cache_microbatch, config.mtp_num_layers
                         )
         else:
-            # Pretrain or a missing SFT lookup uses the immediate chunk id.
             remove_key_value_cache(
                 model[model_chunk_id],
                 backward_microbatch
@@ -3328,6 +3327,38 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 else chunkpipe_backward_microbatch,
                 config.mtp_num_layers,
             )
+
+    def backward_step_helper(virtual_microbatch_id):
+        """Helper method to run backward step with model split into chunks"""
+        nonlocal output_tensor_grads
+        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=False)
+        chunk_id = get_sequence_id_in_microbatch(virtual_microbatch_id, forward=False)
+        chunkpipe_backward_microbatch = microbatch_id * num_chunks + chunk_id
+
+        (
+            input_tensor,
+            output_tensor,
+            output_tensor_grad,
+            backward_microbatch,
+        ) = backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id)
+
+        chunk_info = prepare_backward_chunk_state(
+            model_chunk_id,
+            chunk_id,
+            chunkpipe_backward_microbatch,
+            backward_microbatch,
+        )
+
+        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+
+        cleanup_backward_chunk(
+            model_chunk_id,
+            chunk_id,
+            backward_microbatch,
+            chunkpipe_backward_microbatch,
+            chunk_info,
+        )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -4168,10 +4199,8 @@ def forward_backward_pipelining_without_interleaving(
 
     if p2p_communicator is None and pg_collection is None:
         # Default: single-module with parallel_state groups
-        p2p_communicator = P2PCommunicator(
-            pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
-        )
         pg_collection = _build_default_pg_collection()
+        p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=config)
         tp_group = pg_collection.tp
         cp_group = pg_collection.cp
         cp_size = cp_group.size()
