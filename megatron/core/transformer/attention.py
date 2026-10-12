@@ -1997,6 +1997,14 @@ class Attention(MegatronModule, ABC):
             key, value, attention_mask = self.concat_cached_chunk_key_value(
                 key, value, attention_mask
             )
+            if not self.config.sft_chunkpipe_mode or (
+                self.config.chunkpipe_current_group_size > 1
+                and self.config.chunkpipe_chunk_idx_in_group > 0
+            ):
+                # GQA with asymmetric Q/K lengths requires bottom-right causal
+                # alignment; THD padding masks are not accepted in that case.
+                attn_mask_type = AttnMaskType.causal_bottom_right
+                packed_seq_params = None
 
         # ==================================
         # core attention computation

@@ -835,6 +835,7 @@ def forward_backward_no_pipelining_with_chunkpipe(
                 config.chunkpipe_forward = True
                 for chunk_index in range(config.chunk_num_per_seq):
                     config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+                    config.chunkpipe_chunk_idx_in_group = chunk_index
                     output_tensor, num_tokens = forward_step(
                         forward_step_func,
                         data_iterator,
@@ -861,6 +862,9 @@ def forward_backward_no_pipelining_with_chunkpipe(
                     for chunk_index in range(config.chunk_num_per_seq):
                         output_and_microbatch = chunk_losses.pop()
                         config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                        config.chunkpipe_chunk_idx_in_group = (
+                            config.chunk_num_per_seq - 1 - chunk_index
+                        )
                         backward_step(
                             input_tensor, output_and_microbatch[0], output_tensor_grad, config
                         )
@@ -879,6 +883,7 @@ def forward_backward_no_pipelining_with_chunkpipe(
         config.chunkpipe_forward = True
         for chunk_index in range(config.chunk_num_per_seq):
             config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            config.chunkpipe_chunk_idx_in_group = chunk_index
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -904,6 +909,9 @@ def forward_backward_no_pipelining_with_chunkpipe(
             for chunk_index in range(config.chunk_num_per_seq):
                 output_and_microbatch = chunk_losses.pop()
                 config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                config.chunkpipe_chunk_idx_in_group = (
+                    config.chunk_num_per_seq - 1 - chunk_index
+                )
                 backward_step(input_tensor, output_and_microbatch[0], output_tensor_grad, config)
 
                 # remove caches for key & values
@@ -3067,7 +3075,10 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                     # get_batch writes the true group size while forward_step runs;
                     # until then conservatively expose this as the first chunk.
                     config.chunkpipe_chunk_idx_in_group = 0
+            else:
+                config.chunkpipe_chunk_idx_in_group = chunk_id
 
+        parallel_state.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -3234,6 +3245,8 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 if is_sft_chunkpipe
                 else chunkpipe_backward_microbatch,
             )
+            if not is_sft_chunkpipe:
+                config.chunkpipe_chunk_idx_in_group = chunk_id
 
         chunk_info = None
         if is_sft_chunkpipe:
@@ -4678,6 +4691,10 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         config.chunkpipe_forward = True
         if is_sft_chunkpipe:
             set_sft_forward_chunk_state(chunkpipe_forward_microbatch)
+        else:
+            config.chunkpipe_chunk_idx_in_group = (
+                chunkpipe_forward_microbatch % config.chunk_num_per_seq
+            )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -4747,6 +4764,10 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
         config.chunkpipe_forward = True
         if is_sft_chunkpipe:
             set_sft_forward_chunk_state(chunkpipe_forward_microbatch)
+        else:
+            config.chunkpipe_chunk_idx_in_group = (
+                chunkpipe_forward_microbatch % config.chunk_num_per_seq
+            )
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -4827,6 +4848,10 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
                 config.chunkpipe_current_group_size = group_size_cache.get(
                     backward_group_id, config.chunk_num_per_seq
                 )
+            else:
+                config.chunkpipe_chunk_idx_in_group = (
+                    config.chunkpipe_backward_microbatch % config.chunk_num_per_seq
+                )
 
             input_tensor_grad = backward_func(
                 tmp_tuple[0], tmp_tuple[1], output_tensor_grad, config
@@ -4882,6 +4907,10 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
                 )
                 config.chunkpipe_current_group_size = group_size_cache.get(
                     backward_group_id, config.chunk_num_per_seq
+                )
+            else:
+                config.chunkpipe_chunk_idx_in_group = (
+                    config.chunkpipe_backward_microbatch % config.chunk_num_per_seq
                 )
 
             input_tensor_grad = backward_func(
