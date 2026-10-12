@@ -404,6 +404,27 @@ class MultiLatentAttention(Attention):
                 self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed
                 self.key_pos_emb_cache[pos_cache_indices, :, :k_pos_emb_head_num, :] = k_pos_emb
 
+    def check_kv_cache_grad_consumed(self):
+        """Assert all MLA chunk-cache gradients were consumed for a group.
+
+        MLA accumulates gradients for cached compressed KV and key position
+        embeddings instead of the base attention's key/value caches.
+        """
+        if getattr(self, "kv_compressed_cache_grad", None):
+            orphan_keys = sorted(self.kv_compressed_cache_grad)
+            self.kv_compressed_cache_grad.clear()
+            raise AssertionError(
+                f"Orphan MLA kv_compressed_cache_grad entries {orphan_keys} remain "
+                f"after chunkpipe group backward; layer={self.layer_number}"
+            )
+        if getattr(self, "key_pos_emb_cache_grad", None):
+            orphan_keys = sorted(self.key_pos_emb_cache_grad)
+            self.key_pos_emb_cache_grad.clear()
+            raise AssertionError(
+                f"Orphan MLA key_pos_emb_cache_grad entries {orphan_keys} remain "
+                f"after chunkpipe group backward; layer={self.layer_number}"
+            )
+
     def recover_key_value_up_proj_tensors(self, normed_kv_compressed, k_pos_emb):
         """Recover full key and value tensors from compressed representations.
 
