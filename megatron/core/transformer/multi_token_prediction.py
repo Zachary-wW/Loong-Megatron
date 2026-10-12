@@ -1087,7 +1087,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         # For chunkpipe, rolling and truncation are handled by the caller
         # (MultiTokenPredictionBlock.forward) to preserve the full sequence
-        # with next-batch tokens across MTP layers.
+        # with bridge tokens across MTP layers.
         if not getattr(self.config, 'enable_chunkpipe', False):
             # Calc logits for the current Multi-Token Prediction (MTP) layers.
             input_ids, _ = roll_tensor(
@@ -1510,10 +1510,15 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         recompute_for_chunkpipe = False
         if self.config.enable_chunkpipe:
-            chunk_num = (
-                self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
-            )
-            if chunk_num + self.config.keep_activations_chunks < self.config.chunk_num_per_seq:
+            if getattr(self.config, 'sft_chunkpipe_mode', False):
+                chunk_num = self.config.chunkpipe_chunk_idx_in_group
+                effective_group = self.config.chunkpipe_current_group_size
+            else:
+                chunk_num = (
+                    self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
+                )
+                effective_group = self.config.chunk_num_per_seq
+            if chunk_num + self.config.keep_activations_chunks < effective_group:
                 recompute_for_chunkpipe = True
 
         if (self.config.recompute_granularity == 'full' or recompute_for_chunkpipe) and self.training:
@@ -1843,32 +1848,41 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = hidden_states.detach()
 
         # For chunkpipe, manage rolling at the block level to preserve the full
-        # input_ids (with appended next-batch tokens) across MTP layers: each
+        # input_ids (with appended bridge tokens) across MTP layers: each
         # iteration rolls the full copy left by 1, then truncates to chunksize
         # for that layer's embedding, while keeping the full rolled version for
         # the next iteration so subsequent rolls chain correctly.
         if getattr(self.config, 'enable_chunkpipe', False):
             full_input_ids = input_ids
             full_position_ids = position_ids
+            # SFT preprocessing may append bridge tokens beyond the base chunk.
+            # packed_seq_params only describes the base chunk, so treating the
+            # bridge suffix as a separate packed sequence would leave it unrolled.
+            roll_packed_seq_params = packed_seq_params
+            if (
+                getattr(self.config, 'sft_chunkpipe_mode', False)
+                and full_input_ids.size(-1) > self.config.chunksize
+            ):
+                roll_packed_seq_params = None
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 
             if getattr(self.config, 'enable_chunkpipe', False):
-                # Roll the full sequence (including next-batch tokens) left by 1.
+                # Roll the full sequence (including bridge tokens) left by 1.
                 full_input_ids, _ = roll_tensor(
                     full_input_ids,
                     shifts=-1,
                     dims=-1,
                     cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
+                    packed_seq_params=roll_packed_seq_params,
                 )
                 full_position_ids, _ = roll_tensor(
                     full_position_ids,
                     shifts=-1,
                     dims=-1,
                     cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
+                    packed_seq_params=roll_packed_seq_params,
                 )
                 # Truncate to chunksize for this layer's embedding. Clone so the
                 # downstream layers cannot corrupt full_input_ids in place.

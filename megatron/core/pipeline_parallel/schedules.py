@@ -383,9 +383,19 @@ def forward_step_calc_loss(
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
             if getattr(config, 'enable_chunkpipe', False):
-                MTPLossAutoScaler.set_loss_scale(
-                    loss_scale / (num_microbatches / config.chunk_num_per_seq)
-                )
+                if getattr(config, 'sft_chunkpipe_mode', False):
+                    step_num_groups = getattr(config, 'chunkpipe_step_num_groups', None)
+                    assert step_num_groups is not None and step_num_groups > 0, (
+                        "SFT chunkpipe MTP scaling requires chunkpipe_step_num_groups > 0"
+                    )
+                    dp_size = parallel_state.get_data_parallel_world_size()
+                    MTPLossAutoScaler.set_loss_scale(
+                        loss_scale * dp_size / step_num_groups
+                    )
+                else:
+                    MTPLossAutoScaler.set_loss_scale(
+                        loss_scale / (num_microbatches / config.chunk_num_per_seq)
+                    )
             else:
                 MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
