@@ -441,7 +441,7 @@ class TopKRouter(Router):
                     total_num_tokens = (
                         local_num_tokens
                         * self.tp_cp_group.size()
-                        * self.config.chunk_num_per_seq
+                        * self._chunkpipe_effective_group()
                     )
 
         aux_loss = switch_load_balancing_loss_func(
@@ -530,7 +530,20 @@ class TopKRouter(Router):
         return probs
 
     def _chunkpipe_microbatch_key(self):
-        """Index of the sequence (original microbatch) the current chunk belongs to."""
+        """Index identifying the group the current chunk belongs to.
+
+        Pretrain: the sequence index, derived from the global chunk counter
+        (every group has chunk_num_per_seq chunks). SFT: groups have varying
+        sizes, so the scheduler publishes the chunk index and the key is the
+        counter minus that index.
+        """
+        if self.config.sft_chunkpipe_mode:
+            counter = (
+                self.config.chunkpipe_forward_microbatch
+                if self.config.chunkpipe_forward
+                else self.config.chunkpipe_backward_microbatch
+            )
+            return counter - self.config.chunkpipe_chunk_idx_in_group
         chunk_num = self.config.chunk_num_per_seq
         if self.config.chunkpipe_forward:
             return self.config.chunkpipe_forward_microbatch // chunk_num
@@ -538,10 +551,23 @@ class TopKRouter(Router):
 
     def _chunkpipe_chunk_index(self):
         """Index of the current chunk within its sequence."""
+        if self.config.sft_chunkpipe_mode:
+            return self.config.chunkpipe_chunk_idx_in_group
         chunk_num = self.config.chunk_num_per_seq
         if self.config.chunkpipe_forward:
             return self.config.chunkpipe_forward_microbatch % chunk_num
         return self.config.chunkpipe_backward_microbatch % chunk_num
+
+    def _chunkpipe_effective_group(self):
+        """Number of chunks in the group currently being processed.
+
+        Pretrain groups all hold chunk_num_per_seq chunks; SFT groups vary
+        (1 for binpacked samples, >1 for long sequences) and are published by
+        the scheduler.
+        """
+        if self.config.sft_chunkpipe_mode:
+            return self.config.chunkpipe_current_group_size
+        return self.config.chunk_num_per_seq
 
     def _accumulate_chunkpipe_tokens_per_expert(self, routing_map, seq_length, bsz):
         """Accumulate tokens_per_expert across the chunks of one sequence.
@@ -554,8 +580,14 @@ class TopKRouter(Router):
         """
         chunk_num = self.config.chunk_num_per_seq
         chunkpipe_fwd_mb = self.config.chunkpipe_forward_microbatch
-        chunk_index = chunkpipe_fwd_mb % chunk_num
-        microbatch_key = chunkpipe_fwd_mb // chunk_num
+        if self.config.sft_chunkpipe_mode:
+            # SFT: the scheduler publishes the chunk index directly.
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            microbatch_key = chunkpipe_fwd_mb - chunk_index
+        else:
+            # Pretrain: derive from the global counter (all groups same size).
+            chunk_index = chunkpipe_fwd_mb % chunk_num
+            microbatch_key = chunkpipe_fwd_mb // chunk_num
 
         tokens_per_expert_chunk = routing_map.reshape(seq_length, -1).sum(dim=0)
 
@@ -613,7 +645,7 @@ class TopKRouter(Router):
         the full-sequence tokens_per_expert (detached), and the partial losses
         sum back to the non-chunked loss.
         """
-        chunk_num = self.config.chunk_num_per_seq
+        effective_group = self._chunkpipe_effective_group()
         scores_chunk = scores_for_aux_loss.reshape(seq_length, -1)
 
         full_tokens_per_expert = self._take_chunkpipe_full_tokens_per_expert()
@@ -626,7 +658,7 @@ class TopKRouter(Router):
         full_tokens_per_expert = full_tokens_per_expert.detach()
 
         # Full-sequence parameters for correct scaling.
-        full_seq_length = seq_length * chunk_num
+        full_seq_length = seq_length * effective_group
         total_num_tokens = full_seq_length * self.tp_cp_group.size()
 
         aux_loss = (
@@ -687,9 +719,9 @@ class TopKRouter(Router):
                     total_num_tokens = (
                         local_num_tokens
                         * self.tp_dp_cp_group.size()
-                        * self.config.chunk_num_per_seq
+                        * self._chunkpipe_effective_group()
                     )
-            if self._chunkpipe_chunk_index() == self.config.chunk_num_per_seq - 1:
+            if self._chunkpipe_chunk_index() == self._chunkpipe_effective_group() - 1:
                 self.global_tokens_per_expert += global_tokens_per_expert
                 self.ga_steps += 1
         else:
@@ -758,6 +790,20 @@ class TopKRouter(Router):
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
+        effective_group = (
+            self.config.chunkpipe_current_group_size
+            if self.config.sft_chunkpipe_mode
+            else self.config.chunk_num_per_seq
+        )
+        # In SFT, the data iterator already emits chunk-level microbatches, so
+        # the tracker's loss scale is chunk-inflated. Scale the logged partial
+        # loss back by the current group size. In pretrain, the tracker is not
+        # chunk-inflated, so the raw partial loss is the correct logged value.
+        log_loss = (
+            aux_loss * effective_group
+            if self.config.enable_chunkpipe and self.config.sft_chunkpipe_mode
+            else aux_loss
+        )
         if self.is_mtp_layer:
             layer_number = self.layer_number + self.config.num_layers
         else:
@@ -765,19 +811,17 @@ class TopKRouter(Router):
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
-            aux_loss / aux_loss_coeff,
+            log_loss / aux_loss_coeff,
             layer_number,
             num_layers,
             reduce_group=reduce_group,
             needs_dp_avg=needs_dp_avg,
         )
 
-        # Chunkpipe computes a partial aux loss per chunk; the logging tracker
-        # scales by 1/get_num_microbatches() (not chunk-inflated), so multiply
-        # back by the chunk count to keep the unscaled per-chunk partial losses
-        # summing correctly across chunks and sequences.
+        # Each chunk carries only part of the full-sequence token count. Scale
+        # the gradient contribution by the current group size in both modes.
         if self.config.enable_chunkpipe:
-            aux_loss = aux_loss * self.config.chunk_num_per_seq
+            aux_loss = aux_loss * effective_group
 
         if self.calculate_per_token_loss:
             # Target final scaling on aux_loss gradients: 1 / (num_micro_batches * dp_size),

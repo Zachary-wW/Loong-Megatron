@@ -307,10 +307,29 @@ class MultiLatentAttention(Attention):
         dtype = next(self.parameters()).dtype
 
         total_cache_tokens = self.kv_cache_chunk_size * self.config.chunksize
-        kv_cache_shape = (total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
-                          self.config.micro_batch_size, self.config.kv_lora_rank)
-        k_pos_emb_cache_shape = (total_cache_tokens, self.config.micro_batch_size,
-                                 self.num_attention_heads_per_partition, self.config.qk_pos_emb_head_dim)
+        if self.config.sft_chunkpipe_mode:
+            # SFT packed sequences have no batch dimension.
+            kv_cache_shape = (
+                total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
+                self.config.kv_lora_rank,
+            )
+            k_pos_emb_cache_shape = (
+                total_cache_tokens,
+                self.num_attention_heads_per_partition,
+                self.config.qk_pos_emb_head_dim,
+            )
+        else:
+            kv_cache_shape = (
+                total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
+                self.config.micro_batch_size,
+                self.config.kv_lora_rank,
+            )
+            k_pos_emb_cache_shape = (
+                total_cache_tokens,
+                self.config.micro_batch_size,
+                self.num_attention_heads_per_partition,
+                self.config.qk_pos_emb_head_dim,
+            )
 
         self.kv_compressed_cache = torch.zeros(kv_cache_shape, device=device, dtype=dtype)
         self.key_pos_emb_cache = torch.zeros(k_pos_emb_cache_shape, device=device, dtype=dtype)
@@ -323,9 +342,11 @@ class MultiLatentAttention(Attention):
 
         Args:
             normed_kv_compressed (Tensor): Normalized compressed key-value tensor
-                with shape [chunksize, batch_size, kv_lora_rank]
+                with shape [chunksize, batch_size, kv_lora_rank] in pretrain, or
+                [chunksize, kv_lora_rank] in SFT packed-sequence mode
             k_pos_emb (Tensor): Key positional embeddings with shape
-                [chunksize, batch_size, 1, qk_pos_emb_head_dim]
+                [chunksize, batch_size, 1, qk_pos_emb_head_dim] in pretrain, or
+                [chunksize, 1, qk_pos_emb_head_dim] in SFT packed-sequence mode
 
         Raises:
             RuntimeError: If chunkpipe is not enabled in config
@@ -334,9 +355,16 @@ class MultiLatentAttention(Attention):
         if not self.config.enable_chunkpipe:
             raise RuntimeError("Chunk key-value cache operations require chunkpipe to be enabled.")
 
-        # Skip caching during backward pass or for last chunk in sequence
-        if not self.config.chunkpipe_forward or \
-           (self.config.chunkpipe_forward_microbatch + 1) % self.num_chunks_per_seq == 0:
+        # Skip caching during backward pass or for the last chunk in the group.
+        if not self.config.chunkpipe_forward:
+            return
+        if self.config.sft_chunkpipe_mode:
+            if (
+                self.config.chunkpipe_chunk_idx_in_group
+                >= self.config.chunkpipe_current_group_size - 1
+            ):
+                return
+        elif (self.config.chunkpipe_forward_microbatch + 1) % self.num_chunks_per_seq == 0:
             return
 
         if not self.empty_chunk_indices:
@@ -353,17 +381,28 @@ class MultiLatentAttention(Attention):
 
         # When the 3rd dim of k_pos_emb is smaller than the cache, only write to
         # the first corresponding indices.
-        k_pos_emb_head_num = k_pos_emb.size(2)
-        if self.is_enable_grad_chunkpipe():
-            # detach kv compressed tensors that enter the KV cache to prevent gradient tracking
-            # of the same computational graph twice, which will result in runtime exception
-            self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed.clone().detach()
-            self.key_pos_emb_cache[
-                pos_cache_indices, :, :k_pos_emb_head_num, :
-            ] = k_pos_emb.clone().detach()
+        if self.config.sft_chunkpipe_mode:
+            k_pos_emb_head_num = k_pos_emb.size(1)
+            if self.is_enable_grad_chunkpipe():
+                self.kv_compressed_cache[kv_cache_indices] = normed_kv_compressed.clone().detach()
+                self.key_pos_emb_cache[
+                    pos_cache_indices, :k_pos_emb_head_num, :
+                ] = k_pos_emb.clone().detach()
+            else:
+                self.kv_compressed_cache[kv_cache_indices] = normed_kv_compressed
+                self.key_pos_emb_cache[pos_cache_indices, :k_pos_emb_head_num, :] = k_pos_emb
         else:
-            self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed
-            self.key_pos_emb_cache[pos_cache_indices, :, :k_pos_emb_head_num, :] = k_pos_emb
+            k_pos_emb_head_num = k_pos_emb.size(2)
+            if self.is_enable_grad_chunkpipe():
+                self.kv_compressed_cache[kv_cache_indices, :, :] = (
+                    normed_kv_compressed.clone().detach()
+                )
+                self.key_pos_emb_cache[
+                    pos_cache_indices, :, :k_pos_emb_head_num, :
+                ] = k_pos_emb.clone().detach()
+            else:
+                self.kv_compressed_cache[kv_cache_indices, :, :] = normed_kv_compressed
+                self.key_pos_emb_cache[pos_cache_indices, :, :k_pos_emb_head_num, :] = k_pos_emb
 
     def recover_key_value_up_proj_tensors(self, normed_kv_compressed, k_pos_emb):
         """Recover full key and value tensors from compressed representations.
@@ -419,9 +458,11 @@ class MultiLatentAttention(Attention):
         Args:
             attention_mask (Tensor): Attention mask tensor for the current chunk
             curr_key (Tensor): Current chunk's key tensor with shape
-                [chunksize, batch_size, num_heads, head_dim]
+                [chunksize, batch_size, num_heads, head_dim] in pretrain, or
+                [chunksize, num_heads, head_dim] in SFT packed-sequence mode
             curr_value (Tensor): Current chunk's value tensor with shape
-                [chunksize, batch_size, num_heads, head_dim]
+                [chunksize, batch_size, num_heads, head_dim] in pretrain, or
+                [chunksize, num_heads, head_dim] in SFT packed-sequence mode
 
         Returns:
             tuple: (concatenated_key, concatenated_value, adjusted_mask)
@@ -443,7 +484,10 @@ class MultiLatentAttention(Attention):
         is_forward = self.config.chunkpipe_forward
         microbatch_idx = (self.config.chunkpipe_forward_microbatch if is_forward
                          else self.config.chunkpipe_backward_microbatch)
-        current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
+        if self.config.sft_chunkpipe_mode:
+            current_chunk_idx = self.config.chunkpipe_chunk_idx_in_group
+        else:
+            current_chunk_idx = microbatch_idx % self.num_chunks_per_seq
         start_microbatch_idx = microbatch_idx - current_chunk_idx
 
         # Initialize lists to store retrieved cache data
@@ -452,13 +496,43 @@ class MultiLatentAttention(Attention):
 
         # Calculate total sequence length after concatenation
         total_concatenated_tokens = (current_chunk_idx + 1) * self.config.chunksize
-        concatenated_key_shape = (total_concatenated_tokens, self.config.micro_batch_size,
-                      self.num_attention_heads_per_partition, self.key_hidden_size)
-        concatenated_value_shape = (total_concatenated_tokens, self.config.micro_batch_size,
-                      self.num_attention_heads_per_partition, self.config.v_head_dim)
-        if self.padding_v_head_dim:
-            concatenated_value_shape = (total_concatenated_tokens, self.config.micro_batch_size,
-                      self.num_attention_heads_per_partition, self.key_hidden_size)
+        if self.config.sft_chunkpipe_mode:
+            concatenated_key_shape = (
+                total_concatenated_tokens,
+                self.num_attention_heads_per_partition,
+                self.key_hidden_size,
+            )
+            concatenated_value_shape = (
+                total_concatenated_tokens,
+                self.num_attention_heads_per_partition,
+                self.config.v_head_dim,
+            )
+            if self.padding_v_head_dim:
+                concatenated_value_shape = (
+                    total_concatenated_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.key_hidden_size,
+                )
+        else:
+            concatenated_key_shape = (
+                total_concatenated_tokens,
+                self.config.micro_batch_size,
+                self.num_attention_heads_per_partition,
+                self.key_hidden_size,
+            )
+            concatenated_value_shape = (
+                total_concatenated_tokens,
+                self.config.micro_batch_size,
+                self.num_attention_heads_per_partition,
+                self.config.v_head_dim,
+            )
+            if self.padding_v_head_dim:
+                concatenated_value_shape = (
+                    total_concatenated_tokens,
+                    self.config.micro_batch_size,
+                    self.num_attention_heads_per_partition,
+                    self.key_hidden_size,
+                )
 
         # Initialize zero tensors for concatenated key and value of previous and current chunk
         concatenated_key = torch.zeros(concatenated_key_shape,
@@ -505,8 +579,12 @@ class MultiLatentAttention(Attention):
             pos_indices = torch.arange(self.config.chunksize) + (cache_chunk_idx * self.config.chunksize)
 
             # Retrieve compressed KV and positional embeddings from cache
-            cached_kv_compressed.append(self.kv_compressed_cache[kv_indices, :, :])
-            cached_key_pos_emb.append(self.key_pos_emb_cache[pos_indices, :, :, :])
+            if self.config.sft_chunkpipe_mode:
+                cached_kv_compressed.append(self.kv_compressed_cache[kv_indices])
+                cached_key_pos_emb.append(self.key_pos_emb_cache[pos_indices])
+            else:
+                cached_kv_compressed.append(self.kv_compressed_cache[kv_indices, :, :])
+                cached_key_pos_emb.append(self.key_pos_emb_cache[pos_indices, :, :, :])
 
             # Set up gradient hooks for backward pass
             if self.is_enable_grad_chunkpipe():
@@ -522,17 +600,17 @@ class MultiLatentAttention(Attention):
             )
 
             # Concatenate along sequence dimension
-            concatenated_key[current_pos : current_pos + self.config.chunksize, :, :, :] = \
-                cached_key
-            concatenated_value[current_pos : current_pos + self.config.chunksize, :, :, :] = \
-                cached_value
+            concatenated_key[
+                current_pos : current_pos + self.config.chunksize
+            ] = cached_key
+            concatenated_value[
+                current_pos : current_pos + self.config.chunksize
+            ] = cached_value
             current_pos += self.config.chunksize
 
         # Add the current chunk's keys and values to the concatenated result
-        concatenated_key[current_pos : current_pos + self.config.chunksize, :, :, :] = \
-            curr_key
-        concatenated_value[current_pos : current_pos + self.config.chunksize, :, :, :] = \
-            curr_value
+        concatenated_key[current_pos : current_pos + self.config.chunksize] = curr_key
+        concatenated_value[current_pos : current_pos + self.config.chunksize] = curr_value
 
         # Adjust attention mask for autoregressive (causal) attention
         adjusted_mask = None
@@ -655,15 +733,32 @@ class MultiLatentAttention(Attention):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 with core_attn_manager as query:
-                    core_attn_out = self._run_core_attention(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        packed_seq_params=packed_seq_params,
-                        attn_mask_type=attn_mask_type,
-                        **core_attention_extra_kwargs,
-                    )
+                    if (
+                        self.config.sft_chunkpipe_mode
+                        and self.config.chunkpipe_current_group_size > 1
+                    ):
+                        # THD requires the padding mask type, while Flash
+                        # Attention rejects padding_causal when Q is shorter
+                        # than K. Use SBHD with bottom-right alignment instead.
+                        core_attn_out = self._run_core_attention(
+                            query.unsqueeze(1),
+                            key.unsqueeze(1),
+                            value.unsqueeze(1),
+                            attention_mask,
+                            packed_seq_params=None,
+                            attn_mask_type=AttnMaskType.causal_bottom_right,
+                            **core_attention_extra_kwargs,
+                        )
+                    else:
+                        core_attn_out = self._run_core_attention(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            packed_seq_params=packed_seq_params,
+                            attn_mask_type=attn_mask_type,
+                            **core_attention_extra_kwargs,
+                        )
             elif self.cache_mla_latents:
                 value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
                     self, query, value, packed_seq_params
@@ -706,11 +801,13 @@ class MultiLatentAttention(Attention):
                 core_attn_out, need_v_pad, orig_v_dim, padded_v_dim
             )
 
-        if thd_packed_seq:
-            # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn)
-            # t is the pack size = sum (sq_i)
-            # note that batch is a dummy dimension in the packed case
+        if thd_packed_seq or (
+            self.config.sft_chunkpipe_mode and self.config.chunkpipe_current_group_size > 1
+        ):
+            # reshape to same output shape as unpacked case:
+            # THD: (t, np, hn) -> (t, b=1, h=np*hn)
+            # SFT multi-chunk SBHD: (t, 1, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i); batch is a dummy dimension.
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
         if self.recompute_up_proj:
@@ -1090,13 +1187,16 @@ class MLASelfAttention(MultiLatentAttention):
         # Calculate position embedding offset for chunkpipe
         pos_emb_offset = 0
         if self.config.enable_chunkpipe:
-            ck_fwd_mic = (
-                self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
-            )
-            if not self.config.chunkpipe_forward:
+            if self.config.sft_chunkpipe_mode:
+                ck_fwd_mic = self.config.chunkpipe_chunk_idx_in_group
+            else:
                 ck_fwd_mic = (
-                    self.config.chunkpipe_backward_microbatch % self.config.chunk_num_per_seq
+                    self.config.chunkpipe_forward_microbatch % self.config.chunk_num_per_seq
                 )
+                if not self.config.chunkpipe_forward:
+                    ck_fwd_mic = (
+                        self.config.chunkpipe_backward_microbatch % self.config.chunk_num_per_seq
+                    )
             pos_emb_offset = ck_fwd_mic * self.config.chunksize
 
         # rotary_pos_emb:[s, b, 1, 64]
@@ -1376,10 +1476,20 @@ class MLASelfAttention(MultiLatentAttention):
                     Hook function to combine compressed KV gradients of loss of subsequent chunk
                     with respect to that of current chunk.
                     """
-                    chunks_in_current_sequence = (
-                        self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
-                    )
-                    if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                    if self.config.sft_chunkpipe_mode:
+                        chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                        is_last = (
+                            chunks_in_current_sequence
+                            >= self.config.chunkpipe_current_group_size - 1
+                        )
+                    else:
+                        chunks_in_current_sequence = (
+                            self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                        )
+                        is_last = (
+                            chunks_in_current_sequence == self.num_chunks_per_seq - 1
+                        )
+                    if is_last:
                         return grad
                     else:
                         grad_from_prev_chunk = self.kv_compressed_cache_grad.pop(
@@ -1392,10 +1502,20 @@ class MLASelfAttention(MultiLatentAttention):
                     Hook function to combine gradient of loss of current chunk
                     with respect to key position embeddings of previous chunks.
                     """
-                    chunks_in_current_sequence = (
-                        self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
-                    )
-                    if chunks_in_current_sequence == self.num_chunks_per_seq - 1:
+                    if self.config.sft_chunkpipe_mode:
+                        chunks_in_current_sequence = self.config.chunkpipe_chunk_idx_in_group
+                        is_last = (
+                            chunks_in_current_sequence
+                            >= self.config.chunkpipe_current_group_size - 1
+                        )
+                    else:
+                        chunks_in_current_sequence = (
+                            self.config.chunkpipe_backward_microbatch % self.num_chunks_per_seq
+                        )
+                        is_last = (
+                            chunks_in_current_sequence == self.num_chunks_per_seq - 1
+                        )
+                    if is_last:
                         return grad
                     else:
                         grad_from_prev_chunk = self.key_pos_emb_cache_grad.pop(

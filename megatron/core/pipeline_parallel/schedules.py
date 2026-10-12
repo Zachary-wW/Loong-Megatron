@@ -802,10 +802,10 @@ def forward_backward_no_pipelining_with_chunkpipe(
 ):
     """Run forward and backward passes with no pipeline parallelism under chunkpipe.
 
-    Each original microbatch is split into `config.chunk_num_per_seq` chunks which
-    are forwarded in order and backwarded in reverse order, so that the attention
-    KV cache of the earlier chunks of the same sequence is still resident when a
-    later chunk runs.
+    Pretrain uses a fixed number of chunks per sequence. SFT receives chunks from
+    the external data pipeline and discovers each group's size after its first
+    forward step; the scheduler then finishes that group and backwards it in
+    reverse order so earlier chunks' KV caches remain resident.
     """
     if pg_collection is None:
         pg_collection = _build_default_pg_collection()
@@ -822,94 +822,172 @@ def forward_backward_no_pipelining_with_chunkpipe(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
-    assert (
-        num_microbatches % config.chunk_num_per_seq == 0
-    ), "num microbatches should be divided by num chunks"
-    num_sequences = num_microbatches // config.chunk_num_per_seq
+    if not config.sft_chunkpipe_mode:
+        assert (
+            num_microbatches % config.chunk_num_per_seq == 0
+        ), "num microbatches should be divided by num chunks"
+        num_sequences = num_microbatches // config.chunk_num_per_seq
 
-    chunkpipe_forward_microbatch = 0
-    with no_sync_func():
-        for seq_index in range(num_sequences - 1):
-            chunk_losses = []
-            config.chunkpipe_forward = True
-            for chunk_index in range(config.chunk_num_per_seq):
-                config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
-                output_tensor, num_tokens = forward_step(
-                    forward_step_func,
-                    data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    pg_collection.cp.size(),
-                    collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(
-                        first_val_step, forward_only, chunkpipe_forward_microbatch == 0
-                    ),
-                    current_microbatch=chunkpipe_forward_microbatch,
-                )
-                total_num_tokens += num_tokens
-                output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
-                chunk_losses.append(output_and_microbatch)
-                chunkpipe_forward_microbatch += 1
-
-            # backward according to reverse direction of forward
-            if not forward_only:
-                config.chunkpipe_forward = False
+        chunkpipe_forward_microbatch = 0
+        with no_sync_func():
+            for seq_index in range(num_sequences - 1):
+                chunk_losses = []
+                config.chunkpipe_forward = True
                 for chunk_index in range(config.chunk_num_per_seq):
-                    output_and_microbatch = chunk_losses.pop()
-                    config.chunkpipe_backward_microbatch = output_and_microbatch[1]
-                    backward_step(
-                        input_tensor, output_and_microbatch[0], output_tensor_grad, config
+                    config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+                    output_tensor, num_tokens = forward_step(
+                        forward_step_func,
+                        data_iterator,
+                        model,
+                        num_microbatches,
+                        input_tensor,
+                        forward_data_store,
+                        config,
+                        pg_collection.cp.size(),
+                        collect_non_loss_data,
+                        is_first_microbatch=check_first_val_step(
+                            first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                        ),
+                        current_microbatch=chunkpipe_forward_microbatch,
                     )
+                    total_num_tokens += num_tokens
+                    output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+                    chunk_losses.append(output_and_microbatch)
+                    chunkpipe_forward_microbatch += 1
 
-                    # remove caches for key & values
-                    remove_key_value_cache(
-                        model, output_and_microbatch[1], config.mtp_num_layers
-                    )
-            else:
-                # clear keys & values cache
-                clear_key_value_cache(model, config.mtp_num_layers)
+                # backward according to reverse direction of forward
+                if not forward_only:
+                    config.chunkpipe_forward = False
+                    for chunk_index in range(config.chunk_num_per_seq):
+                        output_and_microbatch = chunk_losses.pop()
+                        config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                        backward_step(
+                            input_tensor, output_and_microbatch[0], output_tensor_grad, config
+                        )
 
-    # Run computation for last microbatch out of context handler (want to
-    # synchronize gradients).
-    chunk_losses = []
-    config.chunkpipe_forward = True
-    for chunk_index in range(config.chunk_num_per_seq):
-        config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            pg_collection.cp.size(),
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, chunkpipe_forward_microbatch == 0
-            ),
-            current_microbatch=chunkpipe_forward_microbatch,
-        )
-        total_num_tokens += num_tokens
-        output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
-        chunk_losses.append(output_and_microbatch)
-        chunkpipe_forward_microbatch += 1
+                        # remove caches for key & values
+                        remove_key_value_cache(
+                            model, output_and_microbatch[1], config.mtp_num_layers
+                        )
+                else:
+                    # clear keys & values cache
+                    clear_key_value_cache(model, config.mtp_num_layers)
 
-    if not forward_only:
-        config.chunkpipe_forward = False
+        # Run computation for last microbatch out of context handler (want to
+        # synchronize gradients).
+        chunk_losses = []
+        config.chunkpipe_forward = True
         for chunk_index in range(config.chunk_num_per_seq):
-            output_and_microbatch = chunk_losses.pop()
-            config.chunkpipe_backward_microbatch = output_and_microbatch[1]
-            backward_step(input_tensor, output_and_microbatch[0], output_tensor_grad, config)
+            config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                pg_collection.cp.size(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, chunkpipe_forward_microbatch == 0
+                ),
+                current_microbatch=chunkpipe_forward_microbatch,
+            )
+            total_num_tokens += num_tokens
+            output_and_microbatch = (output_tensor, chunkpipe_forward_microbatch)
+            chunk_losses.append(output_and_microbatch)
+            chunkpipe_forward_microbatch += 1
 
-            # remove caches for key & values
-            remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
+        if not forward_only:
+            config.chunkpipe_forward = False
+            for chunk_index in range(config.chunk_num_per_seq):
+                output_and_microbatch = chunk_losses.pop()
+                config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                backward_step(input_tensor, output_and_microbatch[0], output_tensor_grad, config)
+
+                # remove caches for key & values
+                remove_key_value_cache(model, output_and_microbatch[1], config.mtp_num_layers)
+        else:
+            # clear keys & values cache
+            clear_key_value_cache(model, config.mtp_num_layers)
     else:
-        # clear keys & values cache
-        clear_key_value_cache(model, config.mtp_num_layers)
+        chunkpipe_forward_microbatch = 0
+        microbatch_idx = 0
+        last_group_losses = None
+        last_group_size = 0
+
+        def _forward_one_chunk(chunk_idx_in_group: int, is_first_global: bool):
+            """Forward one SFT chunk and return its output and microbatch id."""
+            nonlocal chunkpipe_forward_microbatch, total_num_tokens
+            config.chunkpipe_forward = True
+            config.chunkpipe_forward_microbatch = chunkpipe_forward_microbatch
+            config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                pg_collection.cp.size(),
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, is_first_global
+                ),
+                current_microbatch=chunkpipe_forward_microbatch,
+            )
+            total_num_tokens += num_tokens
+            result = (output_tensor, chunkpipe_forward_microbatch)
+            chunkpipe_forward_microbatch += 1
+            return result
+
+        def _backward_group(chunk_losses: list, group_size: int):
+            """Backward one SFT chunk group in reverse forward order."""
+            config.chunkpipe_forward = False
+            for chunk_idx_in_group in reversed(range(group_size)):
+                output_and_microbatch = chunk_losses.pop()
+                config.chunkpipe_backward_microbatch = output_and_microbatch[1]
+                config.chunkpipe_chunk_idx_in_group = chunk_idx_in_group
+                backward_step(
+                    input_tensor, output_and_microbatch[0], output_tensor_grad, config
+                )
+                remove_key_value_cache(
+                    model, output_and_microbatch[1], config.mtp_num_layers
+                )
+
+        # The external SFT data pipeline writes chunkpipe_current_group_size while
+        # producing each group's first chunk. Forward that chunk before deriving
+        # how many chunks belong to the current group.
+        with no_sync_func():
+            while microbatch_idx < num_microbatches:
+                config.chunkpipe_forward = True
+                is_first_global = chunkpipe_forward_microbatch == 0
+                chunk_losses = [_forward_one_chunk(0, is_first_global)]
+                group_size = config.chunkpipe_current_group_size or 1
+
+                for chunk_idx_in_group in range(1, group_size):
+                    chunk_losses.append(_forward_one_chunk(chunk_idx_in_group, False))
+
+                microbatch_idx += group_size
+                if microbatch_idx >= num_microbatches:
+                    last_group_losses = chunk_losses
+                    last_group_size = group_size
+                    break
+
+                if not forward_only:
+                    _backward_group(chunk_losses, group_size)
+                elif group_size > 1:
+                    clear_key_value_cache(model, config.mtp_num_layers)
+
+        # Run the last group outside no_sync so its backward can synchronize
+        # gradients, matching the fixed-size pretrain schedule.
+        if last_group_losses is not None:
+            if not forward_only:
+                _backward_group(last_group_losses, last_group_size)
+            elif last_group_size > 1:
+                clear_key_value_cache(model, config.mtp_num_layers)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
