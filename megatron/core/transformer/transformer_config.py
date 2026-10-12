@@ -74,8 +74,8 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_loss_scaling_factor: Optional[float] = 0.1
     """Weighting factor of Multi-Token Prediction (MTP) loss.
-    We compute the average of the MTP losses across all depths, 
-    and multiply it the scaling factor to obtain the overall MTP loss, 
+    We compute the average of the MTP losses across all depths,
+    and multiply it the scaling factor to obtain the overall MTP loss,
     which serves as an additional training objective.
     """
 
@@ -109,8 +109,8 @@ class TransformerConfig(ModelParallelConfig):
     - list: e.g., [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']].
     - PipelineParallelLayerLayout: a PipelineParallelLayerLayout object.
     If given either a string or a list, it will be transferred into a PipelineParallelLayerLayout
-    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers 
-    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ..., 
+    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers
+    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ...,
     vpp(i)pp(j), vpp(i)pp(j+1), ..., vpp(-1)pp(-2), vpp(-1)pp(-1).
     In the inner lists of layers, 'embedding' or 'E' denotes the embedding layer, 'loss' or 'L'
     denotes the loss function, and 'decoder' or 't' denotes the transformer decoder layer.
@@ -161,8 +161,8 @@ class TransformerConfig(ModelParallelConfig):
     """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html.
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
        and learnable offset."""
 
     num_query_groups: Optional[int] = field(
@@ -222,7 +222,7 @@ class TransformerConfig(ModelParallelConfig):
     The stored input is casted back to the original precision before backprop compuatation."""
 
     glu_linear_offset: float = 0.0
-    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
+    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only
     used when gated_linear_unit is True"""
 
     activation_func_clamp_value: Optional[float] = None
@@ -347,7 +347,7 @@ class TransformerConfig(ModelParallelConfig):
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
-    """Frequency between LA (linear attention) layers 
+    """Frequency between LA (linear attention) layers
     and SDPA (scaled dot-product attention) layers.
     Accepts either:
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
@@ -389,13 +389,13 @@ class TransformerConfig(ModelParallelConfig):
 
     embedding_init_method: Optional[Callable] = None
     """
-    Method to initialize weights of the embedding layer. If None, will be set as described 
+    Method to initialize weights of the embedding layer. If None, will be set as described
     in init_method above.
     """
 
     embedding_init_method_std: Optional[float] = None
     """
-    Standard deviation of the zero mean normal for the default initialization method for the 
+    Standard deviation of the zero mean normal for the default initialization method for the
     embedding layer. If None, will be set to init_method_std. Setting this to a value around
     1.0 may avoid loss spikes in training. Setting this to any value will also skip applying
     weight decay on embedding weights to avoid shrinkage towards zero.
@@ -652,7 +652,7 @@ class TransformerConfig(ModelParallelConfig):
     fp4: Optional[Literal['e2m1']] = field(
         default=None, metadata={"argparse_meta": {"arg_names": ["--fp4-format"]}}
     )
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only 
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
@@ -690,12 +690,12 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert. Only effective when 
+    """Enable gate for shared expert. Only effective when
     moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared experts execute before the router. 
+    Without this, the shared experts execute before the router.
     Only effective when moe-shared-expert-intermediate-size is set.
     """
 
@@ -810,8 +810,12 @@ class TransformerConfig(ModelParallelConfig):
     no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
 
     moe_router_force_load_balancing: bool = False
-    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_router_force_hotspot_ratio: float = 0.0
+    """[Experimental] Force this ratio of router tokens to route to the first EP rank.
+    This is an experimental feature and only for benchmark."""
 
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
@@ -862,6 +866,36 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
+
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts (ECHO)."""
+
+    moe_echo_dump_dir: Optional[str] = None
+    """Directory where ECHO routing statistics are dumped."""
+
+    moe_echo_log_steps: Optional[str] = None
+    """Comma-separated training steps for which ECHO statistics are logged."""
+
+    moe_echo_log_layers: Optional[str] = None
+    """Comma-separated layer numbers for which ECHO statistics are logged."""
+
+    moe_echo_log_file: Optional[str] = None
+    """Path to the ECHO statistics log file."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of spare/echo experts used for elastic expert cloning."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Overlap echo expert weight dispatch with home expert computation."""
+
+    moe_echo_expert_dispatcher_type: Literal['hybridep', 'alltoall'] = "hybridep"
+    """Dispatcher used for echo expert weight movement."""
+
+    moe_echo_algorithm: Literal['sinkhorn', 'greedy'] = "sinkhorn"
+    """Algorithm used to assign overflow tokens to echo experts."""
+
+    moe_received_token_capacity: Optional[float] = None
+    """Total received-token capacity for each EP rank."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -1112,7 +1146,7 @@ class TransformerConfig(ModelParallelConfig):
     batch_invariant_mode: bool = False
     """If true, uses batch-invariant kernels that provide deterministic forward execution regardless
        of batch size. This ensures bitwise identical results when the same inputs are processed
-       in different batch configurations. This will significantly affect speed of 
+       in different batch configurations. This will significantly affect speed of
        training and inference as the kernels are not full optimized.
        Defaults to False."""
 
@@ -1604,6 +1638,31 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
+                )
+
+        if self.moe_enable_echo:
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("moe_enable_echo requires gradient_accumulation_fusion.")
+            if self.moe_num_echo_experts is None:
+                raise ValueError("moe_num_echo_experts must be set when moe_enable_echo is True.")
+            if self.moe_num_echo_experts <= 0:
+                raise ValueError("moe_num_echo_experts must be positive.")
+            if self.moe_num_echo_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "moe_num_echo_experts must be divisible by expert_model_parallel_size "
+                    "when moe_enable_echo is True."
+                )
+            if self.use_transformer_engine_op_fuser or self.moe_single_grouped_weight:
+                raise ValueError(
+                    "moe_enable_echo requires the non-fused TE GroupedLinear path with "
+                    "per-expert weight parameters."
+                )
+            if self.moe_echo_expert_dispatch_overlap and self.moe_echo_expert_dispatcher_type != (
+                "hybridep"
+            ):
+                raise ValueError(
+                    "moe_echo_expert_dispatch_overlap requires "
+                    "moe_echo_expert_dispatcher_type='hybridep'."
                 )
 
         if self.moe_flex_dispatcher_backend == "ncclep":
@@ -2953,7 +3012,7 @@ class MLATransformerConfig(TransformerConfig):
 
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
-       This is only for the dynamic inference backend and requires that 
+       This is only for the dynamic inference backend and requires that
        Flash MLA is installed."""
 
     mla_down_proj_fusion: bool = False
