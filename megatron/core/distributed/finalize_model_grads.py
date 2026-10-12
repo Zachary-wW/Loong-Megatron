@@ -622,8 +622,18 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
+    if getattr(config, 'moe_echo_expert_dispatch_overlap', False):
+        try:
+            from megatron.core.transformer.moe.moe_layer import MoELayer
+
+            if hasattr(MoELayer, 'moe_a2a_stream'):
+                torch.cuda.default_stream().wait_stream(MoELayer.moe_a2a_stream)
+        except ImportError:
+            pass
     for model_chunk in model:
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
+    if getattr(config, 'moe_echo_expert_dispatch_overlap', False):
+        torch.cuda.synchronize()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 
