@@ -2579,6 +2579,7 @@ def load_checkpoint(
                 args.use_distributed_optimizer
                 and not is_torch_dist
                 and ckpt_format not in ['torch_dcp', 'fsdp_dtensor']
+                and optimizer is not None
             ):
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
