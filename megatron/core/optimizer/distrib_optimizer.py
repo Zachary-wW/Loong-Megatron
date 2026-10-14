@@ -429,20 +429,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             model_param
                         ):
                             if hasattr(model_param, 'get_high_precision_init_val'):
-                                high_precision_init_val = model_param.get_high_precision_init_val()
-                                if high_precision_init_val is not None:
-                                    shard_main_param = (
-                                        high_precision_init_val.view(-1)[
-                                            param_range.start : param_range.end
-                                        ]
-                                        .clone()
-                                        .to(model_param.device)
-                                        .float()
-                                    )
-                                else:
-                                    shard_main_param = model_param.float().view(-1)[
-                                        param_range.start : param_range.end
-                                    ]
+                                shard_main_param = (
+                                    model_param.get_high_precision_init_val()
+                                    .view(-1)[param_range.start : param_range.end]
+                                    .clone()
+                                    .to(model_param.device)
+                                    .float()
+                                )
                                 # Keep the high-precision init value alive: copy_group_params
                                 # (state_dict load path) consumes it to initialize the main
                                 # params losslessly; dequantizing the fp8 shard instead loses
