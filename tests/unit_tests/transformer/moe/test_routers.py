@@ -9,6 +9,8 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
+    RandomSTE,
+    apply_random_logits,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
@@ -578,6 +580,19 @@ def test_router_gating_linear_bias(router_dtype):
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
     assert torch.allclose(bias.grad, ref_bias.grad, **tols)
+
+
+def test_apply_random_logits_static_cache(monkeypatch):
+    """The static cache is returned without consuming the rank-local RNG."""
+    logits = torch.zeros(2, 4, requires_grad=True)
+    cached = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    monkeypatch.setattr(RandomSTE, "random_logits", cached)
+
+    output = apply_random_logits(logits, static_logits=True)
+    output.backward(torch.ones_like(output))
+
+    assert output is cached
+    torch.testing.assert_close(logits.grad, torch.ones_like(logits))
 
 
 @pytest.mark.internal
