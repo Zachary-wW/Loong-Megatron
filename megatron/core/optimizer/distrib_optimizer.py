@@ -3172,19 +3172,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 "Megatron-FSDP does not implement a model-to-main parameter update."
             )
 
-        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
-        # do the work of copying data from main params to model params.
-        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            return
-
-        if state_dict is not None:
-            # Build a mapping from the model params to the corresponding tensors in the state dict,
-            # so that whenever the model params are used to initialize the main params, they can be
-            # replaced by the corresponding tensors from the state dict to initialize the master
-            # weights.
-            model_param_to_state_dict_param_map = self._build_model_param_to_state_dict_param_map(
-                state_dict
-            )
+        # Built by the branch that actually copies model groups, so precision-aware HDO
+        # can proceed directly to its optimizer-owned master parameters.
+        model_param_to_state_dict_param_map = None
 
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):
@@ -3219,10 +3209,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # load. In the fp8 case the shard params are fp32 copies that the load does not
             # update, so copy the model params into them explicitly.
             if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                if state_dict is not None:
+                    model_param_to_state_dict_param_map = (
+                        self._build_model_param_to_state_dict_param_map(state_dict)
+                    )
                 copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
                 copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
             self.optimizer.update_fp32_param_by_new_param()
             return
+
+        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
+        # do the work of copying data from main params to model params.
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return
+
+        if state_dict is not None:
+            model_param_to_state_dict_param_map = self._build_model_param_to_state_dict_param_map(
+                state_dict
+            )
 
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)

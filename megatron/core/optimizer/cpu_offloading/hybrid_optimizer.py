@@ -121,7 +121,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         master_param = model_param_shard.detach().to(
             device="cpu", dtype=torch.float32, copy=True
         ).contiguous()
-        if self.pin_cpu_params:
+        if self.pin_cpu_params and not getattr(self, "contiguous_state", False):
             master_param = master_param.pin_memory()
         # Release the CPU bf16 high-precision init copy NOW — the master shard
         # has already been built from it, so the init copy is dead weight.
