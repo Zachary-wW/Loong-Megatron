@@ -311,9 +311,11 @@ def _ddp_wrap(
         wrapped_model = []
         for model_chunk_idx, model_chunk in enumerate(model):
             chunk_kwargs = dict(dp_init_kwargs)
-            disable_bucketing = (
-                (model_chunk_idx > 0)
-                or overlap_param_gather_with_optimizer_step
+            force_bucketing = (
+                DP is DistributedDataParallel and ddp_config.force_turn_on_bucketing
+            )
+            disable_bucketing = not force_bucketing and (
+                (model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step
             )
 
             # Pre-compute parameter layouts for the distributed optimizer.
@@ -324,9 +326,9 @@ def _ddp_wrap(
                 ]
                 pp_rank = pg_collection.pp.rank()
                 effective_bucket_size = (
-                    None
-                    if disable_bucketing or pp_rank > 0
-                    else ddp_config.bucket_size
+                    ddp_config.bucket_size
+                    if force_bucketing or not (disable_bucketing or pp_rank > 0)
+                    else None
                 )
                 # Size the layout by the group the optimizer actually shards over, which is
                 # the intra-instance group when there are several optimizer instances. Using

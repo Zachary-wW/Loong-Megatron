@@ -1856,14 +1856,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
         # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
-        # is on, or for non-zero pipeline-parallel ranks.
+        # is on, or for non-zero pipeline-parallel ranks unless explicitly forced.
         pp_rank = get_pg_rank(pg_collection.pp)
+        force_bucketing = DP is DDP and ddp_config.force_turn_on_bucketing
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            not force_bucketing
+            and ((chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step)
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
-            None if (disable or pp_rank > 0) else ddp_config.bucket_size
+            ddp_config.bucket_size
+            if force_bucketing or not (disable or pp_rank > 0)
+            else None
             for disable in per_chunk_disable_bucketing
         ]
 
