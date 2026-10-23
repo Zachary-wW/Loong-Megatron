@@ -1,4 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -7,6 +9,7 @@ from megatron.core.models.common.fine_grained_callables import build_layer_calla
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -165,6 +168,135 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
 
     torch.testing.assert_close(output, expected)
     torch.testing.assert_close(node.chunk_state.mtp_hidden_states[0], expected)
+
+
+def test_echo_fine_grained_callables_combine_once(monkeypatch):
+    """ECHO uses the split callables and hands one preprocessed value to combine."""
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda _self, _stream: None)
+
+    class Metadata:
+        token_probs = None
+        dispatched_probs = None
+
+        @staticmethod
+        def get_number_of_tokens_per_expert():
+            return torch.tensor([1])
+
+    class FakeTokenDispatcher:
+        metadata = Metadata()
+
+    class EchoMLP(MoELayer):
+        num_local_experts = 1
+        use_shared_expert = False
+        shared_expert_overlap = False
+        token_dispatcher = FakeTokenDispatcher()
+
+        def __init__(self):
+            self.calls = []
+
+        def shared_experts_compute(self, hidden_states):
+            return None
+
+        def _echo_route(self, hidden_states):
+            self.calls.append("route")
+            routing_map = torch.ones(hidden_states.shape[0], 2, dtype=torch.bool)
+            probs = torch.ones(hidden_states.shape[0], 2)
+            return routing_map, probs, torch.ones(2, 2, dtype=torch.bool)
+
+        def preprocess(self, hidden_states, probs, routing_map):
+            self.calls.append("preprocess")
+            return hidden_states, probs
+
+        def dispatch(self, hidden_states, probs):
+            self.calls.append("dispatch")
+            return hidden_states, probs
+
+        def _prepare_echo_expert_dispatch(self, expert_offloading_map):
+            self.calls.append("prepare_expert_dispatch")
+            return object(), object()
+
+        def echo_routed_experts_compute(
+            self,
+            dispatched_input,
+            dispatched_probs,
+            fc1_expert_dispatch_metadata,
+            fc2_expert_dispatch_metadata,
+        ):
+            self.calls.append("expert_compute")
+            return dispatched_input + 1
+
+        def combine(self, output):
+            self.calls.append("combine")
+            return output + 1
+
+        def postprocess(self, output, shared_expert_output):
+            self.calls.append("postprocess")
+            return output + 1
+
+    class FakeConfig:
+        moe_token_dispatcher_type = "flex"
+        moe_flex_dispatcher_backend = "hybridep"
+        moe_enable_echo = True
+        moe_ncclep_zero_copy = False
+        bias_dropout_fusion = False
+
+    class FakeLayer:
+        config = FakeConfig()
+        mlp = EchoMLP()
+        offload_mlp_norm = False
+        recompute_pre_mlp_layernorm = False
+        hidden_dropout = 0.0
+        training = True
+
+        @staticmethod
+        def _forward_attention(hidden_states, **_kwargs):
+            return hidden_states + 1, None
+
+        @staticmethod
+        def pre_mlp_layernorm(hidden_states):
+            return hidden_states
+
+        @staticmethod
+        def init_backward_dw_wrapper():
+            return None
+
+        backward_dw_wrapper = staticmethod(lambda: None)
+
+        @staticmethod
+        def bias_dropout_add_exec_handler():
+            return nullcontext()
+
+        @staticmethod
+        def mlp_bda(_training, _bias_dropout_fusion):
+            return lambda mlp_output_with_bias, residual, _dropout: (
+                mlp_output_with_bias[0] + residual
+            )
+
+    layer = FakeLayer()
+    forward_funcs, _ = common_callables.build_transformer_layer_callables(layer)
+    pre_dispatch, dispatch, moe, combine, post_process = forward_funcs
+    assert post_process is None
+
+    node = DummyNode()
+    node.layer_state = DummyState()
+    node.chunk_state = DummyState()
+    node.chunk_state.model = DummyState()
+    node.chunk_state.model.decoder = DummyState()
+    node.chunk_state.model.decoder.final_layernorm = None
+    node.is_mtp = False
+    node.is_last_layer = False
+
+    hidden_states = torch.zeros(2, 1, 2)
+    local_tokens, probs = pre_dispatch(node, hidden_states)
+    dispatched_tokens = dispatch(node, local_tokens, probs)
+    expert_output = moe(node, dispatched_tokens)
+    output = combine(node, expert_output)
+
+    assert layer.mlp.calls.count("route") == 1
+    assert layer.mlp.calls.count("combine") == 1
+    assert layer.mlp.calls.count("postprocess") == 1
+    torch.testing.assert_close(output, torch.full_like(output, 5.0))
 
 
 class TestTransformerLayerSubmoduleCallables:

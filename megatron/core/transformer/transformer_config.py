@@ -813,6 +813,10 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_hotspot_ratio: float = 0.0
+    """[Experimental] Force this ratio of router tokens to route to the first EP rank.
+    This is an experimental feature and only for benchmark."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -862,6 +866,36 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
+
+    moe_enable_echo: bool = False
+    """[Experimental] Enable Elastic Cloning for Hot Experts (ECHO)."""
+
+    moe_echo_dump_dir: Optional[str] = None
+    """Directory where ECHO routing statistics are dumped."""
+
+    moe_echo_log_steps: Optional[str] = None
+    """Comma-separated training steps for which ECHO statistics are logged."""
+
+    moe_echo_log_layers: Optional[str] = None
+    """Comma-separated layer numbers for which ECHO statistics are logged."""
+
+    moe_echo_log_file: Optional[str] = None
+    """Path to the ECHO statistics log file."""
+
+    moe_num_echo_experts: Optional[int] = None
+    """[Experimental] Number of spare/echo experts used for elastic expert cloning."""
+
+    moe_echo_expert_dispatch_overlap: bool = False
+    """Overlap echo expert weight dispatch with home expert computation."""
+
+    moe_echo_expert_dispatcher_type: Literal['hybridep', 'alltoall'] = "hybridep"
+    """Dispatcher used for echo expert weight movement."""
+
+    moe_echo_algorithm: Literal['sinkhorn', 'greedy'] = "sinkhorn"
+    """Algorithm used to assign overflow tokens to echo experts."""
+
+    moe_received_token_capacity: Optional[float] = None
+    """Total received-token capacity for each EP rank."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -1604,6 +1638,31 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
+                )
+
+        if self.moe_enable_echo:
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("moe_enable_echo requires gradient_accumulation_fusion.")
+            if self.moe_num_echo_experts is None:
+                raise ValueError("moe_num_echo_experts must be set when moe_enable_echo is True.")
+            if self.moe_num_echo_experts <= 0:
+                raise ValueError("moe_num_echo_experts must be positive.")
+            if self.moe_num_echo_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "moe_num_echo_experts must be divisible by expert_model_parallel_size "
+                    "when moe_enable_echo is True."
+                )
+            if self.use_transformer_engine_op_fuser or self.moe_single_grouped_weight:
+                raise ValueError(
+                    "moe_enable_echo requires the non-fused TE GroupedLinear path with "
+                    "per-expert weight parameters."
+                )
+            if self.moe_echo_expert_dispatch_overlap and self.moe_echo_expert_dispatcher_type != (
+                "hybridep"
+            ):
+                raise ValueError(
+                    "moe_echo_expert_dispatch_overlap requires "
+                    "moe_echo_expert_dispatcher_type='hybridep'."
                 )
 
         if self.moe_flex_dispatcher_backend == "ncclep":

@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -1200,23 +1201,29 @@ class RandomSTE(torch.autograd.Function):
     This is used to generate random logits of router for load-balanced benchmark.
     """
 
+    random_logits: Optional[torch.Tensor] = None
+
     @staticmethod
-    def forward(ctx, logits: torch.Tensor) -> torch.Tensor:
+    def forward(ctx, logits: torch.Tensor, static_logits: bool = False) -> torch.Tensor:
         """
         Forward pass returns random logits with rank-specific seed.
 
         Args:
             logits (torch.Tensor): The logits.
+            static_logits (bool): Return the cached logits when available.
 
         Returns:
             torch.Tensor: The random logits.
         """
+        if static_logits and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
             random_logits = logits.clone().normal_()
         return random_logits
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+    def backward(ctx, grad_output: torch.Tensor):
         """
         Backward pass propagates the gradient for logits.
 
@@ -1224,22 +1231,24 @@ class RandomSTE(torch.autograd.Function):
             grad_output (torch.Tensor): The gradient output.
 
         Returns:
-            torch.Tensor: The gradient input.
+            tuple[torch.Tensor, None]: The gradient input and the static-logits
+            argument gradient.
         """
-        return grad_output
+        return grad_output, None
 
 
-def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
+def apply_random_logits(logits: torch.Tensor, static_logits: bool = False) -> torch.Tensor:
     """
     Apply the RandomSTE function to the logits.
 
     Args:
         logits (torch.Tensor): The logits.
+        static_logits (bool): Return the cached logits when available.
 
     Returns:
         torch.Tensor: The random logits.
     """
-    return RandomSTE.apply(logits)
+    return RandomSTE.apply(logits, static_logits)
 
 
 @internal_api
@@ -1683,3 +1692,44 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         return wrapped_func
 
     return decorator
+
+
+class MoERoutingTracker:
+    """Collect rank-local MoE routing statistics for ECHO diagnostics."""
+
+    def __init__(self):
+        self.data_dict = {}
+        self.ep_group = None
+        self.rank = None
+        self.ep_rank = None
+
+    def set_rank_info(self, ep_group):
+        """Store distributed rank metadata for later dumps."""
+        self.ep_group = ep_group
+        self.rank = torch.distributed.get_rank()
+        self.ep_rank = torch.distributed.get_rank(ep_group)
+
+    def add_data(self, moe_layer_number: int, key_name: str, data: torch.Tensor):
+        """Record one tensor statistic for a MoE layer."""
+        self.data_dict.setdefault(key_name, {}).setdefault(moe_layer_number, []).append(
+            data.detach()
+        )
+
+    def dump_data(self, dir_path: str):
+        """Stack collected tensors and save one file for every EP rank."""
+        for key_name, layers in self.data_dict.items():
+            for moe_layer_number, data_list in layers.items():
+                layers[moe_layer_number] = torch.stack(data_list)
+        os.makedirs(dir_path, exist_ok=True)
+        file_path = os.path.join(
+            dir_path,
+            f"data_rank_{self.rank}_ep_rank_{self.ep_rank}.pth",
+        )
+        torch.save(self.data_dict, file_path)
+
+    def clear_data(self):
+        """Discard collected statistics."""
+        self.data_dict = {}
+
+
+GLOBAL_MOE_ROUTING_TRACKER = MoERoutingTracker()

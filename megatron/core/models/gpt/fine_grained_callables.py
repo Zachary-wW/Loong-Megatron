@@ -12,7 +12,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum, MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 
@@ -98,6 +98,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                 )
+                if getattr(layer.config, 'moe_echo_expert_dispatch_overlap', False):
+                    hidden_states = FlushPendingGradAccum.apply(hidden_states)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
@@ -126,7 +128,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         )
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
+                if layer.config.moe_enable_echo:
+                    node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                if layer.config.moe_enable_echo:
+                    return hidden_states, None, None, shared_expert_output
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
@@ -145,6 +151,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
+        if layer.config.moe_enable_echo:
+            pre_mlp_layernorm_output = node.layer_state.pre_mlp_layernorm_output
+            routing_map, probs, expert_offloading_map = layer.mlp._echo_route(
+                pre_mlp_layernorm_output
+            )
+            local_tokens, probs = layer.mlp.preprocess(
+                pre_mlp_layernorm_output, probs, routing_map
+            )
+            node.layer_state.echo_expert_offloading_map = expert_offloading_map
+            node.layer_state.pre_mlp_layernorm_output = None
+
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
@@ -160,10 +177,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
+        metadata = token_dispatcher.metadata
         if enable_deepep or enable_hybridep or enable_ncclep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to pre_dispatch_computation submodule
-            token_dispatcher._comm_manager.token_probs = probs
+            metadata.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
 
@@ -185,18 +203,31 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             post dispatch->experts->combine preprocess
         """
         dispatched_probs = node.layer_state.dispatched_probs
-        token_dispatcher = layer.mlp.token_dispatcher
+        metadata = layer.mlp.token_dispatcher.metadata
         if enable_deepep or enable_hybridep or enable_ncclep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
-            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
+            metadata.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        if layer.config.moe_enable_echo:
+            expert_offloading_map = node.layer_state.echo_expert_offloading_map
+            fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata = (
+                layer.mlp._prepare_echo_expert_dispatch(expert_offloading_map)
+            )
+            expert_output = layer.mlp.echo_routed_experts_compute(
+                dispatched_tokens,
+                dispatched_probs,
+                fc1_expert_dispatch_metadata,
+                fc2_expert_dispatch_metadata,
+            )
+            node.layer_state.echo_expert_offloading_map = None
+        else:
+            expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep or enable_ncclep:
-            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
+            tokens_per_expert = metadata.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
         if layer.recompute_pre_mlp_layernorm:

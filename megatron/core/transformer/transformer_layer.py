@@ -752,6 +752,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        if getattr(self.config, 'moe_echo_expert_dispatch_overlap', False):
+            from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum
+
+            hidden_states = FlushPendingGradAccum.apply(hidden_states)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -1330,6 +1334,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 residual = cuda_graph_output.pop()
                 if not self.is_moe_layer:
                     return residual, None, None, None
+                if getattr(self.config, 'moe_echo_expert_dispatch_overlap', False):
+                    from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum
+
+                    residual = FlushPendingGradAccum.apply(residual)
                 hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
                 if isinstance(hidden_states, tuple):
                     if len(hidden_states) != 2:
