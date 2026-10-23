@@ -24,8 +24,6 @@ from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1296,8 +1294,8 @@ class Attention(MegatronModule, ABC):
         self.num_chunks_per_seq = self.config.chunk_num_per_seq
 
         # Calculate cache chunk size based on pipeline parallelism configuration
-        pipeline_world_size = get_pipeline_model_parallel_world_size()
-        pipeline_rank = get_pipeline_model_parallel_rank()
+        pipeline_world_size = get_pg_size(self.pg_collection.pp)
+        pipeline_rank = get_pg_rank(self.pg_collection.pp)
         if (
             self.config.sft_chunkpipe_mode
             and self.config.virtual_pipeline_model_parallel_size is not None

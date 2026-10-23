@@ -1358,6 +1358,7 @@ def get_extended_schedule_table(
     num_model_chunks,
     microbatch_group_size_per_vp_stage,
     num_chunks,
+    pipeline_parallel_size,
     override_mgspvs=None,
 ):
     """Extended schedule table to support sequence chunking"""
@@ -1369,7 +1370,7 @@ def get_extended_schedule_table(
     else:
         microbatch_group_size_per_vp_stage = min(
             microbatch_group_size_per_vp_stage,
-            int(parallel_state.get_pipeline_model_parallel_world_size() / num_chunks),
+            int(pipeline_parallel_size / num_chunks),
         )
         microbatch_group_size_per_vp_stage = max(microbatch_group_size_per_vp_stage, 1)
     num_microbatches = int(num_microbatches / num_chunks)
@@ -2834,6 +2835,7 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         len(model),
         config.microbatch_group_size_per_vp_stage,
         num_chunks,
+        p2p_communicator.pp_group.size(),
         override_mgspvs=sft_table_mgspvs,
     )
 
@@ -4979,7 +4981,7 @@ def forward_backward_pipelining_without_interleaving_with_chunkpipe(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
-                if i < parallel_state.get_pipeline_model_parallel_rank():
+                if i < p2p_communicator.pp_group.rank():
                     input_tensor = p2p_communicator.recv_forward(
                         recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                     )

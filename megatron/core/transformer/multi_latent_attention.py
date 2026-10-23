@@ -15,7 +15,7 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
@@ -323,7 +323,7 @@ class MultiLatentAttention(Attention):
         if self.config.sft_chunkpipe_mode:
             # SFT packed sequences have no batch dimension.
             kv_cache_shape = (
-                total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
+                total_cache_tokens // get_pg_size(self.pg_collection.tp),
                 self.config.kv_lora_rank,
             )
             k_pos_emb_cache_shape = (
@@ -333,7 +333,7 @@ class MultiLatentAttention(Attention):
             )
         else:
             kv_cache_shape = (
-                total_cache_tokens // parallel_state.get_tensor_model_parallel_world_size(),
+                total_cache_tokens // get_pg_size(self.pg_collection.tp),
                 self.config.micro_batch_size,
                 self.config.kv_lora_rank,
             )
@@ -387,7 +387,7 @@ class MultiLatentAttention(Attention):
         self.micro_batch_to_cache_chunk_map[self.config.chunkpipe_forward_microbatch] = chunk_id
 
         # Store compressed KV and positional embeddings
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_size = get_pg_size(self.pg_collection.tp)
         kv_cache_indices = torch.arange(self.config.chunksize // tp_size) + \
             (chunk_id * self.config.chunksize // tp_size)
         pos_cache_indices = torch.arange(self.config.chunksize) + (chunk_id * self.config.chunksize)
@@ -607,7 +607,7 @@ class MultiLatentAttention(Attention):
             cache_chunk_idx = self.micro_batch_to_cache_chunk_map[start_microbatch_idx + prev_chunk_idx]
 
             # Calculate tensor parallel indices for retrieving cached data
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            tp_size = get_pg_size(self.pg_collection.tp)
             kv_indices = torch.arange(self.config.chunksize // tp_size) + \
                 (cache_chunk_idx * self.config.chunksize // tp_size)
             pos_indices = torch.arange(self.config.chunksize) + (cache_chunk_idx * self.config.chunksize)
