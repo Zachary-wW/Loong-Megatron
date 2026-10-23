@@ -3112,7 +3112,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Use param from state_dict to initialize main_param
                         model_param = model_param_to_state_dict_param_map[model_param]
 
-                    if self._is_distopt_quantized_param(model_param):
+                    if is_nvfp4tensor(model_param) or self._is_distopt_quantized_param(
+                        model_param
+                    ):
                         if hasattr(model_param, 'get_high_precision_init_val'):
                             high_precision_init_val = model_param.get_high_precision_init_val()
                             if high_precision_init_val is not None:
