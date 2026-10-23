@@ -386,6 +386,7 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 def validate_args(args, defaults={}):
+    preprocess_data_on_cpu = getattr(args, 'preprocess_data_on_cpu', False)
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -1335,7 +1336,7 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.moe_grouped_gemm:
+    if args.moe_grouped_gemm and not preprocess_data_on_cpu:
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -1410,7 +1411,9 @@ def validate_args(args, defaults={}):
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
+    if not preprocess_data_on_cpu and (
+        args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1
+    ) \
         and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_megatron_fsdp:
@@ -1441,7 +1444,9 @@ def validate_args(args, defaults={}):
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
     # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
-    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
+    if not preprocess_data_on_cpu and (
+        args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10
+    ):
         if 'dp_cp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
@@ -1472,7 +1477,9 @@ def validate_args(args, defaults={}):
         )
     )
 
-    if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+    if not preprocess_data_on_cpu and (
+        args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1
+    ):
         if args.fp4 and not args.fp4_param_gather:
             raise ValueError(
                 "GTP (--tensor-parallel-num-weight-shards / "
@@ -3206,6 +3213,9 @@ def _add_data_args(parser):
                        help='FIM PAD token')
     group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
                        help='FIM EOD token')
+    group.add_argument('--preprocess-data-on-cpu', action='store_true',
+                       default=False,
+                       help='If set, build dataset indices on CPU without GPUs.')
     return parser
 
 

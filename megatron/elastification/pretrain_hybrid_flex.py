@@ -445,6 +445,8 @@ def forward_step(data_iterator, model: HybridModel):
 
 
 def is_dataset_built_on_rank(vp_stage=None):
+    if getattr(get_args(), 'preprocess_data_on_cpu', False):
+        return torch.distributed.get_rank() == 0
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False

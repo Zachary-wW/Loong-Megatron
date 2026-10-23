@@ -149,7 +149,8 @@ class Timer(TimerBase):
         assert not self._started, 'timer has already been started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         self._start_time = time.time()
         self._started = True
 
@@ -162,7 +163,8 @@ class Timer(TimerBase):
         assert self._started, 'timer is not started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         elapsed = time.time() - self._start_time
         self._elapsed += elapsed
         self._active_time += elapsed
@@ -299,9 +301,12 @@ class Timers:
         # pytorch yet. It is simpler to deal with a single tensor
         # and since we are only gathering a small amount of data,
         # it should be ok to use all-gather instead of gather.
-        rank_name_to_time = torch.zeros(
-            (world_size, len(names)), dtype=torch.float, device=torch.cuda.current_device()
+        device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device('cpu')
         )
+        rank_name_to_time = torch.zeros((world_size, len(names)), dtype=torch.float, device=device)
         for i, name in enumerate(names):
             if name in self._timers:
                 # Here we don't need to pass the barrier flag as all

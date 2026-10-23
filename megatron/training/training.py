@@ -1114,7 +1114,9 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
+    preprocess_data_on_cpu = getattr(args, 'preprocess_data_on_cpu', False)
+    if not preprocess_data_on_cpu:
+        set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1128,13 +1130,20 @@ def pretrain(
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
     if _STARTUP_TIMESTAMPS['program_start'] is not None:
-        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
+        startup_time_device = 'cpu' if preprocess_data_on_cpu else 'cuda'
+        program_start_global = torch.tensor(
+            [_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device=startup_time_device
+        )
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
         program_start_global = program_start_global.item()
     set_startup_timestamps(program_start=program_start_global)
 
     global _LEGACY_TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
+    start_time_tensor = torch.tensor(
+        [_LEGACY_TRAIN_START_TIME],
+        dtype=torch.double,
+        device='cpu' if preprocess_data_on_cpu else 'cuda',
+    )
     torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
     _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
 
@@ -1222,6 +1231,58 @@ def pretrain(
         }
     else:
         checkpointing_context = {}
+
+    # CPU preprocessing builds dataset indices only. Avoid constructing the
+    # model, optimizer, and DDP wrappers because those paths require CUDA even
+    # when model initialization itself is requested on CPU.
+    if preprocess_data_on_cpu:
+        if not cfg_container.validation.skip_train:
+            raise ValueError("--preprocess-data-on-cpu requires --skip-train")
+        if args.perform_rl_step:
+            raise ValueError("--preprocess-data-on-cpu does not support RL steps")
+
+        app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+        if args.virtual_pipeline_model_parallel_size is not None:
+            iterator_groups = []
+            for vp_stage in range(args.virtual_pipeline_model_parallel_size):
+                dataset_provider_parameters = inspect.signature(
+                    train_valid_test_dataset_provider
+                ).parameters
+                assert "vp_stage" in dataset_provider_parameters, (
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider "
+                    "when using virtual pipeline parallelism"
+                )
+                provider = functools.partial(
+                    train_valid_test_dataset_provider, vp_stage=vp_stage
+                )
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    provider.is_distributed = True
+                iterator_groups.append(build_train_valid_test_data_iterators(provider))
+            train_data_iterator = [group[0] for group in iterator_groups]
+            valid_data_iterator = [group[1] for group in iterator_groups]
+            test_data_iterator = [group[2] for group in iterator_groups]
+        else:
+            (
+                train_data_iterator,
+                valid_data_iterator,
+                test_data_iterator,
+            ) = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+        timers('train/valid/test-data-iterators-setup').stop()
+        app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        print_datetime('after CPU data preprocessing')
+        timers.log(['train/valid/test-data-iterators-setup'], barrier=True)
+        one_logger_utils.track_config_flags(
+            args.train_iters,
+            cfg_container.validation.skip_train,
+            args.do_train,
+            args.do_valid,
+            args.do_test,
+            args.dataloader_type,
+        )
+        one_logger = get_one_logger()
+        one_logger and one_logger.log_metrics(app_metrics)
+        return
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -4546,8 +4607,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
-    # Construct the data pipeline
-    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+    # Construct the data pipeline. CPU preprocessing has no model-parallel
+    # groups, but every Gloo rank must enter the distributed dataset builder;
+    # the provider's rank predicate limits physical index construction to rank 0.
+    build_on_this_rank = (
+        True
+        if getattr(args, 'preprocess_data_on_cpu', False)
+        else is_distributed or mpu.get_tensor_model_parallel_rank() == 0
+    )
+    if build_on_this_rank:
 
         # Build datasets and dataloders.
         if args.perform_rl_step:
@@ -4563,34 +4631,54 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             # Build datasets.
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-            if args.skip_train:
+            if getattr(args, 'preprocess_data_on_cpu', False):
+                # Dataset/index construction is the deliverable; building samplers
+                # and DataLoaders would require uninitialized model-parallel DP groups.
                 train_dataloader = None
+                valid_dataloaders = None
+                test_dataloader = None
+                do_train = False
+                do_valid = False
+                do_test = False
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
-            valid_dataloaders = []
-            for valid_d in valid_ds:
-                if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                if args.skip_train:
+                    train_dataloader = None
                 else:
-                    if args.multiple_validation_sets:
-                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                        # correct and needs to be calculated/set per validation set
-                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-            if not args.multiple_validation_sets:
-                assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
-            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
-            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
+                    train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                valid_dataloaders = []
+                for valid_d in valid_ds:
+                    if args.skip_train or args.full_validation:
+                        valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                    else:
+                        if args.multiple_validation_sets:
+                            # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                            # correct and needs to be calculated/set per validation set
+                            raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                        valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                if not args.multiple_validation_sets:
+                    assert len(valid_dataloaders) == 1
+                test_dataloader = build_pretraining_data_loader(test_ds, 0)
+                do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
+                do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+                do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
         flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+            [int(do_train), int(do_valid), int(do_test)],
+            dtype=torch.long,
+            device='cpu' if getattr(args, 'preprocess_data_on_cpu', False) else 'cuda',
         )
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = torch.tensor(
+            [0, 0, 0],
+            dtype=torch.long,
+            device='cpu' if getattr(args, 'preprocess_data_on_cpu', False) else 'cuda',
+        )
 
-    torch.distributed.broadcast(flags, 0)
+    if getattr(args, 'preprocess_data_on_cpu', False):
+        # Dataset preprocessing does not require the broadcast.
+        print("Dataset preprocessing does not require this step.")
+    else:
+        torch.distributed.broadcast(flags, 0)
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
