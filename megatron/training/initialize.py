@@ -267,10 +267,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                             skip_model_parallel_init=False):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
+    preprocess_data_on_cpu = getattr(args, 'preprocess_data_on_cpu', False)
 
     # Dataset preprocessing on CPU (migrated from AIAK, M-07-2) does not
     # initialize CUDA or model-parallel communicators.
-    if getattr(args, 'preprocess_data_on_cpu', False):
+    if preprocess_data_on_cpu:
         device_count = 0
         args.distributed_backend = "gloo"
         print("CUDA not available, running on CPU")
@@ -293,9 +294,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.cuda_graph_impl == "transformer_engine" and not getattr(
-            args, 'preprocess_data_on_cpu', False
-        ):
+        if args.cuda_graph_impl == "transformer_engine" and not preprocess_data_on_cpu:
             torch.cuda.set_stream(torch.cuda.Stream())
 
         # Set flight recorder env vars if specified.
