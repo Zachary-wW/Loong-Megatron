@@ -4608,9 +4608,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
     # Construct the data pipeline. CPU preprocessing has no model-parallel
-    # groups, so only global rank 0 builds the shared datasets.
+    # groups, but every Gloo rank must enter the distributed dataset builder;
+    # the provider's rank predicate limits physical index construction to rank 0.
     build_on_this_rank = (
-        torch.distributed.get_rank() == 0
+        True
         if getattr(args, 'preprocess_data_on_cpu', False)
         else is_distributed or mpu.get_tensor_model_parallel_rank() == 0
     )
