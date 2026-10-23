@@ -2489,20 +2489,21 @@ def load_checkpoint(
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if 'args' in state_dict and not args.finetune:
-        checkpoint_args = state_dict['args']
-        # A GPT block is split into separate attention and MLP positions in
-        # HybridModel, so num_layers intentionally differs even for an
-        # architecture-preserving load. Keep every other resume-time argument
-        # compatibility check.
-        skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        check_checkpoint_args(checkpoint_args, skip_args=skip_args)
-        args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
-        args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
-        args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
-    else:
-        print_rank_0('could not find arguments in the checkpoint ...')
+    if load_arg == 'load':
+        if 'args' in state_dict and not args.finetune:
+            checkpoint_args = state_dict['args']
+            # A GPT block is split into separate attention and MLP positions in
+            # HybridModel, so num_layers intentionally differs even for an
+            # architecture-preserving load. Keep every other resume-time argument
+            # compatibility check.
+            skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
+            check_checkpoint_args(checkpoint_args, skip_args=skip_args)
+            args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
+            args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
+            update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
+            args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+        else:
+            print_rank_0('could not find arguments in the checkpoint ...')
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
