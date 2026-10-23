@@ -699,15 +699,17 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        routed_recompute_execution_map = tuple(self.fwd_execution_map)
+
         def custom_forward_routed(hidden_states, intermediate_tensors=None, padding_mask=None):
-            if "route" in self.fwd_execution_map:
+            if "route" in routed_recompute_execution_map:
                 probs, routing_map = self.route(hidden_states, padding_mask)
                 hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                 if intermediate_tensors is not None:
                     return hidden_states, probs
 
-            if "expert_compute" in self.fwd_execution_map:
+            if "expert_compute" in routed_recompute_execution_map:
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
@@ -741,7 +743,7 @@ class MoELayer(BaseMoELayer):
         elif (
             self.routed_experts_recompute
             and self.training
-            and "expert_compute" in self.fwd_execution_map
+            and "expert_compute" in routed_recompute_execution_map
         ):
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -763,7 +765,7 @@ class MoELayer(BaseMoELayer):
                 )
 
             output, mlp_bias = outputs
-            if "postprocess" in self.fwd_execution_map:
+            if "postprocess" in routed_recompute_execution_map:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 output = self.postprocess(output, shared_expert_output)
             return output, mlp_bias
