@@ -326,6 +326,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if self.gpu_optimizer:
                 self.gpu_optimizer.step(closure)
             self._streamed_cpu_steps(closure)
+            if hasattr(self, "_writeback_fp8_cpu_offload_masters"):
+                # Supplied by the FP8 CPU-offload integration PR. Grad streaming
+                # returns early, so it must run the same FP8 master write-back as
+                # the regular CPU-optimizer loop.
+                self._writeback_fp8_cpu_offload_masters()
             self._sync_sub_optimizers_state_to_hdo()
             return
 
