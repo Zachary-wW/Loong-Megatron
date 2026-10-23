@@ -556,12 +556,12 @@ def restore_fp16module_inputs_to_fp32(
 
     if config.fp16:
 
-        def float16_convertor(val):
+        def output_dtype_convertor(val):
             return val.half()
 
     elif config.bf16:
 
-        def float16_convertor(val):
+        def output_dtype_convertor(val):
             return val.bfloat16()
 
     if config.fp16 or config.bf16:
@@ -571,7 +571,7 @@ def restore_fp16module_inputs_to_fp32(
                 return float16_to_fp32(inputs)
 
         def forward_post_hook_fn(module, inputs, output):
-            return fp32_to_float16(output, float16_convertor)
+            return fp32_to_float16(output, output_dtype_convertor)
 
         instance.register_forward_pre_hook(forward_pre_hook_fn)
         if not keep_fp32_outputs:

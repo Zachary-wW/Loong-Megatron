@@ -1136,7 +1136,7 @@ class ColumnParallelLinear(torch.nn.Module):
 
         # Partial-module fp32 training (migrated from AIAK, M-17): fp32-weight
         # linears must receive fp32 inputs.
-        if self.weight.dtype == torch.float32:
+        if weight.dtype == torch.float32:
             input_ = input_.float()
 
         bias = self.bias if not self.skip_bias_add else None
