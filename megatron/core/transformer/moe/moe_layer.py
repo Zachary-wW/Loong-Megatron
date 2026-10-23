@@ -689,28 +689,14 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    def echo_forward(self, hidden_states: torch.Tensor):
-        """Forward pass for the MoE layer with echo experts.
-
-        This implements the echo expert logic where overflow tokens are offloaded
-        to spare/echo experts for better load balancing.
-
-        Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer.
-
-        Returns:
-            A tuple containing the output tensor and the MLP bias, if any.
-        """
-        residual = hidden_states
-        router = self.router
-
-        # Step 1: Routing and offloading planning
+    def _echo_route(self, hidden_states: torch.Tensor):
+        """Route tokens and build the ECHO overflow-assignment plan."""
         with torch.cuda.nvtx.range("router"):
-            probs, routing_map = router(hidden_states)
+            probs, routing_map = self.router(hidden_states)
 
         with torch.cuda.nvtx.range("rerouting"):
             tokens_per_expert_current_ep_rank = routing_map.sum(dim=0)
-            if self.config.moe_echo_expert_dispatch_overlap and hasattr(MoELayer, 'moe_a2a_stream'):
+            if self.config.moe_echo_expert_dispatch_overlap and hasattr(MoELayer, "moe_a2a_stream"):
                 torch.cuda.current_stream().wait_stream(MoELayer.moe_a2a_stream)
             tokens_per_expert_per_ep_rank = gather_from_sequence_parallel_region(
                 tokens_per_expert_current_ep_rank, group=self.ep_group
@@ -773,66 +759,139 @@ class MoELayer(BaseMoELayer):
                 GLOBAL_MOE_ROUTING_TRACKER.add_data(
                     self.layer_number, "tokens_per_rank", tokens_per_rank
                 )
-        # Step 2: Expert weight dispatch for echo experts
-        if self.config.moe_echo_expert_dispatch_overlap:
-            # Overlap mode: expert dispatch is launched *inside* forward_with_dispatch_overlap,
-            # after token A2A completes, so it overlaps only with home GEMM — not with
-            # token A2A (which would cause two concurrent A2As contending for the NIC).
-            # CPU-side preprocess only; actual GPU dispatch is deferred.
-            fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
-            fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
-            fc1_expert_dispatch_metadata.buffer_idx = 0
-            fc2_expert_dispatch_metadata.buffer_idx = 1
-        else:
-            # Original synchronous dispatch path
-            # TODO: share the same preprocess operation but use different metadata object
-            fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
-            fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
-            fc1_expert_dispatch_metadata.buffer_idx = 0
-            fc2_expert_dispatch_metadata.buffer_idx = 1
+        return rerouting_map, rerouted_probs, expert_offloading_map
 
+    def _echo_preprocess(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        dispatch_stream: torch.cuda.Stream | None = None,
+    ):
+        """Preprocess rerouted tokens for the token dispatcher."""
+
+        def preprocess():
+            with torch.cuda.nvtx.range("token_dispatch_preprocess"):
+                return self.preprocess(hidden_states, probs, routing_map)
+
+        if dispatch_stream is None:
+            return preprocess()
+
+        with torch.cuda.stream(dispatch_stream):
+            dispatch_stream.wait_stream(torch.cuda.current_stream())
+            return preprocess()
+
+    def _prepare_echo_expert_dispatch(self, expert_offloading_map: torch.Tensor):
+        """Prepare ECHO expert-weight metadata and optionally dispatch the weights."""
+        fc1_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+        fc2_expert_dispatch_metadata = self.expert_dispatcher.preprocess(expert_offloading_map)
+        fc1_expert_dispatch_metadata.buffer_idx = 0
+        fc2_expert_dispatch_metadata.buffer_idx = 1
+
+        if not self.config.moe_echo_expert_dispatch_overlap:
             with torch.cuda.nvtx.range("expert_dispatch"):
                 fc1_expert_weights = self.experts.get_expert_weights(
                     "fc1", self.home_expert_indices
                 )
                 dispatched_fc1_weights = self.expert_dispatcher.expert_dispatch(
-                    fc1_expert_dispatch_metadata,
-                    *fc1_expert_weights,
+                    fc1_expert_dispatch_metadata, *fc1_expert_weights
                 )
                 self.experts.set_expert_weights(
-                    "fc1",
-                    dispatched_fc1_weights,
-                    self.echo_expert_indices,
+                    "fc1", dispatched_fc1_weights, self.echo_expert_indices
                 )
 
                 fc2_expert_weights = self.experts.get_expert_weights(
                     "fc2", self.home_expert_indices
                 )
                 dispatched_fc2_weights = self.expert_dispatcher.expert_dispatch(
-                    fc2_expert_dispatch_metadata,
-                    *fc2_expert_weights,
+                    fc2_expert_dispatch_metadata, *fc2_expert_weights
                 )
                 self.experts.set_expert_weights(
-                    "fc2",
-                    dispatched_fc2_weights,
-                    self.echo_expert_indices,
+                    "fc2", dispatched_fc2_weights, self.echo_expert_indices
                 )
+        return fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata
+
+    def _echo_experts_from_permuted(
+        self,
+        dispatched_input: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        fc1_expert_dispatch_metadata,
+        fc2_expert_dispatch_metadata,
+    ) -> torch.Tensor:
+        """Run ECHO experts and prepare their output for a single token combine."""
+        if self.config.moe_echo_expert_dispatch_overlap:
+            expert_output, mlp_bias = self.experts.forward_with_dispatch_overlap(
+                dispatched_input,
+                tokens_per_expert,
+                permuted_probs,
+                len(self.home_expert_indices),
+                self.home_expert_indices,
+                self.echo_expert_indices,
+                self.expert_dispatcher,
+                fc1_expert_dispatch_metadata,
+                fc2_expert_dispatch_metadata,
+                MoELayer.moe_a2a_stream,
+                MoELayer.fc1_expert_dispatch_event,
+                MoELayer.fc2_expert_dispatch_event,
+            )
+        else:
+            expert_output, mlp_bias = apply_module(self.experts)(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        return self.token_dispatcher.combine_preprocess(expert_output)
+
+    def echo_routed_experts_compute(
+        self,
+        dispatched_input: torch.Tensor,
+        dispatched_probs: torch.Tensor,
+        fc1_expert_dispatch_metadata,
+        fc2_expert_dispatch_metadata,
+    ) -> torch.Tensor:
+        """Post-process ECHO tokens, run experts, and prepare one combine input."""
+        permuted_tokens, tokens_per_expert, permuted_probs = (
+            self.token_dispatcher.dispatch_postprocess(dispatched_input, dispatched_probs)
+        )
+        return self._echo_experts_from_permuted(
+            permuted_tokens,
+            tokens_per_expert,
+            permuted_probs,
+            fc1_expert_dispatch_metadata,
+            fc2_expert_dispatch_metadata,
+        )
+
+    def echo_forward(self, hidden_states: torch.Tensor):
+        """Forward pass for the MoE layer with echo experts.
+
+        This implements the echo expert logic where overflow tokens are offloaded
+        to spare/echo experts for better load balancing.
+
+        Args:
+            hidden_states (torch.Tensor): The input tensor to the MoE layer.
+
+        Returns:
+            A tuple containing the output tensor and the MLP bias, if any.
+        """
+        residual = hidden_states
+        rerouting_map, rerouted_probs, expert_offloading_map = self._echo_route(hidden_states)
+        fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata = (
+            self._prepare_echo_expert_dispatch(expert_offloading_map)
+        )
 
         shared_expert_output = self.shared_experts_compute(residual)
 
-        # Step 3: Token dispatch preprocess.
         if self.config.moe_echo_expert_dispatch_overlap:
-            with torch.cuda.stream(MoELayer.moe_a2a_stream):
-                MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
-                with torch.cuda.nvtx.range("token_dispatch_preprocess"):
-                    hidden_states, probs = self.preprocess(
-                        hidden_states, rerouted_probs, rerouting_map
-                    )
+            hidden_states, probs = self._echo_preprocess(
+                hidden_states,
+                rerouted_probs,
+                rerouting_map,
+                dispatch_stream=MoELayer.moe_a2a_stream,
+            )
         else:
-            with torch.cuda.nvtx.range("token_dispatch_preprocess"):
-                hidden_states, probs = self.preprocess(
-                    hidden_states, rerouted_probs, rerouting_map
-                )
+            hidden_states, probs = self._echo_preprocess(
+                hidden_states, rerouted_probs, rerouting_map
+            )
 
         # Step 4: Token dispatch
         def dispatch_and_compute(hidden_states, probs):
@@ -857,47 +916,26 @@ class MoELayer(BaseMoELayer):
                         self.token_dispatcher.dispatch_postprocess(dispatched_input, probs)
                     )
 
-            # Step 5: Expert computation
             with torch.cuda.nvtx.range("expert_compute"):
-                if self.config.moe_echo_expert_dispatch_overlap:
-                    # Overlap path: dispatch is launched inside forward_with_dispatch_overlap
-                    # *after* token A2A (here), so expert weight A2A overlaps with home GEMM
-                    # only — not with token A2A.
-                    expert_output, mlp_bias = self.experts.forward_with_dispatch_overlap(
-                        dispatched_input,
-                        tokens_per_expert,
-                        permuted_probs,
-                        len(self.home_expert_indices),
-                        self.home_expert_indices,
-                        self.echo_expert_indices,
-                        self.expert_dispatcher,
-                        fc1_expert_dispatch_metadata,
-                        fc2_expert_dispatch_metadata,
-                        MoELayer.moe_a2a_stream,
-                        MoELayer.fc1_expert_dispatch_event,
-                        MoELayer.fc2_expert_dispatch_event,
-                    )
-                else:
-                    expert_output, mlp_bias = self.experts(
-                        dispatched_input, tokens_per_expert, permuted_probs
-                    )
+                output = self._echo_experts_from_permuted(
+                    dispatched_input,
+                    tokens_per_expert,
+                    permuted_probs,
+                    fc1_expert_dispatch_metadata,
+                    fc2_expert_dispatch_metadata,
+                )
 
             if self.config.moe_echo_expert_dispatch_overlap:
-                # Step 6: Token combine (on moe_a2a_stream, after all expert GEMM on default stream)
                 with torch.cuda.stream(MoELayer.moe_a2a_stream):
-                    # Wait for all expert GEMM on default stream to finish before combine A2A.
                     MoELayer.moe_a2a_stream.wait_stream(torch.cuda.default_stream())
                     with torch.cuda.nvtx.range("token_combine"):
-                        output = self.token_dispatcher.combine_preprocess(expert_output)
                         output = self.combine(output)
                     MoELayer.token_combine_event.record()
-                # Default stream waits for combine A2A to complete before returning output.
                 torch.cuda.default_stream().wait_event(MoELayer.token_combine_event)
             else:
                 with torch.cuda.nvtx.range("token_combine"):
-                    output = self.token_dispatcher.combine_preprocess(expert_output)
                     output = self.combine(output)
-            return output, mlp_bias, shared_expert_output
+            return output, None, shared_expert_output
 
         if self.moe_layer_recompute:
             output, mlp_bias, shared_expert_output = tensor_parallel.checkpoint(

@@ -1079,14 +1079,18 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        tokens_per_expert: list[int] = tokens_per_expert.long().cpu().tolist()
+        received_num_tokens = None
         if self.config.moe_received_token_capacity is not None:
+            received_num_tokens = permuted_local_hidden_states.shape[0]
             actual_total = sum(tokens_per_expert)
             if actual_total > self.config.moe_received_token_capacity:
                 raise RuntimeError(
                     "ECHO received token count exceeds moe_received_token_capacity: "
                     f"received={actual_total}, capacity={self.config.moe_received_token_capacity}"
                 )
+            permuted_local_hidden_states = permuted_local_hidden_states[:actual_total]
+            permuted_probs = permuted_probs[:actual_total]
         permuted_probs = permuted_probs.unsqueeze(-1)
         if skip_routed_expert_padding(self.config):
             pass
@@ -1225,6 +1229,11 @@ class TEGroupedMLP(MegatronModule):
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
+        if received_num_tokens is not None and output.shape[0] < received_num_tokens:
+            output = torch.cat(
+                [output, output.new_zeros(received_num_tokens - output.shape[0], output.shape[1])],
+                dim=0,
+            )
         output_bias = None
 
         return output, output_bias

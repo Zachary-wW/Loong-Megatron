@@ -126,7 +126,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         )
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
+                if layer.config.moe_enable_echo:
+                    node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                if layer.config.moe_enable_echo:
+                    return hidden_states, None, None, shared_expert_output
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
@@ -146,10 +150,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             return hidden_states
 
         if layer.config.moe_enable_echo:
-            raise ValueError(
-                "ECHO MoE is not currently supported by the fine-grained three-stage "
-                "overlap schedule; disable moe_enable_echo or use a non-overlap schedule."
+            pre_mlp_layernorm_output = node.layer_state.pre_mlp_layernorm_output
+            routing_map, probs, expert_offloading_map = layer.mlp._echo_route(
+                pre_mlp_layernorm_output
             )
+            local_tokens, probs = layer.mlp.preprocess(
+                pre_mlp_layernorm_output, probs, routing_map
+            )
+            node.layer_state.echo_expert_offloading_map = expert_offloading_map
+            node.layer_state.pre_mlp_layernorm_output = None
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -198,7 +207,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             metadata.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        if layer.config.moe_enable_echo:
+            expert_offloading_map = node.layer_state.echo_expert_offloading_map
+            fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata = (
+                layer.mlp._prepare_echo_expert_dispatch(expert_offloading_map)
+            )
+            expert_output = layer.mlp.echo_routed_experts_compute(
+                dispatched_tokens,
+                dispatched_probs,
+                fc1_expert_dispatch_metadata,
+                fc2_expert_dispatch_metadata,
+            )
+            node.layer_state.echo_expert_offloading_map = None
+        else:
+            expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
