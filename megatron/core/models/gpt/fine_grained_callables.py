@@ -12,7 +12,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum, MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 
@@ -98,6 +98,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                 )
+                if getattr(layer.config, 'moe_echo_expert_dispatch_overlap', False):
+                    hidden_states = FlushPendingGradAccum.apply(hidden_states)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
