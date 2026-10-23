@@ -362,6 +362,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
     config = core_transformer_config_from_args(args)
+    if getattr(args, 'preprocess_data_on_cpu', False):
+        return torch.distributed.get_rank() == 0
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
