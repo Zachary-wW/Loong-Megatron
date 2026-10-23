@@ -190,7 +190,6 @@ def validate_yaml(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.model_parallel.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
