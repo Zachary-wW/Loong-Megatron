@@ -699,7 +699,10 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        routed_recompute_execution_map = tuple(self.fwd_execution_map)
+        if isinstance(self.fwd_execution_map, str):
+            routed_recompute_execution_map = {self.fwd_execution_map}
+        else:
+            routed_recompute_execution_map = set(self.fwd_execution_map)
 
         def custom_forward_routed(hidden_states, intermediate_tensors=None, padding_mask=None):
             if "route" in routed_recompute_execution_map:
