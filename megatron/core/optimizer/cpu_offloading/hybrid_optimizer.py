@@ -378,7 +378,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         Update the fp32 parameters by the new parameters.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+            source_param = param
+            if hasattr(param, 'get_high_precision_init_val'):
+                high_precision_init_val = param.get_high_precision_init_val()
+                if high_precision_init_val is not None:
+                    source_param = high_precision_init_val
+            fp32_param.data.copy_(source_param)
+            if source_param is not param and hasattr(param, 'clear_high_precision_init_val'):
+                param.clear_high_precision_init_val()
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):

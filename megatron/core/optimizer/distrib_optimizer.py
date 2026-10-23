@@ -440,7 +440,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 # (state_dict load path) consumes it to initialize the main
                                 # params losslessly; dequantizing the fp8 shard instead loses
                                 # precision at load time.
-                                # model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
