@@ -464,7 +464,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                    # .detach() required: fp32 params with requires_grad=True would
+                    # otherwise track autograd history through the shard view
+                    # (community main carries the same fix).
+                    shard_model_param = model_param.detach().view(-1)[
+                        param_range.start : param_range.end
+                    ]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
                     tensor_parallel.copy_tensor_model_parallel_attributes(
@@ -774,6 +779,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
+
+        # _build_model_and_main_param_groups() installs each group's params as
+        # [*fp32 shards, *fp32-from-float16 shards], which reorders a group
+        # whenever it mixes fp32 and float16 model params (they live in
+        # different-dtype grad buffers, so the gbuf-iteration order used by
+        # _build_optimizer_group_ranges() interleaves them). Rebuild each
+        # param's group_order to match the installed order; the map is read by
+        # every optimizer-state save/load path via
+        # _get_main_param_and_optimizer_states().
+        for group_index, (model_fp32_params, model_float16_params) in enumerate(
+            zip(self.model_fp32_groups, self.model_float16_groups)
+        ):
+            for group_order, model_param in enumerate([*model_fp32_params, *model_float16_params]):
+                self.model_param_group_index_map[model_param] = (group_index, group_order)
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(

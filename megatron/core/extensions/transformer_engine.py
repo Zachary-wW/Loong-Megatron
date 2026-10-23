@@ -849,6 +849,16 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        # Partial-module fp32 training (migrated from AIAK, M-17): when the norm
+        # weight is kept in fp32, compute the norm forward entirely in fp32.
+        from megatron.core.transformer.module import restore_fp16module_inputs_to_fp32
+
+        restore_fp16module_inputs_to_fp32(
+            instance,
+            config,
+            weight_is_fp32=lambda module: module.weight.dtype == torch.float32,
+        )
+
         return cast(LayerNormInterface, instance)
 
 
