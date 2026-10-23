@@ -41,6 +41,35 @@ def _te_do_not_offload(tensor):
     )
 
 
+def _is_fp8_tensor(tensor):
+    """Return whether tensor is a Transformer Engine quantized FP8 tensor."""
+    from megatron.core.fp8_utils import is_float8tensor
+
+    return is_float8tensor(tensor)
+
+
+OFFLOAD_TAG = "_fine_grained_offload_tag"
+
+
+def offloading_checker(tensor, tensor_selector=False):
+    """Return whether the tensor should be offloaded under the tensor-level selector.
+
+    Module-level offload accepts every candidate tensor. Tensor-level offload accepts only
+    explicitly marked tensors, using the selection captured with the current offload group.
+    """
+    if not tensor_selector:
+        return True
+
+    return bool(getattr(tensor, OFFLOAD_TAG, False)) and not isinstance(
+        tensor, torch.nn.Parameter
+    )
+
+
+def set_offload_tag(tensor):
+    """Mark the tensor as selected for tensor-level offloading."""
+    setattr(tensor, OFFLOAD_TAG, True)
+
+
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     """
     Print an ASCII table summarizing offload bytes across all ranks.
@@ -351,8 +380,9 @@ class OffloadTensorGroup:
     A group of tensors to be offloaded together.
     """
 
-    def __init__(self, name):
+    def __init__(self, name, tensor_selector=False):
         self._name = name
+        self.tensor_selector = tensor_selector
         self._tensors = {}
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
@@ -835,12 +865,23 @@ class ChunkOffloadHandler:
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
+        # FP8 tensors carry quantized metadata, so they are copied as a uint8 payload and
+        # restored through the TE wrapper. They bypass the CPU pool, which tracks raw tensors.
+        fp8_offload = _is_fp8_tensor(src_tensor)
+        use_cpu_pool = use_cpu_pool and not fp8_offload
+
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
         else:
             cpu_backup = torch.empty(
-                src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
+                src_tensor.shape,
+                dtype=torch.uint8 if fp8_offload else src_tensor.dtype,
+                device="cpu",
+                pin_memory=pin_memory,
             )
+
+        if fp8_offload:
+            cpu_backup = type(src_tensor).make_like(src_tensor, data=cpu_backup)
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
         state = (src_tensor.device, cpu_backup, use_cpu_pool)
@@ -850,8 +891,15 @@ class ChunkOffloadHandler:
         """Reload."""
         debug_rank("------reload")
         dev, cpu_backup, use_cpu_pool = state
+        fp8_offload = _is_fp8_tensor(cpu_backup)
         if non_blocking is None:
-            non_blocking = cpu_backup.is_pinned()
+            non_blocking = getattr(cpu_backup, "_data", cpu_backup).is_pinned()
+        if fp8_offload:
+            # `.to()` rebuilds the TE wrapper on device, preserving the FP8 metadata.
+            gpu_tensor = cpu_backup.to(dev, non_blocking=non_blocking)
+            if use_cpu_pool:
+                self.cpu_tensor_pool.free(cpu_backup)
+            return gpu_tensor
         gpu_tensor = torch.empty(
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
@@ -983,19 +1031,24 @@ class ChunkOffloadHandler:
         debug_rank(f"--------tensor_pop {tensor.shape}")
         return tensor
 
-    def tensor_need_offloading_checker(self, tensor):
+    def tensor_need_offloading_checker(self, tensor, tensor_selector=False):
         """Check if the tensor needs to be offloaded."""
         debug_rank("tensor_need_offloading_checker")
         if not self._can_manage_tensor_for_offload(tensor):
             return False
-        if _te_do_not_offload(tensor):
+        if not offloading_checker(tensor, tensor_selector):
+            return False
+        # FP8 tensors are offloaded as a uint8 payload, so the TE do-not-offload marker
+        # (which exists because the wrapper cannot be copied into a plain buffer) does not apply.
+        fp8_offload = _is_fp8_tensor(tensor)
+        if not fp8_offload and _te_do_not_offload(tensor):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
         # Respect tensor's offload preference if specified
-        if getattr(tensor, "_TE_do_not_offload", False) or getattr(
-            tensor, "_do_not_offload", False
-        ):
+        if getattr(tensor, "_do_not_offload", False):
+            return False
+        if not fp8_offload and getattr(tensor, "_TE_do_not_offload", False):
             return False
         return True
 
@@ -1006,7 +1059,9 @@ class ChunkOffloadHandler:
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
-                if self.tensor_need_offloading_checker(tensor_on_device):
+                if self.tensor_need_offloading_checker(
+                    tensor_on_device, group_to_offload.tensor_selector
+                ):
                     state = self.offload(
                         tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
@@ -1100,7 +1155,9 @@ class ChunkOffloadHandler:
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
                 for release_tensor in forced_released_tensors:
-                    if self.tensor_need_offloading_checker(release_tensor):
+                    if self.tensor_need_offloading_checker(
+                        release_tensor, group_to_offload.tensor_selector
+                    ):
                         # Ensure tensor is not in use before freeing
                         release_tensor.record_stream(cur_stream)
                         release_tensor.untyped_storage().resize_(0)
@@ -1188,6 +1245,13 @@ class ChunkOffloadHandler:
         self._tensor_count_current_group = 0
         self._groups_to_offload.append(self.offload_groups[self._offloaded_group_index - 1])
         debug_rank(f"groups to offload {self._groups_to_offload}")
+
+    def set_current_group_tensor_selector(self, tensor_selector):
+        """Record whether the active group uses tensor-level selection."""
+        if self.do_offload and self._offloaded_group_index > 0:
+            self.offload_groups[
+                self._offloaded_group_index - 1
+            ].tensor_selector = tensor_selector
 
     def on_group_start_backward(self):
         """
@@ -1356,15 +1420,25 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
-    def __init__(self, offload: bool, tensor: torch.Tensor, name: str):
+    def __init__(
+        self,
+        offload: bool,
+        tensor: torch.Tensor,
+        name: str,
+        tensor_selector: bool = False,
+    ):
         self.offload = offload
         self.tensor = tensor
         self.name = name
+        self.tensor_selector = tensor_selector
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         if self.offload:
             self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
+            chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+            if chunk is not None:
+                chunk.set_current_group_tensor_selector(self.tensor_selector)
             PipelineOffloadManager.get_instance().__enter__()
         return self.tensor
 

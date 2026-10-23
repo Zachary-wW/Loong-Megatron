@@ -526,13 +526,8 @@ class MoELayer(BaseMoELayer):
         return shared_expert_output
 
     @internal_api
-    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
-        """Computes the output of the routed experts on the dispatched tokens.
-
-        This method first post-processes the dispatched input to get permuted tokens
-        for each expert. It then passes the tokens through the local experts.
-        The output from the experts is preprocessed for the combine step.
-        """
+    def pre_routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """Post-processes the dispatched input into per-expert permuted tokens."""
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
@@ -540,6 +535,15 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        return dispatched_input, tokens_per_expert, permuted_probs
+
+    def routed_experts_compute(
+        self,
+        dispatched_input: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
+        """Computes the output of the routed experts on the dispatched tokens."""
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
@@ -559,9 +563,11 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        return expert_output, mlp_bias
 
-        return output, mlp_bias
+    def post_routed_experts_compute(self, expert_output: torch.Tensor):
+        """Preprocesses the expert output for the combine step."""
+        return self.token_dispatcher.combine_preprocess(expert_output)
 
     def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
@@ -671,10 +677,18 @@ class MoELayer(BaseMoELayer):
                     hidden_states, probs = intermediate_tensors
 
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                (
+                    dispatched_input,
+                    tokens_per_expert,
+                    permuted_probs,
+                ) = self.pre_routed_experts_compute(dispatched_input, probs)
+                output, mlp_bias = self.routed_experts_compute(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                output = self.post_routed_experts_compute(output)
                 output = self.combine(output)
 
                 if intermediate_tensors is not None:

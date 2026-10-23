@@ -1244,6 +1244,13 @@ class TransformerConfig(ModelParallelConfig):
     "moe_act": offload the input of the moe act part.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
     """
+    offload_tensors: Optional[list[str]] = field(default_factory=list)
+    """Individual tensors to offload to CPU during the forward pass and reload during
+    the backward pass. This is a tensor-level selector on top of the module-level
+    ``offload_modules``; when it is non-empty only the selected tensors are offloaded.
+    choices: "dispatched_input".
+    "dispatched_input": offload the tokens dispatched to the routed experts.
+    """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
@@ -1849,39 +1856,54 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.cpu_offloading
             ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
-            assert self.offload_modules is not None and len(self.offload_modules) > 0
-            allowed_modules = {
-                "core_attn",
-                "attn_proj",
-                "expert_fc1",
-                "fused_group_mlp",
-                "moe_act",
-                "attn_norm",
-                "mlp_norm",
-                "qkv_linear",
-            }
-            invalid_modules = set(self.offload_modules) - allowed_modules
-            assert not invalid_modules, (
-                f'Invalid choices for offload_modules: {invalid_modules}. '
-                f'Allowed modules are: {allowed_modules}'
+            has_offload_modules = self.offload_modules is not None and len(self.offload_modules) > 0
+            has_offload_tensors = self.offload_tensors is not None and len(self.offload_tensors) > 0
+            assert has_offload_modules or has_offload_tensors, (
+                "fine_grained_activation_offloading requires at least one of "
+                "offload_modules or offload_tensors to be specified."
             )
-            if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
-                raise ValueError(
-                    "attn_proj cannot be set to offload_modules alone without core_attn "
-                    "because the input of attn_proj is the output of core_attn, "
-                    "which is needed in core_attn.backward()."
+            if has_offload_tensors:
+                allowed_tensors = {
+                    "dispatched_input",
+                }
+                invalid_tensors = set(self.offload_tensors) - allowed_tensors
+                assert not invalid_tensors, (
+                    f'Invalid choices for offload_tensors: {invalid_tensors}. '
+                    f'Allowed tensors are: {allowed_tensors}'
                 )
-            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
-                    self.offload_modules
+            if has_offload_modules:
+                allowed_modules = {
+                    "core_attn",
+                    "attn_proj",
+                    "expert_fc1",
+                    "fused_group_mlp",
+                    "moe_act",
+                    "attn_norm",
+                    "mlp_norm",
+                    "qkv_linear",
+                }
+                invalid_modules = set(self.offload_modules) - allowed_modules
+                assert not invalid_modules, (
+                    f'Invalid choices for offload_modules: {invalid_modules}. '
+                    f'Allowed modules are: {allowed_modules}'
                 )
-                assert not offload_inside_moe, (
-                    f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
-                    f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
-                    f"so offloading activations inside it is redundant and will cause errors. "
-                    f"Either remove 'moe' from --recompute-modules or remove "
-                    f"{offload_inside_moe} from --offload-modules."
-                )
+                if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
+                    raise ValueError(
+                        "attn_proj cannot be set to offload_modules alone without core_attn "
+                        "because the input of attn_proj is the output of core_attn, "
+                        "which is needed in core_attn.backward()."
+                    )
+                if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
+                    offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
+                        self.offload_modules
+                    )
+                    assert not offload_inside_moe, (
+                        f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
+                        f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
+                        f"so offloading activations inside it is redundant and will cause errors. "
+                        f"Either remove 'moe' from --recompute-modules or remove "
+                        f"{offload_inside_moe} from --offload-modules."
+                    )
             assert (
                 self.min_offloaded_tensor_size >= 0
             ), "min_offloaded_tensor_size must be non-negative."
