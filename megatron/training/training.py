@@ -2320,7 +2320,7 @@ def dummy_train_step(data_iterator):
                 cp_size=args.context_parallel_size,
                 tp_rank=tp_rank,
                 micro_batch_size=args.micro_batch_size,
-                seq_length=args.seq_length,
+                seq_length=args.chunksize if args.enable_chunkpipe else args.seq_length,
                 mtp_on_this_rank=False,
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),

@@ -83,18 +83,24 @@ if TYPE_CHECKING:
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
-    """Prepare value tensor for MLA core attention THD execution."""
+    """Pad MLA values when THD or chunkpipe requires Q/K/V head-dimension alignment."""
     orig_v_dim = value.shape[-1] if value is not None else None
     padded_v_dim = orig_v_dim
-    need_v_pad = (
-        packed_seq_params is not None
-        and packed_seq_params.qkv_format == "thd"
-        and parallel_attention.config.experimental_attention_variant is None
-        and value is not None
-        and query.shape[-1] != orig_v_dim
-    )
+    chunkpipe_v_pad = getattr(parallel_attention, 'padding_v_head_dim', False)
+    if chunkpipe_v_pad:
+        orig_v_dim = parallel_attention.config.v_head_dim
+        need_v_pad = value is not None and query.shape[-1] != orig_v_dim
+    else:
+        need_v_pad = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and parallel_attention.config.experimental_attention_variant is None
+            and value is not None
+            and query.shape[-1] != orig_v_dim
+        )
     if need_v_pad:
-        value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
+        if value.shape[-1] != query.shape[-1]:
+            value = F.pad(value, [0, query.shape[-1] - value.shape[-1]])
         padded_v_dim = value.shape[-1]
     return value, need_v_pad, orig_v_dim, padded_v_dim
 
@@ -167,6 +173,13 @@ class MultiLatentAttention(Attention):
         # Overwrite the base class kv shape to support MLA inference
         self.key_hidden_size = self.q_head_dim
         self.val_hidden_size = self.config.v_head_dim
+        self.v_channels = self.config.v_head_dim
+        self.padding_v_head_dim = False
+        if self.config.enable_chunkpipe:
+            # Chunkpipe cache reconstruction expects K and V to share the same
+            # head dimension; trim padded V back to v_head_dim after attention.
+            self.v_channels = self.q_head_dim
+            self.padding_v_head_dim = True
 
         self.recompute_up_proj = (
             self.config.recompute_granularity == 'selective'
@@ -212,7 +225,7 @@ class MultiLatentAttention(Attention):
             attention_type=self.attention_type,
             softmax_scale=self.softmax_scale,
             k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
+            v_channels=self.v_channels,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
@@ -1548,6 +1561,9 @@ class MLASelfAttention(MultiLatentAttention):
                     kv_compressed.register_hook(kv_compressed_hook_fn)
                     k_pos_emb.register_hook(key_pos_emb_hook_fn)
                 self.append_chunk_key_value_cache_mla(kv_compressed, k_pos_emb)
+
+            if self.padding_v_head_dim:
+                value = F.pad(value, [0, self.q_head_dim - self.config.v_head_dim])
 
             query = query.contiguous()
             key = key.contiguous()

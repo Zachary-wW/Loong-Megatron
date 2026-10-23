@@ -768,7 +768,7 @@ def clear_key_value_cache(model, mtp_num_layers):
     for layer_idx in range(num_layers):
         decoder.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
 
-    if mtp_num_layers == 0:
+    if mtp_num_layers is None or mtp_num_layers == 0:
         return
     if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
         return
