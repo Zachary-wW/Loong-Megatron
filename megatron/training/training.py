@@ -1232,6 +1232,58 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    # CPU preprocessing builds dataset indices only. Avoid constructing the
+    # model, optimizer, and DDP wrappers because those paths require CUDA even
+    # when model initialization itself is requested on CPU.
+    if preprocess_data_on_cpu:
+        if not cfg_container.validation.skip_train:
+            raise ValueError("--preprocess-data-on-cpu requires --skip-train")
+        if args.perform_rl_step:
+            raise ValueError("--preprocess-data-on-cpu does not support RL steps")
+
+        app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+        if args.virtual_pipeline_model_parallel_size is not None:
+            iterator_groups = []
+            for vp_stage in range(args.virtual_pipeline_model_parallel_size):
+                dataset_provider_parameters = inspect.signature(
+                    train_valid_test_dataset_provider
+                ).parameters
+                assert "vp_stage" in dataset_provider_parameters, (
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider "
+                    "when using virtual pipeline parallelism"
+                )
+                provider = functools.partial(
+                    train_valid_test_dataset_provider, vp_stage=vp_stage
+                )
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    provider.is_distributed = True
+                iterator_groups.append(build_train_valid_test_data_iterators(provider))
+            train_data_iterator = [group[0] for group in iterator_groups]
+            valid_data_iterator = [group[1] for group in iterator_groups]
+            test_data_iterator = [group[2] for group in iterator_groups]
+        else:
+            (
+                train_data_iterator,
+                valid_data_iterator,
+                test_data_iterator,
+            ) = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+        timers('train/valid/test-data-iterators-setup').stop()
+        app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        print_datetime('after CPU data preprocessing')
+        timers.log(['train/valid/test-data-iterators-setup'], barrier=True)
+        one_logger_utils.track_config_flags(
+            args.train_iters,
+            cfg_container.validation.skip_train,
+            args.do_train,
+            args.do_valid,
+            args.do_test,
+            args.dataloader_type,
+        )
+        one_logger = get_one_logger()
+        one_logger and one_logger.log_metrics(app_metrics)
+        return
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
