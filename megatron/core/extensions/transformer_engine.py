@@ -2986,6 +2986,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
+            if self.activation_recompute:
+                return super().forward(hidden_states, **kwargs)
+
             # Construct fused impl if needed
             # Note: We initialize during the first forward pass in
             # case the params are modified after the constructor.
@@ -3166,7 +3169,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if self.activation_recompute or get_tensor_model_parallel_world_size() > 1:
                 return super().forward(hidden_states, **kwargs)
 
             orig_shape = hidden_states.shape

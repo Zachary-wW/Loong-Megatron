@@ -545,19 +545,23 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+    choices: "core_attn", "moe_act", "mlp_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "routed_experts", "pre_mlp", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "mlp_act": recompute the dense MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "routed_experts": recompute the routed experts path (router, dispatch, experts, combine).
+    "pre_mlp": recompute the attention half layer before the MLP.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "moe_act", "mlp_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use
+    output-discarding checkpointing; "core_attn", "mlp", "moe", "shared_experts",
+    "routed_experts", and "pre_mlp" use normal checkpointing.
     """
 
     ####################
@@ -1768,10 +1772,13 @@ class TransformerConfig(ModelParallelConfig):
                 allowed_modules = {
                     "core_attn",
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "mla_up_proj",
+                    "pre_mlp",
                     "mlp",
                     "moe",
+                    "routed_experts",
                     "shared_experts",
                     "gdn_norm_out",
                 }
