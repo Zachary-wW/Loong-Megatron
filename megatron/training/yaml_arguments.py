@@ -7,8 +7,10 @@ import dataclasses
 import json
 import os
 import re
-import torch
 import types
+import warnings
+
+import torch
 
 try:
     import yaml
@@ -22,7 +24,7 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -327,9 +329,19 @@ def validate_yaml(args, defaults={}):
 
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.model_parallel.sequence_parallel:
-            raise RuntimeError(
+            warnings.warn(
                 "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1",
+                UserWarning,
+                stacklevel=2,
+            )
+        if getattr(args.model_parallel, "async_tensor_model_parallel_allreduce", False):
+            warnings.warn(
+                "Using async gradient all reduce requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1",
+                UserWarning,
+                stacklevel=2,
+            )
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
