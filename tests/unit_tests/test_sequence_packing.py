@@ -19,6 +19,14 @@ from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
 
 
+def test_rerun_data_iterator_implements_iterator_protocol():
+    data_iterator = RerunDataIterator(iter([1, 2]))
+
+    assert iter(data_iterator) is data_iterator
+    assert next(data_iterator) == 1
+    assert next(iter(data_iterator)) == 2
+
+
 def test_scheduler_thd_padding_mask_from_cu_seqlens():
     cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
