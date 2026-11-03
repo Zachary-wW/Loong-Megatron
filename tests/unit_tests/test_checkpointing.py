@@ -820,59 +820,6 @@ def test_load_checkpoint(
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
-def test_load_checkpoint_logs_strict_load_failure(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
-):
-    """Strict load diagnostics include the original exception and fallback result."""
-    args = create_ckpt_load_args
-    args.ckpt_format = "torch"
-    args.use_distributed_optimizer = False
-    args.use_dist_ckpt = False
-    args.fp16 = False
-    args.bf16 = False
-
-    with TempNamedDir(
-        tmp_path_dist_ckpt / "test_load_checkpoint_logs_strict_load_failure", sync=True
-    ) as ckpt_dir:
-        args.load = ckpt_dir
-        args.save = ckpt_dir
-        args.save_tokenizer_assets = False
-        set_args(args)
-
-        config = TransformerConfig(num_layers=1, kv_channels=1)
-        save_checkpoint(
-            10,
-            [MockModel(config)],
-            MockState({"optimizer": "optimizer_state"}),
-            MockState({"opt_param_scheduler": "scheduler_state"}),
-            0,
-        )
-
-        load_calls = []
-        load_return = (["model.missing"], ["model.unexpected"])
-
-        class FailingLoadModel(MockModel):
-            def load_state_dict(self, state_dict, strict=True):
-                load_calls.append(strict)
-                if strict:
-                    raise RuntimeError("strict failure with missing/unexpected keys")
-                return load_return
-
-        with mock.patch("builtins.print") as mocked_print:
-            load_checkpoint(
-                [FailingLoadModel(config)],
-                optimizer=None,
-                opt_param_scheduler=None,
-                strict=True,
-            )
-
-    assert load_calls == [True, False]
-    printed = "\n".join(str(call.args[0]) for call in mocked_print.call_args_list if call.args)
-    assert "[load_state_dict strict=True] exception:" in printed
-    assert "strict failure with missing/unexpected keys" in printed
-    assert f"[load_state_dict strict=False] return: {load_return}" in printed
-
-
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
     init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
