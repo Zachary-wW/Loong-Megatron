@@ -76,7 +76,15 @@ class MockMixedFusedLayerNorm(TorchLayerNorm):
         setattr(self.bias, "sequence_parallel", self.sequence_parallel)
 
 
-def mock_bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
+def mock_bias_swiglu_impl(
+    input,
+    bias,
+    fp8_input_store=False,
+    cpu_offload_input=False,
+    clamp_value=None,
+    gate_clamp_scale: Optional[float] = None,
+    linear_clamp_scale: Optional[float] = None,
+):
     """
     mock_bias_swiglu_impl
     """
@@ -84,6 +92,31 @@ def mock_bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=
     assert len(ori_shape) in [2, 3]
     assert not fp8_input_store
     input = input.view(-1, ori_shape[-1])
+
+    if clamp_value is not None or gate_clamp_scale is not None:
+        from megatron.core.fusions.fused_bias_swiglu import (
+            bias_clamped_swiglu,
+            bias_situ_glu,
+            clamped_swiglu,
+        )
+
+        assert gate_clamp_scale is not None or linear_clamp_scale is None
+        assert gate_clamp_scale is None or clamp_value is None
+        if gate_clamp_scale is not None:
+            output = (
+                bias_situ_glu(input, bias, gate_clamp_scale, linear_clamp_scale)
+                if bias is not None
+                else bias_situ_glu(
+                    input, torch.zeros_like(input), gate_clamp_scale, linear_clamp_scale
+                )
+            )
+        else:
+            output = (
+                bias_clamped_swiglu(input, bias, clamp_value)
+                if bias is not None
+                else clamped_swiglu(input, clamp_value)
+            )
+        return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
     if bias is not None:
         input = input + bias
@@ -168,7 +201,15 @@ class MockWeightedSwiGLUFunction(torch.autograd.Function):
             return d_input, None, grad_weights, None
 
 
-def mock_weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def mock_weighted_bias_swiglu_impl(
+    input,
+    bias,
+    weights,
+    fp8_input_store=False,
+    clamp_value=None,
+    gate_clamp_scale: Optional[float] = None,
+    linear_clamp_scale: Optional[float] = None,
+):
     """Token-wise-weighted bias swiglu fusion for XPU.
 
     Computes: swiglu(input + bias) * weights
@@ -185,6 +226,23 @@ def mock_weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     # weights may be [s, b, 1] when input is 3D, need [s*b, 1]
     if weights.dim() > 2:
         weights = weights.view(-1, weights.shape[-1])
+
+    if clamp_value is not None or gate_clamp_scale is not None:
+        from megatron.core.fusions.fused_bias_swiglu import (
+            clamped_weighted_swiglu,
+            weighted_situ_glu,
+        )
+
+        assert gate_clamp_scale is not None or linear_clamp_scale is None
+        assert gate_clamp_scale is None or clamp_value is None
+        fused_input = input if bias is None else input + bias
+        if gate_clamp_scale is not None:
+            output = weighted_situ_glu(
+                fused_input, weights, gate_clamp_scale, linear_clamp_scale
+            )
+        else:
+            output = clamped_weighted_swiglu(fused_input, weights, clamp_value)
+        return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
     output = MockWeightedSwiGLUFunction.apply(input, bias, weights, fp8_input_store)
 
