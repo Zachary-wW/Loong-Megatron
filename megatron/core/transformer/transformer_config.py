@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -680,6 +680,45 @@ class TransformerConfig(ModelParallelConfig):
     "core_attn", "mlp", "moe", "shared_experts", "routed_experts", and "pre_mlp" use normal
     checkpointing.
     """
+
+    ####################
+    # ChunkPipe
+    ####################
+    enable_chunkpipe: bool = False
+    """Split each sequence into causal chunks processed as a pipeline group."""
+
+    chunksize: int = 0
+    """Number of tokens in each ChunkPipe chunk."""
+
+    chunk_num_per_seq: int = 0
+    """Number of chunks per sequence, calculated as seq_length // chunksize."""
+
+    keep_activations_chunks: int = 0
+    """Number of trailing chunks whose activations are retained."""
+
+    chunkpipe_forward_microbatch: int = 0
+    """Runtime forward-microbatch index used by ChunkPipe."""
+
+    chunkpipe_backward_microbatch: int = 0
+    """Runtime backward-microbatch index used by ChunkPipe."""
+
+    chunkpipe_current_group_size: int = 0
+    """Runtime size of the ChunkPipe group being processed."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime zero-based chunk index within the current ChunkPipe group."""
+
+    chunk_keys: Optional[dict[int, Any]] = None
+    """Runtime cross-chunk key cache."""
+
+    chunk_values: Optional[dict[int, Any]] = None
+    """Runtime cross-chunk value cache."""
+
+    chunkpipe_forward: bool = False
+    """Whether the scheduler is in the ChunkPipe forward phase."""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether ChunkPipe is running with external, dynamically sized SFT groups."""
 
     ####################
     # fp8 related
@@ -1690,6 +1729,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mtp_connection_type='parallel' cannot be combined with mtp_hsm=True."
             )
+        self.chunk_keys = {}
+        self.chunk_values = {}
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -3146,6 +3187,8 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion for multi-latent attention only supports training. "
                     "It is experimental and may change in future versions."
                 )
+                if self.enable_chunkpipe:
+                    self.apply_rope_fusion = False
             else:
                 if self.rotary_interleaved:
                     if not is_te_min_version("2.3.0"):
