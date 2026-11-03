@@ -1604,67 +1604,68 @@ class MultiTokenPredictionLayer(MegatronModule):
                 tensor_parallel_output_grad=False,
                 group=self.tp_group,
             ).transpose(0, 1)
-        if self.config.attention_cp_layout == "contiguous":
-            input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
-                (input_ids, position_ids, padding_mask, mtp_input_mask),
-                self.cp_group,
-                packed_seq_params,
-                fill_values=(0, 0, True, False),
-            )
-            if mtp_input_mask is not None:
-                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-        else:
-            if mtp_input_mask is None:
-                input_ids, _ = roll_tensor(
-                    input_ids,
-                    shifts=-1,
-                    dims=-1,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
-                    return_sum=False,
+        if not getattr(self.config, 'enable_chunkpipe', False):
+            if self.config.attention_cp_layout == "contiguous":
+                input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
+                    (input_ids, position_ids, padding_mask, mtp_input_mask),
+                    self.cp_group,
+                    packed_seq_params,
+                    fill_values=(0, 0, True, False),
                 )
+                if mtp_input_mask is not None:
+                    mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
             else:
-                # Roll IDs and validity together so CP performs one boundary exchange.
-                token_metadata = torch.cat(
-                    (input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0
-                )
-                token_metadata, _ = roll_tensor(
-                    token_metadata,
+                if mtp_input_mask is None:
+                    input_ids, _ = roll_tensor(
+                        input_ids,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.cp_group,
+                        packed_seq_params=packed_seq_params,
+                        return_sum=False,
+                    )
+                else:
+                    # Roll IDs and validity together so CP performs one boundary exchange.
+                    token_metadata = torch.cat(
+                        (input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0
+                    )
+                    token_metadata, _ = roll_tensor(
+                        token_metadata,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.cp_group,
+                        packed_seq_params=packed_seq_params,
+                        return_sum=False,
+                    )
+                    input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
+                    mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+                position_ids, _ = roll_tensor(
+                    position_ids,
                     shifts=-1,
                     dims=-1,
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
-                input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
-                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-            position_ids, _ = roll_tensor(
-                position_ids,
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
-            )
-            if padding_mask is not None:
-                # Roll validity so zero-filled sequence ends remain padding.
-                valid_mask, _ = roll_tensor(
-                    ~padding_mask,
-                    shifts=-1,
-                    dims=-1,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
-                    return_sum=False,
+                if padding_mask is not None:
+                    # Roll validity so zero-filled sequence ends remain padding.
+                    valid_mask, _ = roll_tensor(
+                        ~padding_mask,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.cp_group,
+                        packed_seq_params=packed_seq_params,
+                        return_sum=False,
+                    )
+                    padding_mask = ~valid_mask
+            if padding_mask is not None and self.config.sequence_parallel:
+                padding_mask = (
+                    scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
                 )
-                padding_mask = ~valid_mask
-        if padding_mask is not None and self.config.sequence_parallel:
-            padding_mask = (
-                scatter_to_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -2686,6 +2687,25 @@ class MultiTokenPredictionBlock(MegatronModule):
         if hidden_state_mixing_enabled:
             hidden_state_history = [hidden_states]
 
+        if self.config.enable_chunkpipe and decoder_input is None:
+            full_input_ids = input_ids
+            full_position_ids = position_ids
+            full_mtp_input_mask = mtp_input_mask
+            full_padding_mask = padding_mask
+            if full_padding_mask is not None and self.sequence_parallel:
+                full_padding_mask = gather_from_sequence_parallel_region(
+                    full_padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=self.tp_group,
+                ).transpose(0, 1)
+            roll_packed_seq_params = packed_seq_params
+            if (
+                getattr(self.config, 'sft_chunkpipe_mode', False)
+                and full_input_ids is not None
+                and full_input_ids.size(-1) > self.config.chunksize
+            ):
+                roll_packed_seq_params = None
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 
@@ -2712,6 +2732,71 @@ class MultiTokenPredictionBlock(MegatronModule):
                         return_sum=False,
                     )
                     padding_mask = ~valid_mask.transpose(0, 1).contiguous()
+
+            if self.config.enable_chunkpipe and decoder_input is None:
+                full_input_ids, _ = roll_tensor(
+                    full_input_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=roll_packed_seq_params,
+                    return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
+                )
+                full_position_ids, _ = roll_tensor(
+                    full_position_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=roll_packed_seq_params,
+                    return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
+                )
+                if full_mtp_input_mask is not None:
+                    full_mtp_input_mask, _ = roll_tensor(
+                        full_mtp_input_mask,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.cp_group,
+                        packed_seq_params=roll_packed_seq_params,
+                        return_sum=False,
+                        cp_layout=self.config.attention_cp_layout,
+                        fill_value=False,
+                    )
+                if full_padding_mask is not None:
+                    full_valid_mask, _ = roll_tensor(
+                        ~full_padding_mask,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=self.cp_group,
+                        packed_seq_params=roll_packed_seq_params,
+                        return_sum=False,
+                        cp_layout=self.config.attention_cp_layout,
+                        fill_value=False,
+                    )
+                    full_padding_mask = ~full_valid_mask
+                chunk_size = self.config.chunksize
+                layer_input_ids = full_input_ids[:, :chunk_size].clone()
+                layer_position_ids = full_position_ids[:, :chunk_size].clone()
+                layer_mtp_input_mask = (
+                    None
+                    if full_mtp_input_mask is None
+                    else full_mtp_input_mask[:, :chunk_size].clone()
+                )
+                if full_padding_mask is None:
+                    layer_padding_mask = None
+                else:
+                    sequence_parallel_scale = (
+                        get_pg_size(self.tp_group) if self.sequence_parallel else 1
+                    )
+                    layer_padding_mask = full_padding_mask[
+                        :, : chunk_size // sequence_parallel_scale
+                    ].clone()
+            else:
+                layer_input_ids = input_ids
+                layer_position_ids = position_ids
+                layer_mtp_input_mask = mtp_input_mask
+                layer_padding_mask = padding_mask
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.
@@ -2783,11 +2868,11 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask = self.layers[
                 layer_idx
             ](
-                input_ids=input_ids,
-                position_ids=position_ids,
+                input_ids=layer_input_ids,
+                position_ids=layer_position_ids,
                 hidden_states=hidden_states_input,
                 attention_mask=attention_mask,
-                padding_mask=padding_mask,
+                padding_mask=layer_padding_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
@@ -2798,7 +2883,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
                 decoder_input=decoder_input,
-                mtp_input_mask=mtp_input_mask,
+                mtp_input_mask=layer_mtp_input_mask,
                 **(extra_block_kwargs or {}),
             )
 
