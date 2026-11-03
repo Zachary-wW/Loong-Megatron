@@ -313,7 +313,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
-    device_count = torch.cuda.device_count()
+    if args.preprocess_data_on_cpu:
+        device_count = int(os.environ.get("FAKE_GPU_COUNT", "8"))
+    else:
+        device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
         print_rank_0("torch distributed is already initialized, skipping initialization ...")
@@ -325,7 +328,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
-            torch.cuda.set_device(args.local_rank)
+            if args.preprocess_data_on_cpu:
+                print("CUDA not available, running on CPU")
+            else:
+                torch.cuda.set_device(args.local_rank)
             device_id = torch.device(f'cuda:{args.local_rank}')
         else:
             device_id = None

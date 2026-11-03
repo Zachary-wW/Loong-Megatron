@@ -1376,8 +1376,11 @@ def validate_args(args, defaults={}):
         )
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
-        and get_device_arch_version() < 10:
+    if (
+        (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1)
+        and not args.preprocess_data_on_cpu
+        and get_device_arch_version() < 10
+    ):
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_megatron_fsdp:
             fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Megatron-FSDP"
@@ -3311,6 +3314,9 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 or msc dataloader')
     group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
                        help='The sample surplus to build for the mid-level datasets(s)')
+    group.add_argument('--preprocess-data-on-cpu', action='store_true',
+                       default=None,
+                       help='If set, initialize the dataset on the CPU.')
     group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
                        help='Whether to prevent pad tokens already present in the dataset '
                        'from being masked out when the pad token incorrectly shares the same id '
