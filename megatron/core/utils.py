@@ -2302,6 +2302,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    chunkpipe_variable_seq_lengths: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2342,6 +2343,9 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        chunkpipe_variable_seq_lengths (bool): Whether ChunkPipe chunks can
+            have different sequence lengths and must broadcast their current
+            width before allocating receive buffers.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
@@ -2376,6 +2380,13 @@ def get_batch_on_this_tp_rank(
                 batch['tokens'].shape[1], dtype=torch.int32, device=torch.cuda.current_device()
             )
             _broadcast(hybrid_cp_seq_length)
+        if chunkpipe_variable_seq_lengths:
+            chunkpipe_seq_length = torch.tensor(
+                [batch['tokens'].shape[1]],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            _broadcast(chunkpipe_seq_length)
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
@@ -2442,6 +2453,12 @@ def get_batch_on_this_tp_rank(
             shape = (micro_batch_size, hybrid_cp_seq_length.item())
         else:
             shape = (micro_batch_size, seq_length)
+        if chunkpipe_variable_seq_lengths:
+            chunkpipe_seq_length = torch.empty(
+                (1,), dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            _broadcast(chunkpipe_seq_length)
+            shape = (micro_batch_size, int(chunkpipe_seq_length.item()))
 
         tokens = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         labels = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())

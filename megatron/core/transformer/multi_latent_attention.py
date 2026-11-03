@@ -340,7 +340,8 @@ class MultiLatentAttention(Attention):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
 
-        total_cache_tokens = self.kv_cache_chunk_size * self.config.chunksize
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        total_cache_tokens = self.kv_cache_chunk_size * slot_size
         if self.config.sft_chunkpipe_mode:
             # SFT packed sequence: no batch dimension
             kv_cache_shape = (total_cache_tokens // get_pg_size(self.pg_collection.tp),
@@ -394,11 +395,14 @@ class MultiLatentAttention(Attention):
         chunk_id = self.empty_chunk_indices.pop(0)
         self.micro_batch_to_cache_chunk_map[self.config.chunkpipe_forward_microbatch] = chunk_id
 
-        # Store compressed KV and positional embeddings
+        # Cache slots use max_chunk_size as a fixed stride; each write uses the
+        # current chunk's actual length.
         tp_size = get_pg_size(self.pg_collection.tp)
-        kv_cache_indices = torch.arange(self.config.chunksize // tp_size) + \
-            (chunk_id * self.config.chunksize // tp_size)
-        pos_cache_indices = torch.arange(self.config.chunksize) + (chunk_id * self.config.chunksize)
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        kv_len = normed_kv_compressed.shape[0]
+        pos_len = k_pos_emb.shape[0]
+        kv_cache_indices = torch.arange(kv_len) + (chunk_id * slot_size // tp_size)
+        pos_cache_indices = torch.arange(pos_len) + (chunk_id * slot_size)
 
         # When the 3rd dim of k_pos_emb is smaller than the cache,
         # only write to the first corresponding indices
@@ -501,8 +505,10 @@ class MultiLatentAttention(Attention):
         cached_kv_compressed = []
         cached_key_pos_emb = []
 
-        # Calculate total sequence length after concatenation
-        total_concatenated_tokens = (current_chunk_idx + 1) * self.config.chunksize
+        cu_chunks = self.config.cu_chunks
+        chunk_sizes = self.config.chunk_sizes
+        slot_size = self.config.max_chunk_size or self.config.chunksize
+        total_concatenated_tokens = cu_chunks[current_chunk_idx + 1]
 
         # Detect packed sequence mode (SFT chunkpipe uses packed sequences,
         # where batch dim is squeezed: key/value are 3D [t, n, d] instead of 4D [s, b, n, d])
@@ -563,11 +569,16 @@ class MultiLatentAttention(Attention):
             # Get the cache index for this previous chunk
             cache_chunk_idx = self.micro_batch_to_cache_chunk_map[start_microbatch_idx + prev_chunk_idx]
 
-            # Calculate tensor parallel indices for retrieving cached data
+            # Cache slots are slot_size-strided, but only the previous chunk's
+            # real token count is read.
+            previous_chunk_size = chunk_sizes[prev_chunk_idx]
             tp_size = get_pg_size(self.pg_collection.tp)
-            kv_indices = torch.arange(self.config.chunksize // tp_size) + \
-                (cache_chunk_idx * self.config.chunksize // tp_size)
-            pos_indices = torch.arange(self.config.chunksize) + (cache_chunk_idx * self.config.chunksize)
+            kv_indices = torch.arange(previous_chunk_size // tp_size) + (
+                cache_chunk_idx * slot_size // tp_size
+            )
+            pos_indices = torch.arange(previous_chunk_size) + (
+                cache_chunk_idx * slot_size
+            )
 
             # Retrieve compressed KV and positional embeddings from cache
             if self.config.sft_chunkpipe_mode:
@@ -592,32 +603,32 @@ class MultiLatentAttention(Attention):
                 cached_key_pos_emb[-1]
             )
 
-            # Concatenate along sequence dimension
-            concatenated_key[current_pos : current_pos + self.config.chunksize] = \
-                cached_key
-            concatenated_value[current_pos : current_pos + self.config.chunksize] = \
-                cached_value
-            current_pos += self.config.chunksize
+            concatenated_key[current_pos : current_pos + previous_chunk_size] = cached_key
+            concatenated_value[current_pos : current_pos + previous_chunk_size] = cached_value
+            current_pos += previous_chunk_size
 
         # Add the current chunk's keys and values to the concatenated result
-        concatenated_key[current_pos : current_pos + self.config.chunksize] = \
-            curr_key
-        concatenated_value[current_pos : current_pos + self.config.chunksize] = \
-            curr_value
+        current_chunk_size = curr_key.shape[0]
+        concatenated_key[current_pos : current_pos + current_chunk_size] = curr_key
+        concatenated_value[current_pos : current_pos + current_chunk_size] = curr_value
 
         # Adjust attention mask for autoregressive (causal) attention
         adjusted_mask = None
         if attention_mask is not None:
-            chunksize = self.config.chunksize
-            # Create a mask that prevents attending to future tokens
-            mask_org = torch.ones(chunksize, total_concatenated_tokens, dtype=torch.bool,
-                device=self.kv_compressed_cache.device)
-            mask_index = current_chunk_idx * chunksize + 1
+            mask_org = torch.ones(
+                current_chunk_size,
+                total_concatenated_tokens,
+                dtype=torch.bool,
+                device=self.kv_compressed_cache.device,
+            )
+            mask_index = cu_chunks[current_chunk_idx] + 1
             # Apply upper triangular masking (applying in-place operation triu_ to avoid doubling memory)
             mask_org.triu_(diagonal=mask_index)
             # Reshape mask to match attention mechanism requirements
             # Using .view creates a new tensor without allocating additional memory
-            adjusted_mask = mask_org.view(1, 1, chunksize, total_concatenated_tokens)
+            adjusted_mask = mask_org.view(
+                1, 1, current_chunk_size, total_concatenated_tokens
+            )
 
         return concatenated_key, concatenated_value, adjusted_mask
 
@@ -1128,17 +1139,36 @@ class MLASelfAttention(MultiLatentAttention):
             inference_context, None, hidden_states, self.config, packed_seq_params
         )
 
+        pos_emb_offset = 0
+        if self.config.enable_chunkpipe:
+            if self.config.sft_chunkpipe_mode:
+                chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            else:
+                chunk_index = self.config.chunkpipe_forward_microbatch % (
+                    self.config.chunk_num_per_seq
+                )
+                if not self.config.chunkpipe_forward:
+                    chunk_index = self.config.chunkpipe_backward_microbatch % (
+                        self.config.chunk_num_per_seq
+                    )
+            pos_emb_offset = self.config.cu_chunks[chunk_index]
+
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len, offset=pos_emb_offset, packed_seq=thd_packed_seq
+            )
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+                    rotary_seq_len,
+                    offset=pos_emb_offset,
+                    dtype=hidden_states.dtype,
+                    packed_seq=thd_packed_seq,
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -1148,7 +1178,7 @@ class MLASelfAttention(MultiLatentAttention):
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq=thd_packed_seq
+                    rotary_seq_len, offset=pos_emb_offset, packed_seq=thd_packed_seq
                 )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':

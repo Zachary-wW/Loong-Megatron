@@ -2775,7 +2775,11 @@ class MultiTokenPredictionBlock(MegatronModule):
                         fill_value=False,
                     )
                     full_padding_mask = ~full_valid_mask
-                chunk_size = self.config.chunksize
+                chunk_sizes = getattr(self.config, 'chunk_sizes', None)
+                if chunk_sizes is not None:
+                    chunk_size = chunk_sizes[self.config.chunkpipe_chunk_idx_in_group]
+                else:
+                    chunk_size = self.config.chunksize
                 layer_input_ids = full_input_ids[:, :chunk_size].clone()
                 layer_position_ids = full_position_ids[:, :chunk_size].clone()
                 layer_mtp_input_mask = (

@@ -3245,6 +3245,9 @@ def dummy_train_step(data_iterator):
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
                 is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+                chunkpipe_variable_seq_lengths=getattr(
+                    args, 'chunkpipe_variable_chunk', False
+                ),
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
@@ -5748,7 +5751,7 @@ def evaluate(
             evaluation_num_microbatches = scheduled_eval_num_microbatches
             evaluation_seq_length = args.seq_length
             if args.enable_chunkpipe:
-                evaluation_seq_length = args.chunksize
+                evaluation_seq_length = args.max_chunk_size or args.chunksize
                 if not args.sft_chunkpipe_mode:
                     evaluation_num_microbatches *= args.chunk_num_per_seq
 
@@ -6162,9 +6165,11 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     def _get_iterator(args, dataloader_type, dataloader):
         """Return dataset iterator."""
         if args.enable_chunkpipe:
-            num_chunks = args.seq_length // args.chunksize
+            num_chunks = args.chunk_num_per_seq
             if dataloader_type == "single":
-                return ChunkDataIterator(num_chunks, iter(dataloader))
+                return ChunkDataIterator(
+                    num_chunks, iter(dataloader), chunk_sizes=args.chunk_sizes
+                )
             if dataloader_type == "external":
                 # SFT external datasets already emit chunk-level samples.
                 if isinstance(dataloader, list):

@@ -668,7 +668,16 @@ class TransformerConfig(ModelParallelConfig):
     """Number of tokens in each ChunkPipe chunk."""
 
     chunk_num_per_seq: int = 0
-    """Number of chunks per sequence, calculated as seq_length // chunksize."""
+    """Number of chunks per sequence."""
+
+    chunk_sizes: Optional[list] = None
+    """Per-chunk token counts in sequence order."""
+
+    cu_chunks: Optional[list] = None
+    """Prefix sums of chunk_sizes, including the zero start and trailing end."""
+
+    max_chunk_size: int = 0
+    """Largest chunk size, used for cache slot stride and shape hints."""
 
     keep_activations_chunks: int = 0
     """Number of trailing chunks whose activations are retained."""

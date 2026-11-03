@@ -1973,14 +1973,78 @@ def validate_args(args, defaults={}):
         assert not args.create_attention_mask_in_dataloader, (
             "ChunkPipe requires --no-create-attention-mask-in-dataloader."
         )
-        assert args.chunksize, "chunksize is not set"
         assert args.keep_activations_chunks >= 0, "keep activations chunks should be >= 0"
 
-        args.chunk_num_per_seq = args.seq_length // args.chunksize
         args.sft_chunkpipe_mode = bool(args.sft)
+
+        if args.chunk_sizes is not None:
+            assert len(args.chunk_sizes) > 0, "--chunk-sizes must be non-empty"
+            assert all(size > 0 for size in args.chunk_sizes), (
+                "--chunk-sizes must be positive"
+            )
+            if args.sft_chunkpipe_mode:
+                raise RuntimeError(
+                    "--chunk-sizes is not supported with --sft: the SFT collator pads "
+                    "every chunk to --chunksize, so the table cannot describe the real "
+                    "chunk widths. Use --chunksize for uniform SFT chunks."
+                )
+            if sum(args.chunk_sizes) != args.seq_length:
+                raise RuntimeError(
+                    f"sum(chunk_sizes)={sum(args.chunk_sizes)} must equal "
+                    f"seq_length={args.seq_length}."
+                )
+            args.chunk_num_per_seq = len(args.chunk_sizes)
+            args.chunksize = max(args.chunk_sizes)
+        else:
+            assert args.chunksize, "chunksize is not set"
+            if not args.sft_chunkpipe_mode and args.seq_length % args.chunksize != 0:
+                raise RuntimeError("seq_length is not divided by chunksize.")
+            args.chunk_num_per_seq = args.seq_length // args.chunksize
+            args.chunk_sizes = [args.chunksize] * args.chunk_num_per_seq
+
+        args.cu_chunks = [0]
+        for chunk_size in args.chunk_sizes:
+            args.cu_chunks.append(args.cu_chunks[-1] + chunk_size)
+        args.max_chunk_size = max(args.chunk_sizes)
+
+        args.chunkpipe_variable_chunk = len(set(args.chunk_sizes)) > 1
+        if args.chunkpipe_variable_chunk:
+            args.variable_seq_lengths = True
+            if args.cuda_graph_impl != "none":
+                raise RuntimeError(
+                    "variable-length ChunkPipe is incompatible with CUDA graphs."
+                )
+            if not args.calculate_per_token_loss:
+                raise RuntimeError(
+                    "variable-length ChunkPipe requires --calculate-per-token-loss: "
+                    "per-chunk loss normalization otherwise over-weights shorter chunks."
+                )
+
+        if (
+            args.multi_latent_attention
+            and args.tensor_model_parallel_size > 1
+            and not args.sequence_parallel
+        ):
+            raise RuntimeError(
+                "ChunkPipe with multi-latent attention requires --sequence-parallel "
+                "when tensor_model_parallel_size > 1."
+            )
+
+        if args.sequence_parallel and args.tensor_model_parallel_size > 1:
+            bad_chunk_sizes = [
+                size
+                for size in args.chunk_sizes
+                if size % args.tensor_model_parallel_size != 0
+            ]
+            if bad_chunk_sizes:
+                raise RuntimeError(
+                    f"chunk sizes {bad_chunk_sizes} are not divisible by "
+                    f"tensor_model_parallel_size={args.tensor_model_parallel_size}."
+                )
+
         if not args.sft_chunkpipe_mode:
-            if args.seq_length % args.chunksize != 0:
-                raise RuntimeError('seq_length is not divided by chunksize.')
+            if sum(args.chunk_sizes) != args.seq_length:
+                raise RuntimeError("sum(chunk_sizes) does not cover seq_length.")
             if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
                 raise RuntimeError(
                     'num chunks is not divided by pipeline model parallel size.'
@@ -2884,6 +2948,14 @@ def _add_training_args(parser):
         help='Split each sequence into causal chunks processed as a pipeline group.',
     )
     group.add_argument('--chunksize', type=int, default=0, help='Size of each ChunkPipe chunk.')
+    group.add_argument(
+        '--chunk-sizes',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Per-chunk token counts for variable-length ChunkPipe. Values must be '
+        'positive and sum to --seq-length.',
+    )
     group.add_argument(
         '--keep-activations-chunks',
         type=int,
