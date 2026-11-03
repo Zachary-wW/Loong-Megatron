@@ -1062,6 +1062,22 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    enable_moe_mem_monitor: bool = False
+    """Whether to enable MoE memory and dispatcher-token monitoring."""
+
+    print_moe_mem_monitor_interval: int = field(
+        default=1000, metadata={"argparse_meta": {"default": 100000}}
+    )
+    """Interval at which MoE memory monitor data is written."""
+
+    moe_mem_monitor_log: str | None = None
+    """Directory where MoE memory monitor data is written."""
+
+    moe_mem_monitor_force_print_token_threshold: int = field(
+        default=100_000_000, metadata={"argparse_meta": {"default": 10_000_000}}
+    )
+    """Force monitor output when peak dispatcher tokens exceed this threshold."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
