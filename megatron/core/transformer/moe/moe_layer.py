@@ -20,7 +20,11 @@ from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
+    initialize_cuda_monitoring,
     maybe_skip_or_early_return_by_cudagraph,
+    monitor_max_dispatcher_tokens,
+    monitor_max_memory_usage,
+    write_monitor_data_to_file,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -390,6 +394,16 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        if config.enable_moe_mem_monitor:
+            initialize_cuda_monitoring(
+                tp_rank=utils.get_pg_rank(pg_collection.tp),
+                pp_rank=utils.get_pg_rank(pg_collection.pp),
+                ep_rank=utils.get_pg_rank(pg_collection.ep),
+                mem_monitor_force_print_token_threshold=(
+                    config.moe_mem_monitor_force_print_token_threshold
+                ),
+            )
+
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
             if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -622,6 +636,14 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        if self.config.enable_moe_mem_monitor:
+            monitor_max_memory_usage()
+            monitor_max_dispatcher_tokens(tokens_per_expert)
+            if self.config.moe_mem_monitor_log is not None:
+                write_monitor_data_to_file(
+                    self.config.moe_mem_monitor_log,
+                    self.config.print_moe_mem_monitor_interval,
+                )
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(

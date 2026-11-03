@@ -2,7 +2,9 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -1814,3 +1816,98 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         return wrapped_func
 
     return decorator
+
+
+CUDA_MONITOR_UTIL = {}
+MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD = 1000000000
+
+
+def initialize_cuda_monitoring(
+    tp_rank: int,
+    pp_rank: int,
+    ep_rank: int | None = None,
+    mem_monitor_force_print_token_threshold: int | None = None,
+) -> None:
+    """Initialize per-rank CUDA memory and dispatcher-token monitoring."""
+    rank = torch.distributed.get_rank()
+    if rank in CUDA_MONITOR_UTIL:
+        return
+    CUDA_MONITOR_UTIL[rank] = {
+        "tp_rank": tp_rank,
+        "pp_rank": pp_rank,
+        "max_dispatcher_tokens": 0,
+        "index": 0,
+    }
+    if ep_rank is not None:
+        CUDA_MONITOR_UTIL[rank]["ep_rank"] = ep_rank
+    global MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD
+    MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD = mem_monitor_force_print_token_threshold
+
+
+def monitor_max_memory_usage() -> None:
+    """Record the current CUDA peak reserved and allocated memory."""
+    rank = torch.distributed.get_rank()
+    CUDA_MONITOR_UTIL[rank]["max_mem_reserved"] = torch.cuda.max_memory_reserved()
+    CUDA_MONITOR_UTIL[rank]["max_mem_allocated"] = torch.cuda.max_memory_allocated()
+
+
+def monitor_max_dispatcher_tokens(tokens_per_expert: torch.Tensor) -> None:
+    """Record the peak total number of tokens dispatched to local experts."""
+    rank = torch.distributed.get_rank()
+    cur_tokens = tokens_per_expert.sum().item()
+    if cur_tokens > CUDA_MONITOR_UTIL[rank]["max_dispatcher_tokens"]:
+        CUDA_MONITOR_UTIL[rank]["max_dispatcher_tokens"] = cur_tokens
+
+
+def write_monitor_data_to_file(monitor_dir: str, print_mem_monitor_interval: int) -> None:
+    """Write per-rank monitor data and aggregate numeric rank files from rank zero."""
+    rank = torch.distributed.get_rank()
+    data = CUDA_MONITOR_UTIL[rank]
+    data["index"] += 1
+    max_dispatcher_tokens = data["max_dispatcher_tokens"]
+    force_print = False
+    global MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD
+    if max_dispatcher_tokens > MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD:
+        print(
+            f"WARNING: max_dispatcher_tokens({max_dispatcher_tokens}) "
+            f"exceeds threshold of {MEM_MONITOR_FORCE_PRINT_TOKEN_THRESHOLD}. Printing anyway."
+        )
+        if data["index"] % print_mem_monitor_interval != 1:
+            force_print = True
+    if force_print or data["index"] % print_mem_monitor_interval == 0:
+        os.makedirs(monitor_dir, exist_ok=True)
+        temp_path = os.path.join(monitor_dir, f"{rank}_temp")
+        rank_path = os.path.join(monitor_dir, f"{rank}")
+        with open(temp_path, "w", encoding="utf-8") as rank_file:
+            rank_file.write(
+                f"rank: {rank}|t: {data['tp_rank']}|p: {data['pp_rank']}|e: {data.get('ep_rank')}"
+            )
+            rank_file.write(
+                f"|max_mem_reserved: {data['max_mem_reserved']}"
+                f"|max_mem_allocated: {data['max_mem_allocated']}"
+                f"|max_dispatcher_tokens: {data['max_dispatcher_tokens']}"
+            )
+        os.replace(temp_path, rank_path)
+    if force_print or (
+        rank == 0
+        and data["index"] > 1
+        and data["index"] % print_mem_monitor_interval == 1
+    ):
+        process_numeric_files(monitor_dir, os.path.join(monitor_dir, "monitor_data"))
+
+
+def process_numeric_files(input_dir: str, output_file: str) -> None:
+    """Concatenate numeric per-rank files in rank order into one timestamped file."""
+    numeric_files = []
+    for filename in os.listdir(input_dir):
+        full_path = os.path.join(input_dir, filename)
+        if os.path.isfile(full_path) and filename.isdigit():
+            numeric_files.append((int(filename), full_path))
+
+    numeric_files.sort(key=lambda item: item[0])
+    formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with open(output_file + formatted_time, "wb") as output:
+        for _, filepath in numeric_files:
+            with open(filepath, "rb") as rank_file:
+                output.write(rank_file.read())
+                output.write(b"\n")
