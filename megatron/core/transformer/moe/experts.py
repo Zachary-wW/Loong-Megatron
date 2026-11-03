@@ -928,6 +928,14 @@ class TEGroupedMLP(MegatronModule):
         x = x.view(shape)
         return x
 
+    def _needs_quantization_padding(self) -> bool:
+        """Return whether either grouped linear executes with a quantized recipe."""
+        if not (self.config.fp8 or self.config.fp4):
+            return False
+        return self.linear_fc1.will_execute_quantized(
+            is_context_quantized=True
+        ) or self.linear_fc2.will_execute_quantized(is_context_quantized=True)
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -984,7 +992,7 @@ class TEGroupedMLP(MegatronModule):
         # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
         # applies its common aligned-segment contract to the GroupedTensor backend so quantized
         # grouped execution receives supported shapes
-        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+        elif self._needs_quantization_padding() or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(

@@ -3189,16 +3189,6 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
-            "sigmoid",
-            "sqrtsoftplus",
-        ):
-            raise ValueError(
-                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
-                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
-                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
-            )
-
         if self.moe_num_hash_layers > 0:
             if self.moe_shortcut_connection:
                 raise ValueError(
