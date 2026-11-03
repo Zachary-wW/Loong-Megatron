@@ -395,8 +395,13 @@ def forward_step_calc_loss(
             # changes, carry the scale per autograd context instead of via a
             # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            loss_denominator = (
+                num_microbatches / config.chunk_num_per_seq
+                if config.enable_chunkpipe
+                else num_microbatches
+            )
             experimental_attention_variant_loss_scale_func(
-                loss_scale * cp_size_for_scaling / num_microbatches
+                loss_scale * cp_size_for_scaling / loss_denominator
             )
 
     return output_tensor, num_tokens
