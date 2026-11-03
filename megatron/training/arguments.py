@@ -1986,6 +1986,27 @@ def validate_args(args, defaults={}):
                     'num chunks is not divided by pipeline model parallel size.'
                 )
 
+        if args.sft_chunkpipe_mode:
+            # External SFT input is already chunk-level. The global batch must
+            # contain at least one theoretical maximum sequence group.
+            chunk_microbatches_per_global_batch = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size
+            )
+            if chunk_microbatches_per_global_batch < args.chunk_num_per_seq:
+                args.global_batch_size = (
+                    args.chunk_num_per_seq
+                    * args.micro_batch_size
+                    * args.data_parallel_size
+                )
+                print_rank_0(
+                    '[SFT ChunkPipe] auto-inflated global_batch_size to '
+                    f'{args.global_batch_size} to fit '
+                    f'chunk_num_per_seq={args.chunk_num_per_seq}.'
+                )
+            args.chunkpipe_num_microbatches = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size
+            )
+
         if args.chunk_num_per_seq < args.keep_activations_chunks:
             raise RuntimeError(
                 'num chunks to keep activations cannot be larger than num chunks.'

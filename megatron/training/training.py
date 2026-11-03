@@ -5745,6 +5745,13 @@ def evaluate(
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
 
+            evaluation_num_microbatches = scheduled_eval_num_microbatches
+            evaluation_seq_length = args.seq_length
+            if args.enable_chunkpipe:
+                evaluation_seq_length = args.chunksize
+                if not args.sft_chunkpipe_mode:
+                    evaluation_num_microbatches *= args.chunk_num_per_seq
+
             ft_integration.on_eval_step_start()
 
             callback_manager.trigger(step_start_event)
@@ -5755,8 +5762,8 @@ def evaluate(
                     forward_step_func=forward_step_func,
                     data_iterator=packed_data_iterator,
                     model=model,
-                    num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    num_microbatches=evaluation_num_microbatches,
+                    seq_length=evaluation_seq_length,
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
