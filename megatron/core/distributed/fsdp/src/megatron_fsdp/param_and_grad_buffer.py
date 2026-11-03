@@ -5086,6 +5086,10 @@ class AllGatherPipeline:
         else:
             buf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
 
+        if buf is None:
+            self.bucket_status[bucket_key] = BucketStatus.EMPTY
+            return
+
         buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
 
@@ -5131,6 +5135,9 @@ class AllGatherPipeline:
         # Retrieve the buffer associated with the DP-Shard PG
         # that backs the model compute weights.
         wbuf = self.get_fsdp_buffer(bucket_id, bwd)
+        if wbuf is None:
+            self.bucket_status[bucket_key] = BucketStatus.EMPTY
+            return
 
         # Lazy release the unused buckets.
         self.recycle_unused_buckets()
