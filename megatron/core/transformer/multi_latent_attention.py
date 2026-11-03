@@ -750,10 +750,13 @@ class MultiLatentAttention(Attention):
             key, value, attention_mask = self.concat_cached_chunk_key_value_mla(
                 attention_mask, key, value
             )
-            if not self.config.sft_chunkpipe_mode or (
-                self.config.chunkpipe_current_group_size > 1
-                and self.config.chunkpipe_chunk_idx_in_group > 0
-            ):
+            if (
+                not self.config.sft_chunkpipe_mode
+                or (
+                    self.config.chunkpipe_current_group_size > 1
+                    and self.config.chunkpipe_chunk_idx_in_group > 0
+                )
+            ) and self.config.experimental_attention_variant != "dsa":
                 attn_mask_type = AttnMaskType.causal_bottom_right
                 packed_seq_params = None
 
