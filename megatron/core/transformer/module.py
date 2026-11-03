@@ -501,7 +501,11 @@ def convert_module_to_dtype_except_fp32_marked(
     return module._apply(
         lambda tensor: (
             tensor.to(dtype)
-            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
+            if tensor.is_floating_point()
+            and not (
+                getattr(tensor, 'keep_in_fp32', False)
+                or getattr(tensor, '_keep_in_float32', False)
+            )
             else tensor
         )
     )
