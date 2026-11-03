@@ -1969,6 +1969,37 @@ def validate_args(args, defaults={}):
         "CUDA graphs are not supported with --moe-shortcut-connection."
     )
 
+    if args.enable_chunkpipe:
+        assert not args.create_attention_mask_in_dataloader, (
+            "ChunkPipe requires --no-create-attention-mask-in-dataloader."
+        )
+        assert args.chunksize, "chunksize is not set"
+        assert args.keep_activations_chunks >= 0, "keep activations chunks should be >= 0"
+
+        args.chunk_num_per_seq = args.seq_length // args.chunksize
+        args.sft_chunkpipe_mode = bool(args.sft)
+        if not args.sft_chunkpipe_mode:
+            if args.seq_length % args.chunksize != 0:
+                raise RuntimeError('seq_length is not divided by chunksize.')
+            if args.chunk_num_per_seq % args.pipeline_model_parallel_size != 0:
+                raise RuntimeError(
+                    'num chunks is not divided by pipeline model parallel size.'
+                )
+
+        if args.chunk_num_per_seq < args.keep_activations_chunks:
+            raise RuntimeError(
+                'num chunks to keep activations cannot be larger than num chunks.'
+            )
+
+        assert not args.recompute_granularity, (
+            "cannot set recompute_granularity under chunkpipe mode"
+        )
+        assert not args.recompute_method, "cannot set recompute method under chunkpipe mode"
+        assert not args.recompute_num_layers, "cannot set recompute layers under chunkpipe mode"
+        assert not args.custom_pipeline_recompute_layers, (
+            "cannot set recompute under chunkpipe mode"
+        )
+
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
 
@@ -2825,6 +2856,19 @@ def _add_training_args(parser):
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
+
+    group.add_argument(
+        '--enable-chunkpipe',
+        action='store_true',
+        help='Split each sequence into causal chunks processed as a pipeline group.',
+    )
+    group.add_argument('--chunksize', type=int, default=0, help='Size of each ChunkPipe chunk.')
+    group.add_argument(
+        '--keep-activations-chunks',
+        type=int,
+        default=0,
+        help='Number of trailing ChunkPipe chunks whose activations are retained.',
+    )
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
