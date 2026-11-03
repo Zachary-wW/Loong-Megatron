@@ -48,16 +48,18 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.argument_utils import (
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
     get_run_config,
     initialize_runtime_services,
     set_run_config,
 )
+from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
@@ -222,6 +224,9 @@ def get_batch(data_iterator, vp_stage=None):
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        chunkpipe_variable_seq_lengths=getattr(
+            args, 'chunkpipe_variable_chunk', False
+        ),
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
