@@ -2118,6 +2118,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         )
         return _detached("_zc_fwd_token_buf"), dispatch_grad_input
 
+    @property
+    def metadata(self):
+        """Return the backend-owned dispatch metadata handle."""
+        return self._comm_manager
+
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
         Initialize the routing map and probs to a unified format covering the TPxEP group.
