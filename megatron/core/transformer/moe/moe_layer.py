@@ -269,6 +269,10 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        self.routed_experts_recompute = (
+            config.recompute_granularity == 'selective'
+            and "routed_experts" in config.recompute_modules
+        )
 
         self.tp_group = pg_collection.tp
 
@@ -769,6 +773,20 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        def routed_experts_forward(hidden_states, shared_expert_output=None):
+            probs, routing_map = self.route(
+                hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+            )
+            hidden_states, probs = self.preprocess(
+                hidden_states, probs, routing_map, padding_mask
+            )
+            dispatched_input, probs = self.dispatch(hidden_states, probs)
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+            output = self.combine(output)
+            output = self.postprocess(output, shared_expert_output)
+            return output, mlp_bias
+
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -783,6 +801,33 @@ class MoELayer(BaseMoELayer):
             else:
                 outputs = tensor_parallel.checkpoint(
                     custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                )
+        elif (
+            self.routed_experts_recompute
+            and self.training
+            and torch.is_grad_enabled()
+            and intermediate_tensors is None
+            and self.fwd_execution_map == ["route", "expert_compute", "postprocess"]
+        ):
+            shared_expert_output = self.shared_experts_compute(hidden_states)
+            checkpoint_args = (
+                (hidden_states,)
+                if shared_expert_output is None
+                else (hidden_states, shared_expert_output)
+            )
+            if self.config.fp8 or self.config.fp4:
+                outputs = te_checkpoint(
+                    routed_experts_forward,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.tp_group,
+                    *checkpoint_args,
+                )
+            else:
+                outputs = tensor_parallel.checkpoint(
+                    routed_experts_forward,
+                    False,
+                    *checkpoint_args,
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
