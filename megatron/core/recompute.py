@@ -206,7 +206,12 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
-    if self.config.recompute_method == 'uniform':
+    if self.config.enable_chunkpipe:
+        # ChunkPipe checkpoints every physical layer independently so only the
+        # trailing activation-retention chunks avoid recomputation.
+        for layer_idx in range(self.num_layers_per_pipeline_rank):
+            chunk_runner(layer_idx, layer_idx + 1, True)
+    elif self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
         layer_idx = 0
