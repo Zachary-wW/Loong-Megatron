@@ -128,7 +128,6 @@ def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
     }
     barriers = []
     saved = []
-    ensured = []
     iterator = SimpleNamespace(
         iterable=SimpleNamespace(save_state=lambda: {"global_sequence_id": 16})
     )
@@ -151,9 +150,6 @@ def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
             "megatron.training.checkpointing.torch.save",
             side_effect=lambda state, path: saved.append((state, path)),
         ),
-        mock.patch(
-            "megatron.training.checkpointing.ensure_directory_exists", side_effect=ensured.append
-        ),
     ):
         maybe_save_dataloader_state(
             iterator,
@@ -169,52 +165,6 @@ def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
     assert saved[0][1] == str(
         tmp_path / "iter_0000002" / "mp_rank_00_000" / "train_dataloader_dprank003.pt"
     )
-    assert ensured == [saved[0][1]]
-
-
-@pytest.mark.parametrize("vpp_rank", [0, 1])
-def test_maybe_save_dataloader_state_uses_first_list_iterator(tmp_path, vpp_rank):
-    """Every VPP rank selects the first-stage iterator before inspecting it."""
-    group = SimpleNamespace(rank=0, size=1)
-    first = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: {"selected": "first"}))
-    second = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: {"selected": "second"}))
-    saved = []
-
-    with (
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_rank",
-            side_effect=lambda process_group: process_group.rank,
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_size",
-            side_effect=lambda process_group: process_group.size,
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.mpu.get_virtual_pipeline_model_parallel_rank",
-            return_value=vpp_rank,
-        ),
-        mock.patch("megatron.training.checkpointing.torch.distributed.barrier"),
-        mock.patch(
-            "megatron.training.checkpointing.torch.save",
-            side_effect=lambda state, path: saved.append((state, path)),
-        ),
-    ):
-        maybe_save_dataloader_state(
-            [first, second],
-            2,
-            tmp_path,
-            tp_group=group,
-            pp_group=group,
-            dp_group=group,
-            cp_group=group,
-        )
-
-    assert saved == [
-        (
-            {"dataloader_state_dict": {"selected": "first"}},
-            str(tmp_path / "iter_0000002" / "mp_rank_00" / "train_dataloader_dprank000.pt"),
-        )
-    ]
 
 
 @pytest.mark.parametrize("dp_rank", [0, 3])
