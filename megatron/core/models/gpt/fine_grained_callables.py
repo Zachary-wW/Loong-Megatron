@@ -17,7 +17,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum, MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 
@@ -106,6 +106,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     sequence_len_offset=sequence_len_offset,
                     padding_mask=padding_mask,
                 )
+                if getattr(layer.config, 'moe_echo_expert_dispatch_overlap', False):
+                    hidden_states = FlushPendingGradAccum.apply(hidden_states)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
@@ -130,7 +132,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if layer._pre_mlp_layernorm_returns_residual:
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
+                if layer.config.moe_enable_echo:
+                    node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                if layer.config.moe_enable_echo:
+                    return hidden_states, None, None, shared_expert_output
                 # Same routing inputs as the eager MoELayer.forward path: the padding mask is
                 # consumed by the router (dropless HybridEP excludes padded tokens).
                 probs, routing_map = layer.mlp.route(
@@ -153,6 +159,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
+
+        if layer.config.moe_enable_echo:
+            pre_mlp_layernorm_output = node.layer_state.pre_mlp_layernorm_output
+            routing_map, probs, expert_offloading_map = layer.mlp._echo_route(
+                pre_mlp_layernorm_output
+            )
+            local_tokens, probs = layer.mlp.preprocess(
+                pre_mlp_layernorm_output, probs, routing_map
+            )
+            node.layer_state.echo_expert_offloading_map = expert_offloading_map
+            node.layer_state.pre_mlp_layernorm_output = None
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -201,7 +218,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             metadata.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        if layer.config.moe_enable_echo:
+            expert_offloading_map = node.layer_state.echo_expert_offloading_map
+            fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata = (
+                layer.mlp._prepare_echo_expert_dispatch(expert_offloading_map)
+            )
+            expert_output = layer.mlp.echo_routed_experts_compute(
+                dispatched_tokens,
+                dispatched_probs,
+                fc1_expert_dispatch_metadata,
+                fc2_expert_dispatch_metadata,
+            )
+            node.layer_state.echo_expert_offloading_map = None
+        else:
+            expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.

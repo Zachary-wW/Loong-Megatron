@@ -190,13 +190,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -3928,6 +3928,13 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if args.moe_echo_dump_dir is not None:
+            from megatron.core.transformer.moe.moe_utils import GLOBAL_MOE_ROUTING_TRACKER
+
+            GLOBAL_MOE_ROUTING_TRACKER.dump_data(
+                os.path.join(args.moe_echo_dump_dir, f"iter_{iteration}")
+            )
+            GLOBAL_MOE_ROUTING_TRACKER.clear_data()
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
