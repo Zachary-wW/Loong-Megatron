@@ -939,6 +939,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
+            if config._uses_fp8_cpu_offload_main_params():
+                self.optimizer.set_fp8_cpu_offload_writeback_plan(
+                    self._get_ordered_fp8_model_params(), self.data_parallel_group
+                )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
@@ -2737,7 +2741,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
             for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
+                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_dtype_key][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
 
@@ -2852,6 +2856,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     main_data.append(main_param.data)
         return model_data, main_data
+
+    def _get_ordered_fp8_model_params(self):
+        """Return FP8 model parameters in rank-invariant grad-buffer order."""
+        assert not self.ddp_config.use_megatron_fsdp, (
+            "FP8 CPU-offload master parameters are not supported with Megatron FSDP."
+        )
+        return [
+            param
+            for buffer in self.buffers
+            for param in buffer.params
+            if is_float8tensor(param)
+        ]
 
     def _get_fp8_params_and_shard_fp32_from_fp8(self):
         """

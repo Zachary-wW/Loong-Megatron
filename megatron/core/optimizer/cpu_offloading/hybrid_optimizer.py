@@ -12,6 +12,8 @@ from megatron.core.fp8_utils import (
     get_fp8_cpu_offload_proxy_numel,
 )
 
+_FP8_WRITEBACK_STAGE_BYTES = 512 * 1024 * 1024
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -84,6 +86,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
+        self._fp8_writeback_waves = None
+        self._fp8_writeback_group = None
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
@@ -122,30 +126,69 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             model_param.clear_high_precision_init_val()
         return master_param
 
-    def _copy_fp8_offload_master_to_model_param(self, proxy_param, cpu_master_param):
-        """Quantize a CPU FP32 master shard back into the real FP8 model parameter."""
+    def set_fp8_cpu_offload_writeback_plan(
+        self, model_params, data_parallel_group, stage_bytes=_FP8_WRITEBACK_STAGE_BYTES
+    ):
+        """Register the rank-invariant plan for FP8 master write-back."""
+        model_params = list(model_params)
+        waves = []
+        current_wave = []
+        current_bytes = 0
+        for model_param in model_params:
+            nbytes = model_param.numel() * 4
+            if current_wave and current_bytes + nbytes > stage_bytes:
+                waves.append(current_wave)
+                current_wave = []
+                current_bytes = 0
+            current_wave.append(model_param)
+            current_bytes += nbytes
+        if current_wave:
+            waves.append(current_wave)
+
+        self._fp8_writeback_waves = waves
+        self._fp8_writeback_group = data_parallel_group
+
+    def _collect_fp8_offload_master_shards(self):
+        """Map FP8 model parameters to their local CPU master shard."""
+        shards = {}
+        for cpu_param, gpu_param in self.cpu_copys_map_gpu_param.items():
+            info = get_fp8_cpu_offload_proxy_info(gpu_param)
+            if info is not None:
+                shards[info.blockwise_fp8_model_param] = (cpu_param, info.start_offset)
+        return shards
+
+    def _writeback_fp8_cpu_offload_masters(self):
+        """Quantize CPU FP32 master shards once per step in rank-invariant waves."""
         from megatron.core.fp8_utils import quantize_param_shard
 
-        info = get_fp8_cpu_offload_proxy_info(proxy_param)
-        assert info is not None, "Expected an FP8 CPU-offload proxy with metadata."
-        model_param = info.blockwise_fp8_model_param
-        start_offset = info.start_offset
+        shards = self._collect_fp8_offload_master_shards()
+        if self._fp8_writeback_waves is None:
+            assert not shards, (
+                "FP8 CPU-offload master shards exist but no write-back plan was registered."
+            )
+            return
 
-        master_param = cpu_master_param
-        staged_master_param = None
-        if not master_param.is_cuda:
-            staged_master_param = master_param.to(model_param.device, non_blocking=True)
-            master_param = staged_master_param
+        for wave in self._fp8_writeback_waves:
+            main_params = []
+            start_offsets = []
+            staged_masters = []
+            for model_param in wave:
+                entry = shards.get(model_param)
+                if entry is None:
+                    main_params.append(None)
+                    start_offsets.append(None)
+                    continue
+                master_param, start_offset = entry
+                if not master_param.is_cuda:
+                    master_param = master_param.to(model_param.device, non_blocking=True)
+                    staged_masters.append(master_param)
+                main_params.append(master_param)
+                start_offsets.append(start_offset)
 
-        quantize_param_shard(
-            [model_param],
-            [master_param],
-            [start_offset],
-            info.data_parallel_group,
-        )
-
-        if staged_master_param is not None:
-            del staged_master_param
+            quantize_param_shard(
+                wave, main_params, start_offsets, self._fp8_writeback_group
+            )
+            del staged_masters
 
     def _set_sub_optimizer_grads(self):
         if self.param_update_in_fp32:
@@ -191,9 +234,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
                         if get_fp8_cpu_offload_proxy_info(gpu_param) is not None:
-                            self._copy_fp8_offload_master_to_model_param(gpu_param, param)
-                        else:
-                            gpu_param.data.copy_(param.data, non_blocking=True)
+                            continue
+                        gpu_param.data.copy_(param.data, non_blocking=True)
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -244,6 +286,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if d2h_event is not None:
                 d2h_event.synchronize()
             cpu_optimizer.step(closure)
+
+        self._writeback_fp8_cpu_offload_masters()
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
