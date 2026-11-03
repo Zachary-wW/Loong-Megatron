@@ -346,14 +346,13 @@ class MultiLatentAttention(Attention):
             # SFT packed sequence: no batch dimension
             kv_cache_shape = (total_cache_tokens // get_pg_size(self.pg_collection.tp),
                               self.config.kv_lora_rank)
-            k_pos_emb_cache_shape = (total_cache_tokens,
-                                     self.num_attention_heads_per_partition, self.config.qk_pos_emb_head_dim)
+            k_pos_emb_cache_shape = (total_cache_tokens, 1, self.config.qk_pos_emb_head_dim)
         else:
             # Pretrain: with batch dimension
             kv_cache_shape = (total_cache_tokens // get_pg_size(self.pg_collection.tp),
                               self.config.micro_batch_size, self.config.kv_lora_rank)
             k_pos_emb_cache_shape = (total_cache_tokens, self.config.micro_batch_size,
-                                     self.num_attention_heads_per_partition, self.config.qk_pos_emb_head_dim)
+                                     1, self.config.qk_pos_emb_head_dim)
 
         self.kv_compressed_cache = torch.zeros(kv_cache_shape, device=device, dtype=dtype)
         self.key_pos_emb_cache = torch.zeros(k_pos_emb_cache_shape, device=device, dtype=dtype)
@@ -453,6 +452,8 @@ class MultiLatentAttention(Attention):
         k_no_pe, value = torch.split(
             kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
         )
+        if k_pos_emb.shape[-2] != k_no_pe.shape[-2]:
+            k_pos_emb = k_pos_emb.expand(*k_no_pe.shape[:-1], k_pos_emb.shape[-1])
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
         if self.padding_v_head_dim:
@@ -1477,11 +1478,15 @@ class MLASelfAttention(MultiLatentAttention):
 
                 # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                    k_pos_emb_per_head = k_pos_emb.expand(
+                        -1, -1, self.num_attention_heads_per_partition, -1
+                    )
                 else:
                     assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                    k_pos_emb_per_head = k_pos_emb.expand(
+                        -1, self.num_attention_heads_per_partition, -1
+                    )
+                key = torch.cat([k_no_pe, k_pos_emb_per_head], dim=-1)
 
             if not use_fused_q_uproj:
                 query = query.contiguous()
