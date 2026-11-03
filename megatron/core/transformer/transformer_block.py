@@ -692,7 +692,19 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         with rng_context, outer_quantization_context:
             # Forward pass.
-            if self.config.recompute_granularity == 'full' and self.training:
+            recompute_for_chunkpipe = False
+            native_recompute = self.config.recompute_granularity == 'full'
+            if self.config.enable_chunkpipe:
+                chunk_num = (
+                    self.config.chunkpipe_forward_microbatch
+                    % self.config.chunk_num_per_seq
+                )
+                recompute_for_chunkpipe = (
+                    chunk_num + self.config.keep_activations_chunks
+                    < self.config.chunk_num_per_seq
+                )
+
+            if (native_recompute or recompute_for_chunkpipe) and self.training:
                 checkpointed_result = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -815,6 +827,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.custom_pipeline_recompute_layers is not None:
             return self.config.custom_pipeline_recompute_layers[self.pp_rank]
         return cast(int, self.config.recompute_num_layers)
+
+    def update_config(self, chunkpipe_forward: bool, chunk_microbatch: int) -> None:
+        """Update runtime ChunkPipe forward/backward microbatch state."""
+        self.config.chunkpipe_forward = chunkpipe_forward
+        if chunkpipe_forward:
+            self.config.chunkpipe_forward_microbatch = chunk_microbatch
+        else:
+            self.config.chunkpipe_backward_microbatch = chunk_microbatch
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

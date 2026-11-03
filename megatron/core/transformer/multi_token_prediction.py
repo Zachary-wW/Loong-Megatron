@@ -2081,6 +2081,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )
+        elif self.config.recompute_method is None and getattr(
+            self.config, 'enable_chunkpipe', False
+        ):
+            with outer_quantization_context:
+                outputs = checkpoint_handler()
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -2155,11 +2160,26 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
 
+        recompute_for_chunkpipe = False
+        if self.config.enable_chunkpipe:
+            if getattr(self.config, 'sft_chunkpipe_mode', False):
+                chunk_num = self.config.chunkpipe_chunk_idx_in_group
+                effective_group = self.config.chunkpipe_current_group_size
+            else:
+                chunk_num = (
+                    self.config.chunkpipe_forward_microbatch
+                    % self.config.chunk_num_per_seq
+                )
+                effective_group = self.config.chunk_num_per_seq
+            recompute_for_chunkpipe = (
+                chunk_num + self.config.keep_activations_chunks < effective_group
+            )
+
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
         # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
         # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
         use_outer_recompute = (
-            self.config.recompute_granularity == 'full'
+            (self.config.recompute_granularity == 'full' or recompute_for_chunkpipe)
             and self.training
             and self.mtp_layer_pattern is None
         )
