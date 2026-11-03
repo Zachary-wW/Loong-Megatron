@@ -335,7 +335,11 @@ def _set_wandb_writer(args):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
-        import wandb
+        if os.environ.get('ENABLE_SWANLAB', '0') == '1':
+            import swanlab as wandb
+        else:
+            import wandb
+
         if cfg.logger.wandb_save_dir:
             save_dir = cfg.logger.wandb_save_dir
         else:
