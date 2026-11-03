@@ -54,6 +54,9 @@ class DistributedDataParallelConfig:
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
 
+    force_turn_on_bucketing: bool = False
+    """Force gradient bucketing even for disabled or non-first pipeline-stage chunks."""
+
     num_buckets: Optional[int] = None
     """Number of buckets for data-parallel communication. Should only specify one of
        `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`

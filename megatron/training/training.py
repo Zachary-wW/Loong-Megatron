@@ -2337,7 +2337,7 @@ def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_pa
         bucket_size = max(40000000, 1000000 * get_pg_size(dp_cp_group))
     else:
         bucket_size = ddp_config.bucket_size
-    if not overlap_grad_reduce:
+    if not overlap_grad_reduce and not ddp_config.force_turn_on_bucketing:
         bucket_size = None
     return bucket_size
 
@@ -2723,7 +2723,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
-            None if (disable or pp_rank > 0) else ddp_config.bucket_size
+            None
+            if (
+                not ddp_config.force_turn_on_bucketing
+                and (disable or pp_rank > 0)
+            )
+            else ddp_config.bucket_size
             for disable in per_chunk_disable_bucketing
         ]
 

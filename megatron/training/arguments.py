@@ -3070,6 +3070,8 @@ def _add_distributed_args(parser):
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
+    group.add_argument('--force-turn-on-bucketing', action='store_true',
+                       help='Force gradient bucketing on all pipeline stages.')
     group.add_argument('--ddp-pad-buckets-for-high-nccl-busbw', action='store_true',
                        default=False, help='If set, make sure the bucket size is divisible by a large power '
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '

@@ -132,8 +132,8 @@ class DistributedDataParallel(_BaseDataParallel):
         dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
-        # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
+        # Disable bucketing when overlap is off unless explicitly forced.
+        if not ddp_config.overlap_grad_reduce and not ddp_config.force_turn_on_bucketing:
             ddp_config.bucket_size = None
 
         self.ddp_config = ddp_config
@@ -173,8 +173,9 @@ class DistributedDataParallel(_BaseDataParallel):
             pp_rank = self.pp_group[0].rank()
         else:
             pp_rank = self.pp_group.rank()
-        if disable_bucketing or pp_rank > 0:
-            self.bucket_size = None
+        if not self.ddp_config.force_turn_on_bucketing:
+            if disable_bucketing or pp_rank > 0:
+                self.bucket_size = None
 
         self.param_to_bucket_group = {}
 
