@@ -767,8 +767,9 @@ def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
             micro_batch_index
         )
         indexer = getattr(decoder.layers[layer_idx].self_attention.core_attention, 'indexer', None)
-        if indexer is not None:
-            indexer.delete_chunk_indexer_key_cache(micro_batch_index)
+        delete_indexer_cache = getattr(indexer, 'delete_chunk_indexer_key_cache', None)
+        if delete_indexer_cache is not None:
+            delete_indexer_cache(micro_batch_index)
 
     if mtp_num_layers is None or mtp_num_layers == 0:
         return
@@ -780,8 +781,9 @@ def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
             micro_batch_index
         )
         indexer = getattr(mtp_layer.transformer_layer.self_attention.core_attention, 'indexer', None)
-        if indexer is not None:
-            indexer.delete_chunk_indexer_key_cache(micro_batch_index)
+        delete_indexer_cache = getattr(indexer, 'delete_chunk_indexer_key_cache', None)
+        if delete_indexer_cache is not None:
+            delete_indexer_cache(micro_batch_index)
 
 def clear_key_value_cache(model, mtp_num_layers):
     """
@@ -802,8 +804,9 @@ def clear_key_value_cache(model, mtp_num_layers):
     for layer_idx in range(num_layers):
         decoder.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
         indexer = getattr(decoder.layers[layer_idx].self_attention.core_attention, 'indexer', None)
-        if indexer is not None:
-            indexer.clear_chunk_indexer_key_cache()
+        clear_indexer_cache = getattr(indexer, 'clear_chunk_indexer_key_cache', None)
+        if clear_indexer_cache is not None:
+            clear_indexer_cache()
 
     if mtp_num_layers is None or mtp_num_layers == 0:
         return
@@ -813,8 +816,9 @@ def clear_key_value_cache(model, mtp_num_layers):
     for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
         mtp_layer.transformer_layer.self_attention.clear_chunk_key_value_cache()
         indexer = getattr(mtp_layer.transformer_layer.self_attention.core_attention, 'indexer', None)
-        if indexer is not None:
-            indexer.clear_chunk_indexer_key_cache()
+        clear_indexer_cache = getattr(indexer, 'clear_chunk_indexer_key_cache', None)
+        if clear_indexer_cache is not None:
+            clear_indexer_cache()
 
 def forward_backward_no_pipelining_with_chunkpipe(
     *,

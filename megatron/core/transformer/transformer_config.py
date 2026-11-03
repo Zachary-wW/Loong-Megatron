@@ -682,6 +682,9 @@ class TransformerConfig(ModelParallelConfig):
     chunkpipe_current_group_size: int = 0
     """Runtime size of the ChunkPipe group being processed."""
 
+    chunkpipe_num_microbatches: int = 0
+    """Number of chunk-level microbatches scheduled in the current SFT step."""
+
     chunkpipe_chunk_idx_in_group: int = 0
     """Runtime zero-based chunk index within the current ChunkPipe group."""
 
