@@ -2,6 +2,7 @@
 
 import fnmatch
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -171,6 +172,9 @@ class OptimizerConfig:
     ##############
     fp8_recipe: Optional[str] = None
     """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
+
+    fp8_param_gather: bool = False
+    """If true, keep the compute parameter in FP8 and all-gather it in FP8."""
 
     fp16: bool = False
     """If true, train with fp16 mixed precision training. Defaults to False."""
@@ -436,14 +440,29 @@ class OptimizerConfig:
             and (
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
+                or (self.optimizer_cpu_offload and not self.fp8_param_gather)
             )
         )
 
+        if (
+            self.optimizer_cpu_offload
+            and self.optimizer == 'adam'
+            and getattr(self, 'use_deepspeed_cpu_adam', False)
+            and (
+                self.exp_avg_dtype != torch.float32
+                or self.exp_avg_sq_dtype != torch.float32
+            )
+        ):
+            warnings.warn(
+                "DeepSpeed CPUAdam requires FP32 Adam moment states for CPU-offloaded "
+                "FP32 master params. Forcing exp_avg_dtype and exp_avg_sq_dtype to "
+                "torch.float32."
+            )
+            self.exp_avg_dtype = torch.float32
+            self.exp_avg_sq_dtype = torch.float32
+
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."
