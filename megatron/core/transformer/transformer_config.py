@@ -626,22 +626,37 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
+    custom_pipeline_recompute_layers: Optional[List[int]] = field(
+        default=None,
+        metadata={"argparse_meta": {"type": str, "nargs": None}},
+    )
+    """Comma-separated recompute layer count for each physical pipeline stage.
+
+    The list is resolved against the current pipeline rank when the forward pass runs, rather than
+    during configuration construction. This keeps model creation independent of pipeline-group
+    initialization. Requires full recompute granularity.
+    """
+
     distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    choices: "core_attn", "moe_act", "mlp_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "routed_experts", "pre_mlp", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "mlp_act": recompute the dense MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "routed_experts": recompute router, dispatch, routed experts, and combine without recomputing
+            shared experts.
+    "pre_mlp": recompute the attention path before the MLP.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
@@ -653,9 +668,10 @@ class TransformerConfig(ModelParallelConfig):
             Requires moe_shortcut_connection=True and selective recomputation.
     "residual_stream": replay wide-residual reads, connected norms, and writes via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "moe_act", "mlp_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", "routed_experts", and "pre_mlp" use normal
+    checkpointing.
     """
 
     ####################
@@ -2377,6 +2393,21 @@ class TransformerConfig(ModelParallelConfig):
                 "CPU offloading does not work when activation recomputation is enabled"
             )
 
+        if self.custom_pipeline_recompute_layers is not None:
+            if self.recompute_granularity != "full":
+                raise ValueError(
+                    "custom_pipeline_recompute_layers requires recompute_granularity='full'."
+                )
+            if (
+                len(self.custom_pipeline_recompute_layers)
+                != self.pipeline_model_parallel_size
+            ):
+                raise ValueError(
+                    "custom_pipeline_recompute_layers must contain one value per physical "
+                    f"pipeline stage: {len(self.custom_pipeline_recompute_layers)} != "
+                    f"{self.pipeline_model_parallel_size}."
+                )
+
         if self.recompute_granularity is not None:
             if self.recompute_granularity not in ["full", "selective"]:
                 raise ValueError(
@@ -2395,7 +2426,11 @@ class TransformerConfig(ModelParallelConfig):
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if (
+                self.recompute_granularity != "selective"
+                and self.recompute_num_layers is None
+                and self.custom_pipeline_recompute_layers is None
+            ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -2424,11 +2459,14 @@ class TransformerConfig(ModelParallelConfig):
                 allowed_modules = {
                     "core_attn",
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "routed_experts",
+                    "pre_mlp",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
@@ -2481,18 +2519,20 @@ class TransformerConfig(ModelParallelConfig):
             if self.fp8:
                 fp8_output_discarding_modules = {
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "shortcut_pre_mlp_layernorm",
                 }
                 if fp8_output_discarding_modules & set(self.recompute_modules):
                     if self.fp8_recipe == 'delayed':
                         raise ValueError(
-                            "Delayed scaling does not support moe_act, layernorm, or "
+                            "Delayed scaling does not support moe_act, mlp_act, layernorm, or "
                             "shortcut_pre_mlp_layernorm recompute for fp8."
                         )
                     if not is_te_min_version("2.6.0dev0"):
                         raise ValueError(
-                            "moe_act, layernorm, and shortcut_pre_mlp_layernorm recompute for "
+                            "moe_act, mlp_act, layernorm, and shortcut_pre_mlp_layernorm "
+                            "recompute for "
                             "fp8 need "
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
