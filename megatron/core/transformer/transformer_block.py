@@ -288,6 +288,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
+        self.pp_rank = pp_rank
 
         self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm
@@ -704,6 +705,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    recompute_num_layers=self._recompute_num_layers,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -803,6 +805,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return hidden_states, intermediate_hidden_states
 
         return hidden_states
+
+    @property
+    def _recompute_num_layers(self) -> int:
+        """Return the recompute layer count for the current physical pipeline stage."""
+        if self.config.custom_pipeline_recompute_layers is not None:
+            return self.config.custom_pipeline_recompute_layers[self.pp_rank]
+        return cast(int, self.config.recompute_num_layers)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

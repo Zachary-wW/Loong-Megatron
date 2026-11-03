@@ -717,13 +717,8 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        from megatron.core.transformer.cuda_graphs import is_graph_capturing
-
-        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
-            raise RuntimeError(
-                "Checkpointing is not compatible with .grad(), "
-                "please use .backward() if possible"
-            )
+        # Heterogeneous-DP recompute can enter through a manual backward path, for
+        # which torch.autograd._is_checkpoint_valid() rejects the saved checkpoint.
         _set_checkpointing()
 
         inputs = ctx.saved_tensors

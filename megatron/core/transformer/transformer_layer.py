@@ -502,6 +502,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        self.recompute_pre_mlp = False
         # Batch-first shape of the padding_mask this layer received in eager execution (the
         # cuda_graph_warmup_steps), recorded in _forward_attention before any MLP chunking.
         self._padding_mask_shape_seen: Optional[tuple[int, ...]] = None
@@ -575,6 +576,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if "mlp" in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
+            if "pre_mlp" in self.config.recompute_modules:
+                self.recompute_pre_mlp = True
+                self.recompute_input_layernorm = False
 
         self._set_offload_modules()
         self.off_interface = _get_offloading_interface()
@@ -1127,7 +1131,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            hidden_states, context = self._forward_attention(*args, **kwargs)
+            if self.recompute_pre_mlp and self.training and torch.is_grad_enabled():
+                hidden_states, context = self._checkpoint_pre_mlp_forward(*args, **kwargs)
+            else:
+                hidden_states, context = self._forward_attention(*args, **kwargs)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
                 residual_stream_recompute_context = kwargs.get(
                     "residual_stream_recompute_context", None
@@ -1146,6 +1153,87 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     hidden_states, kwargs.get("inference_context", None), **mlp_kwargs
                 )
             return output, context
+
+    def _checkpoint_pre_mlp_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Checkpoint the complete attention path that precedes the MLP."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        def checkpoint_forward(
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            rotary_pos_cos_sin,
+            attention_bias,
+            sequence_len_offset,
+            padding_mask,
+            input_ids,
+        ):
+            return self._forward_attention(
+                hidden_states,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+                residual_stream_recompute_context=residual_stream_recompute_context,
+            )
+
+        args = (
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            rotary_pos_cos_sin,
+            attention_bias,
+            sequence_len_offset,
+            padding_mask,
+            input_ids,
+        )
+        if self.config.fp8 or self.config.fp4:
+            from megatron.core.extensions.transformer_engine import te_checkpoint
+
+            return te_checkpoint(
+                checkpoint_forward,
+                False,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                self.pg_collection.tp,
+                *args,
+            )
+        return tensor_parallel.checkpoint(checkpoint_forward, False, *args)
 
     def _forward_pre_mlp_layernorm(
         self,
