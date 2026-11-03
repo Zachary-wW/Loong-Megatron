@@ -28,14 +28,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The five callables align with the schedule plan's slot order:
+    The six callables align with the schedule plan's slot order:
     1. pre_dispatch_computation (computation):
        attention -> pre-MLP layernorm -> router -> dispatch preprocess.
        For dense layers this is just the attention pass.
     2. moe_dispatch (communication): MoE dispatch All-to-All.
     3. mlp / moe_experts (computation): dense MLP or routed-experts compute.
-    4. moe_combine (communication): MoE combine All-to-All + post-MLP residual.
-    5. mtp_post_process (computation): always ``None`` here; only the MTP
+    4. moe_combine (communication): MoE combine All-to-All.
+    5. post_combine (computation): MoE combine postprocess and MLP residual.
+    6. mtp_post_process (computation): always ``None`` here; only the MTP
        wrapper in ``common/fine_grained_callables.py`` fills this slot.
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
@@ -48,9 +49,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     Returns:
         A tuple containing:
-        - forward_funcs: List of 5 callables, one per slot in the schedule plan
+        - forward_funcs: List of 6 callables, one per slot in the schedule plan
           (pre_dispatch_computation, moe_dispatch, mlp, moe_combine,
-          mtp_post_process=None).
+          post_combine, mtp_post_process=None).
         - backward_dw: Dict mapping slot name to the delayed-wgrad callable
           (keys: "pre_dispatch_computation", "mlp").
     """
@@ -215,8 +216,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         return expert_output
 
     def submodule_combine_forward(node: ScheduleNode, output: torch.Tensor):
+        """Run the MoE token-combine communication."""
+        return layer.mlp.combine(output)
+
+    def submodule_post_combine_forward(node: ScheduleNode, output: torch.Tensor):
         """
-        # Triggers token combine and the remaining computation in the transformer layer.
+        # Run the remaining computation in the transformer layer after token combine.
         # The `mlp_bda` computation is placed after `mlp.combine` due to data dependency.
         # This ordering is also critical for pipeline performance. Starting the `mlp.combine`
         # communication at first allows it to be overlapped with computation from another
@@ -225,7 +230,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
-        output = layer.mlp.combine(output)
         # Without dropout, the shared-expert add of `postprocess` and the residual add of
         # `mlp_bda` run as one kernel that is bit-identical to the two adds.
         fuse_residual_add = (
@@ -293,9 +297,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
+    post_combine_func = submodule_post_combine_forward if is_moe else raise_not_implemented
 
     layer.init_backward_dw_wrapper()
 
-    forward_funcs = [pre_dispatch_func, dispatch_func, mlp_func, combine_func, None]
+    forward_funcs = [
+        pre_dispatch_func,
+        dispatch_func,
+        mlp_func,
+        combine_func,
+        post_combine_func,
+        None,
+    ]
     backward_dw = {"pre_dispatch_computation": layer.backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
