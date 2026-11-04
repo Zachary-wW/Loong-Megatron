@@ -15,7 +15,7 @@ except ImportError:
     HAVE_EINOPS = False
 
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import split_te_layernorm_column_parallel_linear
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import resolve_cp_group
@@ -34,7 +34,7 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
-from megatron.core.utils import deprecate_inference_params, is_te_min_version
+from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
@@ -52,7 +52,7 @@ try:
     _EXPECTED_SIGNATURE = [
         't',
         'freqs',
-        'tensor_format', 
+        'tensor_format',
         'fused',
         'cu_seqlens',
         'cp_size',
@@ -62,13 +62,14 @@ try:
         if arg not in set(inspect.signature(_raw_fused_apply_rope).parameters):
             raise ImportError("Need apply_rotary_pos_emb that takes {}".format(arg))
     fused_apply_rope = _raw_fused_apply_rope
-    
+
     def fused_mla_apply_rotary_pos_emb(
         t: Tensor,
         freqs: Tensor,
         config: TransformerConfig,
         cu_seqlens: Union[torch.Tensor, None] = None,
         mscale: float = 1.0,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Apply rotary positional embedding to input tensor T using fused kernel from transformer_engine.
@@ -80,6 +81,7 @@ try:
             cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
             with shape [b + 1] and dtype torch.
             mscale (float): The scale factor for the rotary positional embedding. Default is 1.0.
+            cp_group: Context-parallel process group for this call.
         """
 
         rot_dim = freqs.shape[-1]
@@ -90,8 +92,8 @@ try:
         t = torch.cat((t_emb1, t_emb2), dim=-1)
         t = torch.cat((t, t_emb_pass), dim=-1)
 
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+        cp_rank = torch.distributed.get_rank(cp_group) if cp_group is not None else 0
         if cp_size > 1 and not is_te_min_version("1.11.0", check_equality=False):
             raise ValueError("Only TE >= 1.12 supports RoPE fusion for THD format with CP.")
 
@@ -319,6 +321,10 @@ class MLASelfAttention(MultiLatentAttention):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if packed_seq_params is not None:
+            assert packed_seq_params.local_cp_size is None, (
+                "XPU MLA does not support hybrid context parallelism."
+            )
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -372,9 +378,13 @@ class MLASelfAttention(MultiLatentAttention):
             #   2. Scatter sequence back to s / TP if sequence-parallel since it was
             #      gathered by ColumnParallelLinear.
             if q_compressed.size(-1) != self.config.q_lora_rank:
-                q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+                q_compressed = gather_from_tensor_model_parallel_region(
+                    q_compressed, group=self.pg_collection.tp
+                )
                 if self.config.sequence_parallel:
-                    q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+                    q_compressed = scatter_to_sequence_parallel_region(
+                        q_compressed, group=self.pg_collection.tp
+                    )
         else:
             q_compressed = hidden_states
 
@@ -385,25 +395,28 @@ class MLASelfAttention(MultiLatentAttention):
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            kv_combined = gather_from_tensor_model_parallel_region(
+                kv_combined, group=self.pg_collection.tp
+            )
             # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
             if self.config.sequence_parallel:
                 # kv_compressed:[s / TP, b, kv_lora_rank]
-                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+                kv_compressed = scatter_to_sequence_parallel_region(
+                    kv_compressed, group=self.pg_collection.tp
+                )
         else:
             # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if (
-                parallel_state.get_tensor_model_parallel_world_size() > 1
-                and self.config.sequence_parallel
-            ):
+            if get_pg_size(self.pg_collection.tp) > 1 and self.config.sequence_parallel:
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
-                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
+                k_pos_emb = gather_from_sequence_parallel_region(
+                    k_pos_emb, group=self.pg_collection.tp
+                )
 
         if packed_seq_params is not None:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
@@ -522,7 +535,7 @@ class MLASelfAttention(MultiLatentAttention):
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
-            
+
             q_len = q.size()[0]
             if inference_context is not None:
                 # add offset to the sequence start for inference
@@ -559,14 +572,16 @@ class MLASelfAttention(MultiLatentAttention):
                     rotary_pos_emb,
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
-                    mscale=mscale
+                    mscale=mscale,
+                    cp_group=runtime_cp_group,
                 )
                 k_pos_emb = fused_mla_apply_rotary_pos_emb(
                     k_pos_emb,
                     rotary_pos_emb,
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale
+                    mscale=mscale,
+                    cp_group=runtime_cp_group,
                 )
             else:
                 q_pos_emb = apply_rotary_pos_emb(

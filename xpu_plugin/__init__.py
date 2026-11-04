@@ -34,7 +34,6 @@ import_module_list = [
     "megatron.core.transformer.moe.token_dispatcher",
     "megatron.core.transformer.moe.moe_layer",
     "megatron.core.transformer.multi_latent_attention",
-    "megatron.core.fusions.linear_cross_entropy.generic.entry",
 ]
 
 
@@ -121,9 +120,6 @@ def init_megatron_core_xpu_plugin():
     replace_symbol("megatron.legacy.fused_kernels.load", empty_package.empty_function)
 
     replace_symbol(
-        "megatron.core.transformer.mlp.bias_swiglu_impl", mock_megatron.mock_bias_swiglu_impl
-    )
-    replace_symbol(
         "megatron.core.transformer.mlp.weighted_bias_swiglu_impl",
         mock_megatron.mock_weighted_bias_swiglu_impl,
     )
@@ -131,10 +127,6 @@ def init_megatron_core_xpu_plugin():
         "megatron.core.transformer.moe.experts.weighted_bias_swiglu_impl",
         mock_megatron.mock_weighted_bias_swiglu_impl,
     )
-    replace_symbol(
-        "megatron.legacy.model.fused_bias_gelu.bias_gelu_impl", mock_megatron.mock_bias_gelu_impl
-    )
-    replace_symbol("megatron.legacy.model.fused_bias_gelu.bias_gelu", mock_megatron.mock_bias_gelu)
     replace_symbol(
         "megatron.core.tensor_parallel.mappings._gather_along_first_dim",
         mock_megatron.mock_gather_along_first_dim,
@@ -146,9 +138,6 @@ def init_megatron_core_xpu_plugin():
     replace_symbol(
         "megatron.legacy.model.fused_softmax.FusedScaleMaskSoftmax.is_kernel_available",
         mock_megatron.mock_is_kernel_available,
-    )
-    replace_symbol(
-        "megatron.core.transformer.moe.token_dispatcher.unpermute", mock_megatron.mock_unpermute
     )
     replace_symbol(
         "megatron.core.fp8_utils._modify_underlying_storage_impl", empty_package.empty_function
@@ -181,14 +170,3 @@ def init_megatron_core_xpu_plugin():
 
     if os.getenv("XMLIR_MOCK_GATED_DELTANET") not in ("false", "0", "False"):
         gated_deltanet._install_gdn_mock_hook()
-
-    # Mock fused linear cross-entropy backward for XPU
-    if os.getenv("XMLIR_MOCK_LCE") not in ("false", "0", "False"):
-        replace_symbol(
-            "megatron.core.fusions.linear_cross_entropy.generic.entry.backward",
-            mock_megatron.mock_lce_backward,
-        )
-
-    # Auto-detect DTensor params and use torch.optim.AdamW (supports DTensor and BF16)
-    # instead of TE/Apex FusedAdam to avoid optimizer kernel errors
-    replace_symbol("megatron.core.optimizer.Adam", mock_megatron.Adam)
