@@ -115,6 +115,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.rerun_state_machine import (
+    ChunkDataIterator,
     RerunDataIterator,
     RerunMode,
     destroy_rerun_state_machine,
@@ -190,13 +191,13 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_telemetry,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
     get_wandb_writer,
-    get_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -3244,6 +3245,9 @@ def dummy_train_step(data_iterator):
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
                 is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+                chunkpipe_variable_seq_lengths=getattr(
+                    args, 'chunkpipe_variable_chunk', False
+                ),
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
@@ -5744,6 +5748,13 @@ def evaluate(
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
 
+            evaluation_num_microbatches = scheduled_eval_num_microbatches
+            evaluation_seq_length = args.seq_length
+            if args.enable_chunkpipe:
+                evaluation_seq_length = args.max_chunk_size or args.chunksize
+                if not args.sft_chunkpipe_mode:
+                    evaluation_num_microbatches *= args.chunk_num_per_seq
+
             ft_integration.on_eval_step_start()
 
             callback_manager.trigger(step_start_event)
@@ -5754,8 +5765,8 @@ def evaluate(
                     forward_step_func=forward_step_func,
                     data_iterator=packed_data_iterator,
                     model=model,
-                    num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    num_microbatches=evaluation_num_microbatches,
+                    seq_length=evaluation_seq_length,
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
@@ -6151,8 +6162,21 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     dl_type = args.dataloader_type
     assert dl_type in ['single', 'cyclic', 'external']
 
-    def _get_iterator(dataloader_type, dataloader):
+    def _get_iterator(args, dataloader_type, dataloader):
         """Return dataset iterator."""
+        if args.enable_chunkpipe:
+            num_chunks = args.chunk_num_per_seq
+            if dataloader_type == "single":
+                return ChunkDataIterator(
+                    num_chunks, iter(dataloader), chunk_sizes=args.chunk_sizes
+                )
+            if dataloader_type == "external":
+                # SFT external datasets already emit chunk-level samples.
+                if isinstance(dataloader, list):
+                    return [RerunDataIterator(d) for d in dataloader]
+                return RerunDataIterator(dataloader)
+            raise RuntimeError("unexpected dataloader type")
+
         if dataloader_type == "single":
             return RerunDataIterator(iter(dataloader))
         elif dataloader_type == "cyclic":
@@ -6167,7 +6191,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             raise RuntimeError("unexpected dataloader type")
 
     if train_dataloader is not None:
-        train_data_iterator = _get_iterator(dl_type, train_dataloader)
+        train_data_iterator = _get_iterator(args, dl_type, train_dataloader)
     else:
         train_data_iterator = None
 
@@ -6203,18 +6227,18 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             else:
                 valid_dl_type = "cyclic" if args.full_validation else dl_type
                 valid_data_iterators = [
-                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                    _get_iterator(args, valid_dl_type, dl) for dl in valid_dataloaders
                 ]
         elif valid_dataloaders[0] is not None:
             valid_dl_type = "cyclic" if args.full_validation else dl_type
-            valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
+            valid_data_iterators = _get_iterator(args, valid_dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None
     else:
         valid_data_iterators = None
 
     if test_dataloader is not None:
-        test_data_iterator = _get_iterator(dl_type, test_dataloader)
+        test_data_iterator = _get_iterator(args, dl_type, test_dataloader)
     else:
         test_data_iterator = None
 
