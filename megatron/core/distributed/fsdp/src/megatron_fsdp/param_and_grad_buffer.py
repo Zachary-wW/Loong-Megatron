@@ -4765,10 +4765,15 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder,
         suggested_prefetch_size: Optional[int],
         double_buffer_units: set,
+        bwd: bool = False,
     ) -> List[int]:
         """Extend a bucket list using the communication-size heuristic."""
         parameter_groups = self.buffer.parameter_groups
         result = list(bucket_ids)
+
+        def buffer_size(bucket_id):
+            weight_buffer = self.get_fsdp_buffer(bucket_id, bwd=bwd)
+            return 0 if weight_buffer is None else weight_buffer.bucket_index.size
 
         def next_bucket_id():
             if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
@@ -4791,18 +4796,12 @@ class AllGatherPipeline:
             suggested_prefetch_size = 500_000_000
 
         base_all_gather_size = sum(
-            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
-            for bucket_id in result
+            buffer_size(bucket_id) for bucket_id in result
         )
         bucket_id = next_bucket_id()
         while bucket_id is not None:
-            prefetched_size = (
-                sum(
-                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
-                    for result_bucket_id in result
-                )
-                - base_all_gather_size
-            )
+            prefetched_size = sum(buffer_size(result_bucket_id) for result_bucket_id in result)
+            prefetched_size -= base_all_gather_size
             if prefetched_size >= suggested_prefetch_size:
                 break
 
@@ -4817,6 +4816,16 @@ class AllGatherPipeline:
             bucket_id = next_bucket_id()
 
         return result
+
+    def _filter_buckets_with_weight_buffers(self, bucket_ids: List[int], bwd: bool) -> List[int]:
+        """Drop released weight buffers and mark their buckets empty."""
+        available_bucket_ids = []
+        for bucket_id in bucket_ids:
+            if self.get_fsdp_buffer(bucket_id, bwd=bwd) is None:
+                self.bucket_status[self.get_bucket_key(bucket_id, bwd)] = BucketStatus.EMPTY
+                continue
+            available_bucket_ids.append(bucket_id)
+        return available_bucket_ids
 
     def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
         """Group selected buckets by their coalesced collective group."""
@@ -4904,6 +4913,10 @@ class AllGatherPipeline:
 
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
+        ag_buckets = self._filter_buckets_with_weight_buffers(ag_buckets, bwd)
+        if len(ag_buckets) == 0:
+            return
+
         parameter_groups = self.buffer.parameter_groups
         double_buf_units = set()
         if self.buffer.ddp_config.fsdp_double_buffer:
@@ -4944,13 +4957,21 @@ class AllGatherPipeline:
 
         if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
-                ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
+                ag_buckets,
+                prefetch_order,
+                suggested_AG_prefetch_size,
+                double_buf_units,
+                bwd,
             )
+            ag_buckets = self._filter_buckets_with_weight_buffers(ag_buckets, bwd)
+            if len(ag_buckets) == 0:
+                return
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
             outer_ag_buckets = self._extend_by_fsdp_units(
                 ag_buckets, prefetch_order, 1 if should_prefetch else 0
             )
+            outer_ag_buckets = self._filter_buckets_with_weight_buffers(outer_ag_buckets, bwd)
 
         if outer_ag_buckets:
             self._launch_outer_prefetches(outer_ag_buckets, bwd)
@@ -4963,12 +4984,14 @@ class AllGatherPipeline:
             if self.bucket_status[self.get_bucket_key(bucket_id, bwd)]
             in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
+        ag_buckets = self._filter_buckets_with_weight_buffers(ag_buckets, bwd)
         if len(ag_buckets) == 0:
             return
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
         bucket_group_to_buckets = self._group_buckets(ag_buckets)
+        all_gathered_buckets = []
 
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
         for _, buckets in bucket_group_to_buckets.items():
@@ -4991,7 +5014,8 @@ class AllGatherPipeline:
 
             # Coalesce the asynchronous NCCL operations in this context.
             all_gather_stream.wait_stream(torch.cuda.current_stream())
-            dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
+            dp_group = self.get_fsdp_buffer(buckets[0], bwd=bwd).data_parallel_group
+            gathered_buckets = []
             with torch.cuda.stream(all_gather_stream):
                 with _coalescing_manager(
                     dp_group, async_ops=async_param_gather
@@ -5000,19 +5024,22 @@ class AllGatherPipeline:
                         # All-gather the module weights from each FSDP buffer shard
                         # into an allocated bucket containing unsharded weights.
                         self.async_bucket_gather(bucket_id, bwd)
+                        if self.get_bucket_key(bucket_id, bwd) in self.param_gather_event_map:
+                            gathered_buckets.append(bucket_id)
 
             # Replace the parameter all-gather event with coalescing event.
-            for bucket_id in buckets:
+            for bucket_id in gathered_buckets:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
                 _, mark_bucket_ready_to_use = self.param_gather_event_map[bucket_key]
                 self.param_gather_event_map[bucket_key] = (
                     coalescing_event,
                     mark_bucket_ready_to_use,
                 )
+            all_gathered_buckets.extend(gathered_buckets)
 
         # Wait for all-gather to finish
         if not async_param_gather:
-            for bucket_id in buckets:
+            for bucket_id in all_gathered_buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
