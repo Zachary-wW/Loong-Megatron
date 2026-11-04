@@ -755,13 +755,6 @@ def get_min_key(chunks_micro: Dict[int, object]) -> int:
     return min_key
 
 
-def p2p_comm_tensor_remove_padding(
-    input_tensor: Optional[torch.Tensor], seq_lengths_per_rank: int
-) -> Optional[torch.Tensor]:
-    """Compatibility hook for source schedules; core_v0.20.0 has no P2P padding."""
-    return input_tensor
-
-
 def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
     """
     Remove the key-value cache for a specific micro-batch index.
@@ -784,9 +777,8 @@ def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
             micro_batch_index
         )
         indexer = getattr(decoder.layers[layer_idx].self_attention.core_attention, 'indexer', None)
-        delete_indexer_cache = getattr(indexer, 'delete_chunk_indexer_key_cache', None)
-        if delete_indexer_cache is not None:
-            delete_indexer_cache(micro_batch_index)
+        if indexer is not None:
+            indexer.delete_chunk_indexer_key_cache(micro_batch_index)
 
     if mtp_num_layers is None or mtp_num_layers == 0:
         return
@@ -798,9 +790,8 @@ def remove_key_value_cache(model, micro_batch_index, mtp_num_layers):
             micro_batch_index
         )
         indexer = getattr(mtp_layer.transformer_layer.self_attention.core_attention, 'indexer', None)
-        delete_indexer_cache = getattr(indexer, 'delete_chunk_indexer_key_cache', None)
-        if delete_indexer_cache is not None:
-            delete_indexer_cache(micro_batch_index)
+        if indexer is not None:
+            indexer.delete_chunk_indexer_key_cache(micro_batch_index)
 
 def clear_key_value_cache(model, mtp_num_layers):
     """
@@ -821,9 +812,8 @@ def clear_key_value_cache(model, mtp_num_layers):
     for layer_idx in range(num_layers):
         decoder.layers[layer_idx].self_attention.clear_chunk_key_value_cache()
         indexer = getattr(decoder.layers[layer_idx].self_attention.core_attention, 'indexer', None)
-        clear_indexer_cache = getattr(indexer, 'clear_chunk_indexer_key_cache', None)
-        if clear_indexer_cache is not None:
-            clear_indexer_cache()
+        if indexer is not None:
+            indexer.clear_chunk_indexer_key_cache()
 
     if mtp_num_layers is None or mtp_num_layers == 0:
         return
@@ -833,9 +823,30 @@ def clear_key_value_cache(model, mtp_num_layers):
     for mtp_layer in mtp_layers.layers[:mtp_num_layers]:
         mtp_layer.transformer_layer.self_attention.clear_chunk_key_value_cache()
         indexer = getattr(mtp_layer.transformer_layer.self_attention.core_attention, 'indexer', None)
-        clear_indexer_cache = getattr(indexer, 'clear_chunk_indexer_key_cache', None)
-        if clear_indexer_cache is not None:
-            clear_indexer_cache()
+        if indexer is not None:
+            indexer.clear_chunk_indexer_key_cache()
+
+
+def _resolve_chunkpipe_component_sizes(config):
+    """Return and validate the current SFT composite descriptor."""
+    components = list(config.chunkpipe_component_sizes or [])
+    if not components:
+        components = [config.chunkpipe_current_group_size or 1]
+    if any(size <= 0 for size in components):
+        raise RuntimeError(
+            f"ChunkPipe component sizes must be positive, got {components}."
+        )
+
+    composite_size = sum(components)
+    if config.chunkpipe_composite_group_size not in (0, composite_size):
+        raise RuntimeError(
+            "ChunkPipe composite size does not match its component sizes: "
+            f"composite={config.chunkpipe_composite_group_size}, "
+            f"components={components}."
+        )
+    config.chunkpipe_composite_group_size = composite_size
+    return components
+
 
 def forward_backward_no_pipelining_with_chunkpipe(
     *,
@@ -1088,9 +1099,7 @@ def forward_backward_no_pipelining_with_chunkpipe(
                 # Read composite descriptor written by get_batch -> config.
                 # Fall back to a single real group if the composite path is not
                 # active (legacy callers / ad-hoc tests that don't set it).
-                components = list(getattr(config, 'chunkpipe_component_sizes', None) or [])
-                if not components:
-                    components = [config.chunkpipe_current_group_size or 1]
+                components = _resolve_chunkpipe_component_sizes(config)
                 first_size = components[0]
 
                 # Forward remaining chunks of the first real group
@@ -2027,15 +2036,6 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
             input_tensor = input_tensors[model_chunk_id][microbatch_id][chunk_id]
 
-        # add for config.reduce_variable_seq_shape_p2p_comm, remove padding.
-        if config.reduce_variable_seq_shape_p2p_comm:
-            input_tensor = p2p_comm_tensor_remove_padding(input_tensor,
-                                                          config.p2p_comm_fixed_seq_lengths_per_rank)
-            if is_sft_chunkpipe:
-                input_tensors[model_chunk_id][chunkpipe_forward_microbatch] = input_tensor
-            else:
-                input_tensors[model_chunk_id][microbatch_id][-1] = input_tensor
-
         return input_tensor
 
     def forward_step_helper_postprocess(model_chunk_id, microbatch_id, chunk_id, output_tensor, num_tokens):
@@ -2242,11 +2242,6 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             input_tensor = input_tensors[model_chunk_id].pop(chunkpipe_backward_microbatch)
             output_tensor = output_tensors[model_chunk_id].pop(chunkpipe_backward_microbatch)
 
-            # add for reduce_variable_seq_shape_p2p_comm, remove padding.
-            if config.reduce_variable_seq_shape_p2p_comm:
-                output_tensor_grad = p2p_comm_tensor_remove_padding(output_tensor_grad,
-                                                                    config.p2p_comm_fixed_seq_lengths_per_rank)
-
             return input_tensor, output_tensor, output_tensor_grad, chunkpipe_backward_microbatch
         else:
             # pylint: disable=E0606
@@ -2257,11 +2252,6 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
             input_tensor = input_tensors[model_chunk_id][microbatch_id].pop()
             output_tensor = output_tensors[model_chunk_id][microbatch_id].pop()
             output_tensor_grad = output_tensor_grads[model_chunk_id][microbatch_id].pop(0)
-
-        # add for reduce_variable_seq_shape_p2p_comm, remove padding.
-        if config.reduce_variable_seq_shape_p2p_comm:
-            output_tensor_grad = p2p_comm_tensor_remove_padding(output_tensor_grad,
-                                                                config.p2p_comm_fixed_seq_lengths_per_rank)
 
         return input_tensor, output_tensor, output_tensor_grad, None
 
@@ -4444,9 +4434,7 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
     def _ensure_sft_chunk_info_after_forward(mb_id):
         """Record exact per-real-group chunk state after get_batch populated config."""
         nonlocal sft_current_composite_id
-        components = list(getattr(config, 'chunkpipe_component_sizes', None) or [])
-        if not components:
-            components = [getattr(config, 'chunkpipe_current_group_size', None) or config.chunk_num_per_seq]
+        components = _resolve_chunkpipe_component_sizes(config)
 
         if not sft_composite_cursor:
             sft_current_composite_id += 1

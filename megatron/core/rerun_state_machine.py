@@ -1228,10 +1228,18 @@ class ChunkDataIterator(RerunDataIterator):
         if not isinstance(batch, dict):
             raise ValueError(f"Unsupported batch type: {type(batch)}")
 
+        runtime_metadata_keys = {
+            "chunkpipe_current_group_size",
+            "chunkpipe_composite_group_size",
+            "chunkpipe_component_sizes",
+        }
         chunks: list[dict[str, Any]] = []
         for chunk_index in range(self.num_chunks):
             chunk: dict[str, Any] = {}
             for key, value in batch.items():
+                if key in runtime_metadata_keys:
+                    chunk[key] = value
+                    continue
                 chunk_dim = 2 if key == "attention_mask" else 1
                 if not isinstance(value, torch.Tensor):
                     chunk[key] = value

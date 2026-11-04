@@ -1536,6 +1536,141 @@ class DSAIndexer(MegatronModule):
         for param in self.parameters():
             setattr(param, "average_gradients_across_tp_domain", True)
 
+        self._chunk_indexer_key_cache: dict[int, torch.Tensor] = {}
+        self._chunk_indexer_key_cache_grad: dict[int, torch.Tensor] = {}
+
+    def _chunkpipe_group_state(self, forward: bool) -> tuple[int, int, int]:
+        """Return current chunk index, real group size, and microbatch index."""
+        if self.config.sft_chunkpipe_mode:
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            effective_group = self.config.chunkpipe_current_group_size
+        else:
+            effective_group = self.config.chunk_num_per_seq
+            microbatch_index = (
+                self.config.chunkpipe_forward_microbatch
+                if forward
+                else self.config.chunkpipe_backward_microbatch
+            )
+            chunk_index = microbatch_index % effective_group
+
+        if effective_group <= 0:
+            raise RuntimeError(
+                "DSA ChunkPipe indexer cache requires a positive group size."
+            )
+        if not 0 <= chunk_index < effective_group:
+            raise RuntimeError(
+                "DSA ChunkPipe indexer cache chunk index is out of range: "
+                f"chunk_index={chunk_index}, group_size={effective_group}."
+            )
+        microbatch_index = (
+            self.config.chunkpipe_forward_microbatch
+            if forward
+            else self.config.chunkpipe_backward_microbatch
+        )
+        return chunk_index, effective_group, microbatch_index
+
+    def _chunkpipe_grad_enabled(self) -> bool:
+        """Return whether this chunk owns retained indexer activations."""
+        if not self.config.chunkpipe_forward:
+            return True
+        if not self.training:
+            return False
+        chunk_index, effective_group, _ = self._chunkpipe_group_state(forward=True)
+        return (
+            chunk_index + self.config.keep_activations_chunks
+            >= effective_group
+        )
+
+    def _register_current_key_gradient_hook(
+        self, key: torch.Tensor, microbatch_index: int
+    ) -> None:
+        """Merge gradients from later chunks into the original current key."""
+
+        def merge_cached_key_gradient(grad):
+            cached_grad = self._chunk_indexer_key_cache_grad.pop(
+                microbatch_index, None
+            )
+            return grad if cached_grad is None else grad + cached_grad
+
+        key.register_hook(merge_cached_key_gradient)
+
+    def _cache_chunk_indexer_key(self, key: torch.Tensor) -> None:
+        """Store a non-final chunk's indexer key without retaining autograd state."""
+        chunk_index, effective_group, microbatch_index = (
+            self._chunkpipe_group_state(forward=True)
+        )
+        if chunk_index == effective_group - 1:
+            return
+        if self._chunkpipe_grad_enabled():
+            self._register_current_key_gradient_hook(key, microbatch_index)
+        self._chunk_indexer_key_cache[microbatch_index] = key.detach().clone()
+
+    def _concat_cached_chunk_indexer_keys(
+        self, key: torch.Tensor
+    ) -> torch.Tensor:
+        """Return all causal indexer keys through the current chunk."""
+        chunk_index, effective_group, microbatch_index = (
+            self._chunkpipe_group_state(forward=self.config.chunkpipe_forward)
+        )
+        if chunk_index == effective_group - 1:
+            return key
+        if not self.config.chunkpipe_forward:
+            self._register_current_key_gradient_hook(key, microbatch_index)
+        if chunk_index == 0:
+            return key
+
+        group_start = microbatch_index - chunk_index
+        cached_keys = []
+        for previous_index in range(chunk_index):
+            previous_microbatch = group_start + previous_index
+            if previous_microbatch not in self._chunk_indexer_key_cache:
+                raise RuntimeError(
+                    "DSA ChunkPipe indexer cache is missing a previous chunk: "
+                    f"microbatch={previous_microbatch}, current={microbatch_index}, "
+                    f"chunk_index={chunk_index}, group_size={effective_group}."
+                )
+            cached_key = self._chunk_indexer_key_cache[
+                previous_microbatch
+            ].detach()
+            if self._chunkpipe_grad_enabled():
+                cached_key = cached_key.clone().requires_grad_(True)
+
+                def accumulate_cached_gradient(grad, cache_index=previous_microbatch):
+                    if cache_index not in self._chunk_indexer_key_cache_grad:
+                        self._chunk_indexer_key_cache_grad[cache_index] = grad
+                    else:
+                        self._chunk_indexer_key_cache_grad[cache_index] += grad
+                    return grad
+
+                cached_key.register_hook(accumulate_cached_gradient)
+            cached_keys.append(cached_key)
+        cached_keys.append(key)
+        return torch.cat(cached_keys, dim=0)
+
+    def cache_and_concat_chunk_indexer_keys(
+        self, key: torch.Tensor
+    ) -> torch.Tensor:
+        """Maintain the ChunkPipe DSA indexer-key prefix and return its full view."""
+        if not self.config.enable_chunkpipe:
+            return key
+        if self.config.chunkpipe_forward:
+            self._cache_chunk_indexer_key(key)
+        return self._concat_cached_chunk_indexer_keys(key)
+
+    def delete_chunk_indexer_key_cache(self, micro_batch_index: int) -> None:
+        """Release one completed ChunkPipe chunk's indexer cache state."""
+        self._chunk_indexer_key_cache.pop(micro_batch_index, None)
+        if micro_batch_index in self._chunk_indexer_key_cache_grad:
+            raise RuntimeError(
+                "DSA ChunkPipe indexer key gradient was not consumed before "
+                f"cache deletion for microbatch {micro_batch_index}."
+            )
+
+    def clear_chunk_indexer_key_cache(self) -> None:
+        """Release all ChunkPipe indexer cache state for a completed group."""
+        self._chunk_indexer_key_cache.clear()
+        self._chunk_indexer_key_cache_grad.clear()
+
     def _project_indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
         """Run ``linear_weights_proj`` according to the DSA-specific precision contract."""
         weights_proj_context = (
@@ -1606,11 +1741,26 @@ class DSAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
+        rotary_position_offset = 0
+        if self.config.enable_chunkpipe:
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            if self.config.cu_chunks is not None:
+                rotary_position_offset = self.config.cu_chunks[chunk_index]
+            else:
+                rotary_position_offset = chunk_index * self.config.chunksize
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                offset=rotary_position_offset,
+                packed_seq=packed_seq,
+            )
             mscale = 1.0
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb, mscale = self.rotary_pos_emb(
+                rotary_seq_len,
+                offset=rotary_position_offset,
+                packed_seq=packed_seq,
+            )
         if packed_seq:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
         else:
@@ -2070,6 +2220,7 @@ class DSAttention(MegatronModule):
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
         nonpacked_query_positions = None
+        chunk_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
         if packed_thd:
@@ -2216,9 +2367,41 @@ class DSAttention(MegatronModule):
                         )
                     value = value.index_select(0, kv_reorder_idx)
 
+        if self.config.enable_chunkpipe and self.indexer is not None:
+            k = self.indexer.cache_and_concat_chunk_indexer_keys(k)
+
         skv = key.size(0)
 
-        if not packed_thd and sequence_parallel_query_is_local:
+        if self.config.enable_chunkpipe and cp_size == 1:
+            chunk_index = self.config.chunkpipe_chunk_idx_in_group
+            if self.config.cu_chunks is not None:
+                chunk_start = self.config.cu_chunks[chunk_index]
+            else:
+                chunk_start = chunk_index * self.config.chunksize
+            full_query_rows = sequence_parallel_tp_full_rows
+            if chunk_start + full_query_rows > skv:
+                raise RuntimeError(
+                    "DSA ChunkPipe query positions exceed the concatenated key "
+                    f"history: chunk_start={chunk_start}, "
+                    f"chunk_rows={full_query_rows}, key_length={skv}."
+                )
+            chunk_query_positions = torch.arange(
+                chunk_start,
+                chunk_start + full_query_rows,
+                dtype=torch.int64,
+                device=query.device,
+            )
+            if sequence_parallel_query_is_local:
+                row_start = sequence_parallel_tp_row_start
+                chunk_query_positions = chunk_query_positions[
+                    row_start : row_start + sq
+                ].contiguous()
+
+        if (
+            not packed_thd
+            and sequence_parallel_query_is_local
+            and not (self.config.enable_chunkpipe and cp_size == 1)
+        ):
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
                 position_ids, sq, query.device
             )
@@ -2267,6 +2450,7 @@ class DSAttention(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 packed_query_positions=packed_query_positions,
                 nonpacked_query_positions=nonpacked_query_positions,
+                chunk_query_positions=chunk_query_positions,
             )
         )
         if varlen_params is not None:

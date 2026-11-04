@@ -679,6 +679,9 @@ class TransformerConfig(ModelParallelConfig):
     max_chunk_size: int = 0
     """Largest chunk size, used for cache slot stride and shape hints."""
 
+    micro_batch_size: int = 1
+    """Micro-batch size used to allocate ChunkPipe attention caches."""
+
     keep_activations_chunks: int = 0
     """Number of trailing chunks whose activations are retained."""
 
@@ -690,6 +693,12 @@ class TransformerConfig(ModelParallelConfig):
 
     chunkpipe_current_group_size: int = 0
     """Runtime size of the ChunkPipe group being processed."""
+
+    chunkpipe_composite_group_size: int = 0
+    """Runtime total chunk count of the current SFT composite group."""
+
+    chunkpipe_component_sizes: Optional[list] = None
+    """Runtime real-group sizes that make up the current SFT composite group."""
 
     chunkpipe_num_microbatches: int = 0
     """Number of chunk-level microbatches scheduled in the current SFT step."""
