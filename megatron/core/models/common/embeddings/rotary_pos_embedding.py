@@ -49,6 +49,8 @@ class RotaryEmbedding(nn.Module):
             10000.
         rope_scaling (bool, optional): Apply rope scaling as used in llama 3.x.
         rope_scaling_factor (float, optional): rope scaling factor in llama 3.x. Defaults to 8.
+        dtype (torch.dtype, optional): dtype used to construct inverse frequencies. Defaults to
+            torch.float32.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
@@ -64,6 +66,7 @@ class RotaryEmbedding(nn.Module):
         rotary_base: int = 10000,
         rope_scaling: bool = False,
         rope_scaling_factor: float = 8.0,
+        dtype: torch.dtype = torch.float32,
         use_cpu_initialization: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
@@ -77,7 +80,7 @@ class RotaryEmbedding(nn.Module):
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
         self.inv_freq = 1.0 / (
-            rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            rotary_base ** (torch.arange(0, dim, 2, dtype=dtype, device=device) / dim)
         )
 
         if rope_scaling:
