@@ -278,10 +278,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     param = param.detach().clone().cpu().pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
-                    if cpu_copy and self.pin_cpu_params:
-                        param = param.pin_memory()
+                if self.param_update_in_fp32:
+                    if param.dtype != torch.float32:
+                        param = param.detach().clone().float()
+                        if cpu_copy and self.pin_cpu_params:
+                            param = param.pin_memory()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -385,8 +386,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            # Native FP32 params do not need a separate master parameter and are
-            # intentionally absent from param_to_fp32_param.
             fp32_param = self.param_to_fp32_param.get(param)
             if fp32_param is not None:
                 fp32_param.data.copy_(v["master_param"])
