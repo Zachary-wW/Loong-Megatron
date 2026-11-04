@@ -96,6 +96,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
     free_input_nodes = {
         "mlp": free_mlp,
         "moe_combine": True,
+        "post_combine": enable_deepep or enable_hybridep or enable_ncclep,
         # For non-DeepEP/HybridEP/NCCL-EP dispatcher mode, the input is the un-dispatched
         # tokens and probs before dispatch A2A and it's not needed anymore after the
         # forward pass. For DeepEP, HybridEP, and NCCL EP dispatcher mode, they are all
