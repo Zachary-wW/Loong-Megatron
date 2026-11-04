@@ -70,6 +70,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         and layer.config.moe_flex_dispatcher_backend == "ncclep"
     )
 
+    def checkpoint_region(forward_func, *inputs):
+        """Checkpoint one computation segment with the active precision recipe."""
+        if layer.config.fp8 or layer.config.fp4:
+            from megatron.core.extensions.transformer_engine import te_checkpoint
+
+            return te_checkpoint(
+                forward_func,
+                False,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                layer.pg_collection.tp,
+                *inputs,
+            )
+        return tensor_parallel.checkpoint(forward_func, False, *inputs)
+
     def submodule_pre_dispatch_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
         Performs the same attention forward logic as GPTModel and the forward pass for
@@ -77,11 +91,21 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             pre mlp layernorm->router->dispatch preprocess
         """
 
-        if (
+        use_cuda_graph = (
             isinstance(layer, GraphableMegatronModule)
             and hasattr(layer, 'cuda_graphs')
             and layer.cuda_graphs
-        ):
+        )
+        if use_cuda_graph:
+            if (
+                layer.a2a_overlap_attn_recompute
+                or layer.a2a_overlap_post_attn_recompute
+                or layer.a2a_overlap_mlp_recompute
+            ):
+                raise RuntimeError(
+                    "A2A overlap node recompute selectors require the eager fine-grained "
+                    "schedule and cannot be isolated from TE CUDA graph replay."
+                )
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
         else:
@@ -96,47 +120,108 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 sequence_len_offset: Optional[Tensor] = None,
                 padding_mask: Optional[Tensor] = None,
             ):
-                hidden_states, _ = layer._forward_attention(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                    rotary_pos_cos=rotary_pos_cos,
-                    rotary_pos_sin=rotary_pos_sin,
-                    packed_seq_params=packed_seq_params,
-                    sequence_len_offset=sequence_len_offset,
-                    padding_mask=padding_mask,
-                )
+                def attention_forward(attention_input):
+                    attention_output, _ = layer._forward_attention(
+                        hidden_states=attention_input,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        rotary_pos_cos=rotary_pos_cos,
+                        rotary_pos_sin=rotary_pos_sin,
+                        packed_seq_params=packed_seq_params,
+                        sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
+                    )
+                    return attention_output
+
+                if layer.a2a_overlap_attn_recompute:
+                    hidden_states = checkpoint_region(attention_forward, hidden_states)
+                else:
+                    hidden_states = attention_forward(hidden_states)
                 if getattr(layer.config, 'moe_echo_expert_dispatch_overlap', False):
                     hidden_states = FlushPendingGradAccum.apply(hidden_states)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
-                mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
-                node.layer_state.mlp_norm_manager = mlp_norm_manager
-                if layer.recompute_pre_mlp_layernorm:
-                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual
-                    )
-                    with mlp_norm_manager as hidden_states:
-                        pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                            apply_module(layer.pre_mlp_layernorm), hidden_states
-                        )
-                else:
-                    with mlp_norm_manager as hidden_states:
+
+                if layer.a2a_overlap_post_attn_recompute:
+                    node.layer_state.mlp_norm_manager = None
+
+                    def post_attn_forward(post_attention_input):
                         pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
-                            hidden_states
+                            post_attention_input
+                        )
+                        if layer._pre_mlp_layernorm_returns_residual:
+                            pre_mlp_layernorm_output, post_attention_input = (
+                                pre_mlp_layernorm_output
+                            )
+                        probs, routing_map = layer.mlp.route(
+                            pre_mlp_layernorm_output,
+                            padding_mask,
+                            packed_seq_params=packed_seq_params,
+                        )
+                        local_tokens, probs = layer.mlp.preprocess(
+                            pre_mlp_layernorm_output,
+                            probs,
+                            routing_map,
+                            padding_mask,
+                        )
+                        return (
+                            post_attention_input,
+                            pre_mlp_layernorm_output,
+                            local_tokens,
+                            probs,
                         )
 
-                # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
-                # the layernorm returns (normalized_output, residual). Unpack
-                # and use the fused residual for the downstream BDA connection.
-                if layer._pre_mlp_layernorm_returns_residual:
-                    pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
+                    (
+                        hidden_states,
+                        pre_mlp_layernorm_output,
+                        local_tokens,
+                        probs,
+                    ) = checkpoint_region(post_attn_forward, hidden_states)
+                else:
+                    mlp_norm_manager = off_interface(
+                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
+                    )
+                    node.layer_state.mlp_norm_manager = mlp_norm_manager
+                    if layer.recompute_pre_mlp_layernorm:
+                        layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                            retain_input_tensors=layer._pre_mlp_layernorm_returns_residual
+                        )
+                        with mlp_norm_manager as hidden_states:
+                            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                                apply_module(layer.pre_mlp_layernorm), hidden_states
+                            )
+                    else:
+                        with mlp_norm_manager as hidden_states:
+                            pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
+                                hidden_states
+                            )
+
+                    # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
+                    # the layernorm returns (normalized_output, residual). Unpack
+                    # and use the fused residual for the downstream BDA connection.
+                    if layer._pre_mlp_layernorm_returns_residual:
+                        pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 if layer.config.moe_enable_echo:
                     node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
-                shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                if layer.config.moe_enable_echo:
+                    shared_expert_output = (
+                        None
+                        if layer.a2a_overlap_mlp_recompute
+                        else layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                    )
                     return hidden_states, None, None, shared_expert_output
+
+                shared_expert_output = (
+                    None
+                    if layer.a2a_overlap_mlp_recompute
+                    else layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                )
+                if layer.a2a_overlap_mlp_recompute:
+                    node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
+
+                if layer.a2a_overlap_post_attn_recompute:
+                    return hidden_states, local_tokens, probs, shared_expert_output
+
                 # Same routing inputs as the eager MoELayer.forward path: the padding mask is
                 # consumed by the router (dropless HybridEP excludes padded tokens).
                 probs, routing_map = layer.mlp.route(
@@ -160,8 +245,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
+        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
         if layer.config.moe_enable_echo:
-            pre_mlp_layernorm_output = node.layer_state.pre_mlp_layernorm_output
+            if pre_mlp_layernorm_output is None:
+                raise RuntimeError("ECHO routing requires the pre-MLP layernorm output.")
             routing_map, probs, expert_offloading_map = layer.mlp._echo_route(
                 pre_mlp_layernorm_output
             )
@@ -169,11 +256,21 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 pre_mlp_layernorm_output, probs, routing_map
             )
             node.layer_state.echo_expert_offloading_map = expert_offloading_map
+
+        if layer.a2a_overlap_mlp_recompute:
+            if pre_mlp_layernorm_output is None:
+                raise RuntimeError("A2A-overlap MLP recompute requires the pre-MLP norm output.")
+            node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
+        else:
             node.layer_state.pre_mlp_layernorm_output = None
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
-        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+        if (
+            not layer.a2a_overlap_mlp_recompute
+            and layer.mlp.use_shared_expert
+            and not layer.mlp.shared_expert_overlap
+        ):
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
@@ -212,26 +309,55 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             post dispatch->experts->combine preprocess
         """
         dispatched_probs = node.layer_state.dispatched_probs
+        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
         metadata = layer.mlp.token_dispatcher.metadata
         if enable_deepep or enable_hybridep or enable_ncclep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             metadata.dispatched_probs = dispatched_probs
 
+        fc1_expert_dispatch_metadata = None
+        fc2_expert_dispatch_metadata = None
         if layer.config.moe_enable_echo:
             expert_offloading_map = node.layer_state.echo_expert_offloading_map
             fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata = (
                 layer.mlp._prepare_echo_expert_dispatch(expert_offloading_map)
             )
-            expert_output = layer.mlp.echo_routed_experts_compute(
+            node.layer_state.echo_expert_offloading_map = None
+
+        def routed_expert_forward(routed_tokens, routed_probs):
+            if layer.config.moe_enable_echo:
+                return layer.mlp.echo_routed_experts_compute(
+                    routed_tokens,
+                    routed_probs,
+                    fc1_expert_dispatch_metadata,
+                    fc2_expert_dispatch_metadata,
+                )
+            expert_output, _ = layer.mlp.routed_experts_compute(routed_tokens, routed_probs)
+            return expert_output
+
+        if layer.a2a_overlap_mlp_recompute:
+            if pre_mlp_layernorm_output is None:
+                raise RuntimeError("A2A-overlap MLP recompute requires the pre-MLP norm output.")
+
+            def shared_and_routed_expert_forward(
+                routed_tokens, routed_probs, shared_expert_input
+            ):
+                shared_expert_output = layer.mlp.shared_experts_compute(shared_expert_input)
+                expert_output = routed_expert_forward(routed_tokens, routed_probs)
+                return expert_output, shared_expert_output
+
+            expert_output, shared_expert_output = checkpoint_region(
+                shared_and_routed_expert_forward,
                 dispatched_tokens,
                 dispatched_probs,
-                fc1_expert_dispatch_metadata,
-                fc2_expert_dispatch_metadata,
+                pre_mlp_layernorm_output,
             )
-            node.layer_state.echo_expert_offloading_map = None
+            if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+                node.layer_state.shared_expert_output = node.detach(shared_expert_output)
+            node.layer_state.pre_mlp_layernorm_output = None
         else:
-            expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+            expert_output = routed_expert_forward(dispatched_tokens, dispatched_probs)
 
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
@@ -239,7 +365,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             tokens_per_expert = metadata.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
-        if layer.recompute_pre_mlp_layernorm:
+        if (
+            layer.recompute_pre_mlp_layernorm
+            and not layer.a2a_overlap_post_attn_recompute
+        ):
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)

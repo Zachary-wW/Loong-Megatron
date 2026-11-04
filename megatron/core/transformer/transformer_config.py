@@ -633,7 +633,8 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm", "residual_stream".
+    "shortcut_pre_mlp_layernorm", "residual_stream", "a2a_overlap_attn",
+    "a2a_overlap_post_attn", "a2a_overlap_mlp".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -653,9 +654,16 @@ class TransformerConfig(ModelParallelConfig):
             Requires moe_shortcut_connection=True and selective recomputation.
     "residual_stream": replay wide-residual reads, connected norms, and writes via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
+    "a2a_overlap_attn": recompute only the attention computation in the
+            pre-dispatch node of the expert-parallel All-to-All overlap schedule.
+    "a2a_overlap_post_attn": recompute the pre-MLP norm, router, and dispatch
+            preprocessing together in the pre-dispatch node.
+    "a2a_overlap_mlp": recompute shared-expert and routed-expert computation in
+            the MLP node.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and the three A2A-overlap selectors use normal
+    checkpointing.
     """
 
     ####################
@@ -2483,9 +2491,22 @@ class TransformerConfig(ModelParallelConfig):
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
 
+        a2a_overlap_recompute_modules = {
+            "a2a_overlap_attn",
+            "a2a_overlap_post_attn",
+            "a2a_overlap_mlp",
+        }
+        if self.recompute_granularity != "selective" and (
+            a2a_overlap_recompute_modules & set(self.recompute_modules)
+        ):
+            raise ValueError("A2A overlap recompute selectors require selective recomputation.")
+
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
+                    "a2a_overlap_attn",
+                    "a2a_overlap_mlp",
+                    "a2a_overlap_post_attn",
                     "core_attn",
                     "moe_act",
                     "layernorm",
@@ -2541,6 +2562,30 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "shared_experts recompute cannot work with --moe-shared-expert-overlap."
                     )
+
+            enabled_a2a_overlap_recompute_modules = (
+                a2a_overlap_recompute_modules & set(self.recompute_modules)
+            )
+            if enabled_a2a_overlap_recompute_modules and not (
+                self.overlap_moe_expert_parallel_comm
+            ):
+                raise ValueError(
+                    f"{sorted(enabled_a2a_overlap_recompute_modules)} require "
+                    "--overlap-moe-expert-parallel-comm."
+                )
+            if enabled_a2a_overlap_recompute_modules and self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "A2A overlap recompute selectors are only supported on the eager "
+                    "fine-grained schedule, not with CUDA graph replay."
+                )
+            if (
+                "a2a_overlap_post_attn" in enabled_a2a_overlap_recompute_modules
+                and self.moe_enable_echo
+            ):
+                raise ValueError(
+                    "a2a_overlap_post_attn is not compatible with MoE ECHO routing "
+                    "because ECHO performs a separate rerouting/planner step."
+                )
 
             if self.fp8:
                 fp8_output_discarding_modules = {
