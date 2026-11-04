@@ -3151,41 +3151,42 @@ def load_checkpoint(
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if load_arg == 'load' and 'args' in state_dict and not args.finetune:
-        checkpoint_args = state_dict['args']
-        # A GPT block is split into separate attention and MLP positions in
-        # HybridModel, so num_layers intentionally differs even for an
-        # architecture-preserving load. Keep every other resume-time argument
-        # compatibility check.
-        skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        checkpoint_config = None
-        if ckpt_type == CheckpointType.LOCAL:
-            checkpoint_config = state_dict.get('run_config')
-        else:
-            from megatron.training.utils.checkpoint_utils import (
-                get_checkpoint_run_config_filename,
-                read_run_config,
-            )
+    if load_arg == 'load':
+        if 'args' in state_dict and not args.finetune:
+            checkpoint_args = state_dict['args']
+            # A GPT block is split into separate attention and MLP positions in
+            # HybridModel, so num_layers intentionally differs even for an
+            # architecture-preserving load. Keep every other resume-time argument
+            # compatibility check.
+            skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
+            checkpoint_config = None
+            if ckpt_type == CheckpointType.LOCAL:
+                checkpoint_config = state_dict.get('run_config')
+            else:
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                    read_run_config,
+                )
 
-            checkpoint_dir = (
-                os.path.dirname(os.path.dirname(checkpoint_name))
-                if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+                checkpoint_dir = (
+                    os.path.dirname(os.path.dirname(checkpoint_name))
+                    if ckpt_type == CheckpointType.LEGACY else checkpoint_name
+                )
+                config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+                if maybe_msc.os.path.exists(config_filename):
+                    checkpoint_config = read_run_config(config_filename)
+            check_checkpoint_args(
+                checkpoint_args,
+                skip_args=skip_args,
+                checkpoint_config=checkpoint_config,
+                check_training_state=restore_training_state,
             )
-            config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-            if maybe_msc.os.path.exists(config_filename):
-                checkpoint_config = read_run_config(config_filename)
-        check_checkpoint_args(
-            checkpoint_args,
-            skip_args=skip_args,
-            checkpoint_config=checkpoint_config,
-            check_training_state=restore_training_state,
-        )
-        if restore_training_state:
-            args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
-            args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-            args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
-    else:
-        print_rank_0('could not find arguments in the checkpoint ...')
+            if restore_training_state:
+                args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
+                args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
+                args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
+        else:
+            print_rank_0('could not find arguments in the checkpoint ...')
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
