@@ -3,14 +3,12 @@ Copyright (c) 2014 Baidu.com, Inc. All Rights Reserved
 This module provides megatron-core-xpu plugin.
 """
 
-import inspect
 import sys
 from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
 from torch.nn import LayerNorm as TorchLayerNorm
-from torch.optim import AdamW
 
 try:
     import torch_xmlir
@@ -21,37 +19,6 @@ try:
     import xspeedgate_ops
 except Exception:
     xspeedgate_ops = None
-
-
-class Adam:
-    """
-    Automatically detect DTensor parameters and route to torch.optim.AdamW
-    (which supports DTensor and BF16) instead of TE/Apex FusedAdam.
-    If no DTensor is found, delegate to the original Adam via __origin_Adam.
-    Silently swallows any TE/Apex-only kwargs (adam_w_mode, bias_correction,
-    master_weights, ...) when using torch.optim.AdamW.
-    """
-
-    _TORCH_ADAMW_ARGS = set(inspect.signature(AdamW).parameters)
-
-    def __new__(cls, params, **kwargs):
-        has_dtensor = any(
-            isinstance(param, torch.distributed.tensor.DTensor)
-            for param_group in params
-            for param in param_group['params']
-        )
-        if has_dtensor:
-            # Use torch.optim.AdamW for DTensor compatibility
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k in cls._TORCH_ADAMW_ARGS}
-            filtered_kwargs.setdefault('fused', True)
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                print('[INFO] DTensor detected in params, using torch.optim.AdamW instead of FusedAdam')
-            return AdamW(params, **filtered_kwargs)
-        else:
-            # Use original Adam (FusedAdam) via __origin_Adam
-            import megatron.core.optimizer as _optim_mod
-            OriginalAdam = getattr(_optim_mod, '__origin_Adam')
-            return OriginalAdam(params, **kwargs)
 
 
 class MockMixedFusedLayerNorm(TorchLayerNorm):
@@ -74,62 +41,6 @@ class MockMixedFusedLayerNorm(TorchLayerNorm):
         self.sequence_parallel = sequence_parallel
         setattr(self.weight, "sequence_parallel", self.sequence_parallel)
         setattr(self.bias, "sequence_parallel", self.sequence_parallel)
-
-
-def mock_bias_swiglu_impl(
-    input,
-    bias,
-    fp8_input_store=False,
-    cpu_offload_input=False,
-    clamp_value=None,
-    gate_clamp_scale: Optional[float] = None,
-    linear_clamp_scale: Optional[float] = None,
-):
-    """
-    mock_bias_swiglu_impl
-    """
-    ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    assert not fp8_input_store
-    input = input.view(-1, ori_shape[-1])
-
-    if clamp_value is not None or gate_clamp_scale is not None:
-        from megatron.core.fusions.fused_bias_swiglu import (
-            bias_clamped_swiglu,
-            bias_situ_glu,
-            clamped_swiglu,
-        )
-
-        assert gate_clamp_scale is not None or linear_clamp_scale is None
-        assert gate_clamp_scale is None or clamp_value is None
-        if gate_clamp_scale is not None:
-            output = (
-                bias_situ_glu(input, bias, gate_clamp_scale, linear_clamp_scale)
-                if bias is not None
-                else bias_situ_glu(
-                    input, torch.zeros_like(input), gate_clamp_scale, linear_clamp_scale
-                )
-            )
-        else:
-            output = (
-                bias_clamped_swiglu(input, bias, clamp_value)
-                if bias is not None
-                else clamped_swiglu(input, clamp_value)
-            )
-        return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
-
-    if bias is not None:
-        input = input + bias
-    
-    if cpu_offload_input:
-        input.activation_offloading = True
-        if bias is not None:
-            bias.activation_offloading = True
-
-    from torch_xmlir.nn.swiglu import SwiGLUFunction
-
-    output = SwiGLUFunction.apply(input)
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
 class MockWeightedSwiGLUFunction(torch.autograd.Function):
@@ -248,42 +159,6 @@ def mock_weighted_bias_swiglu_impl(
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
-class MockGeLUFunction(torch.autograd.Function):
-    """
-    MockGeLUFunction
-    """
-
-    @staticmethod
-    # bias is an optional argument
-    def forward(ctx, input, bias):
-        """
-        forward
-        """
-        # ctx.save_for_backward(input, bias)
-        out = bias + input
-        ctx.save_for_backward(out)
-        return torch.ops.aten.gelu(out)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """
-        backward
-        """
-        out = ctx.saved_tensors[0]
-        tmp = torch.ops.aten.gelu_backward(grad_output, out)
-        return tmp, tmp
-    
-mock_bias_gelu_impl = MockGeLUFunction.apply
-
-
-def mock_bias_gelu(bias, y):
-    """
-    mock_bias_gelu
-    """
-    out = bias + y
-    return torch.ops.aten.gelu(out)
-
-
 class RotaryPositionalEmbeddingWithFreqFunction(torch.autograd.Function):
     """
     RotaryPositionalEmbeddingWithFreqFunction
@@ -372,104 +247,6 @@ def read_metadata_dist_without_DFS(tracker_filename):
         release = bool(release_cuda[0].item())
     return iteration, release
 
-
-def mock_unpermute(
-    permuted_tokens: torch.Tensor,
-    sorted_indices: torch.Tensor,
-    restore_shape: torch.Size,
-    probs: torch.Tensor = None,
-    routing_map: torch.Tensor = None,
-    fused: bool = False,
-    drop_and_pad: bool = False,
-):
-    """
-    Restore the original order of tokens after permutation. If probs are provided, it
-    will also apply them to the tokens before restoring the order.
-
-    When drop_and_pad=True, the tensors will have the following properties:
-      - In routing_map, the number of non-zeros in each column equals to expert capacity
-      - The size of sorted_indices equals to num_experts * capacity, each split of `capacity`
-        contains the indices of tokens routed to an expert.
-    This function exploits these features to use ops that support cuda graph.
-
-    Args:
-        permuted_tokens (torch.Tensor): The permuted token tensor.
-        sorted_indices (torch.Tensor): The indices used to sort the tokens.
-        restore_shape (torch.Size): The shape of the unpermuted tensor.
-        probs (torch.Tensor, optional): The unpermuted probs tensor,
-        routing_map (torch.Tensor, optional): Token to expert mapping, shape
-            [num_tokens, num_experts].
-        fused (bool, optional): Whether use the fused unpermute function.
-        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
-                                       and pads the number of tokens to the expert capacity.
-
-    Returns:
-        torch.Tensor: The tokens restored to their original order.
-    """
-    try:
-        import transformer_engine as te  # pylint: disable=unused-import
-
-        from megatron.core.extensions.transformer_engine import fused_unpermute
-        HAVE_TE = True
-    except ImportError:
-        HAVE_TE = False
-
-    if fused:
-        if not HAVE_TE or fused_unpermute is None:
-            raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
-        return fused_unpermute(
-            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
-        )
-
-    _, hidden = restore_shape
-    input_dtype = permuted_tokens.dtype
-
-    if probs is not None:
-        assert routing_map is not None, "Mask must be provided to permute the probs."
-        if drop_and_pad:
-            num_experts = routing_map.size(1)
-            num_permuted_tokens = sorted_indices.size(0)
-            capacity = num_permuted_tokens // num_experts
-            num_unpermuted_tokens = probs.size(0)
-
-            # [num_unpermuted_tokens, num_experts] -> num_experts * num_unpermuted_tokens
-            probs_T_1D = probs.T.contiguous().view(-1)
-
-            # get 1D indices of the probs selected by routing_map
-            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
-            indices_dim1 = sorted_indices.view(num_experts, capacity)
-            indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
-
-            # get probs from indices
-            permuted_probs = probs_T_1D.index_select(0, indices_1D)
-        else:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
-        # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
-        # higher precision due to moe_router_dtype being enabled. This can lead to
-        # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
-        # allocation.
-        permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
-
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
-        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
-    else:
-        # Scatter add the permuted_input back to the original positions
-        # output_tokens.scatter_add_(
-        #     0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-        # )
-        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
-    return output_tokens.to(dtype=input_dtype)
 
 def mock_is_kernel_available(self, mask, b, np, sq, sk):
     """
@@ -638,124 +415,6 @@ def mock_reduce_scatter_along_first_dim(
             output = temp_output[: original_chunk_sizes[rank]]
             output = output.contiguous()
     return output
-
-# ---------------------------------------------------------------------------
-# Mock for fused linear cross-entropy (LCE) backward — XPU compatible
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def mock_lce_backward(
-    dlogprobs, global_hidden, weight, labels, maximum, accu,
-    num_valid_tokens, reduction="mean", ignore_index=-100,
-    tp_group=None, tp_rank=0, tp_world_size=1, sequence_parallel=False,
-):
-    """
-    Chunked backward pass for fused linear + cross-entropy (pure PyTorch).
-    """
-    from torch import distributed as dist
-
-    from megatron.core.fusions.linear_cross_entropy import utils
-    from megatron.core.fusions.linear_cross_entropy.generic.entry import _get_config
-
-    in_tp_mode = (tp_group is not None) and (tp_world_size > 1)
-
-    hidden_view = global_hidden.view(-1, global_hidden.shape[-1])
-    labels_view = labels.view(-1)
-
-    num_tokens, dim = hidden_view.shape
-    vocab_size = weight.shape[0]
-    device = global_hidden.device
-    REDUCTION = utils.str_to_reduction_enum(reduction)
-
-    # ---- prepare per-token upstream gradient ----
-    valid_mask = labels_view != ignore_index
-    if REDUCTION == utils.EntropyReductionEnum.kMean:
-        scale = dlogprobs.float() / num_valid_tokens.float().clamp(min=1)
-        dlogprobs_per_token = scale.expand(num_tokens)
-    elif REDUCTION == utils.EntropyReductionEnum.kSum:
-        dlogprobs_per_token = dlogprobs.float().expand(num_tokens)
-    else:  # kNone
-        dlogprobs_per_token = dlogprobs.float().view(-1)
-    dlogprobs_per_token = dlogprobs_per_token * valid_mask.float()
-    # precompute: dlogprobs / accu  (used in every split)
-    grad_scale = dlogprobs_per_token / accu.clamp(min=1e-30)  # (num_tokens,)
-
-    d_hidden = torch.empty_like(global_hidden)
-    d_weight = torch.empty_like(weight)
-
-    vocab_offset = tp_rank * vocab_size
-    vocab_per_split = _get_config().bwd_vocab_per_split
-    num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
-    # reusable buffers
-    _d_logits = torch.empty(
-        (num_tokens, vocab_per_split), device=device, dtype=global_hidden.dtype
-    )
-    # bf16 buffer for matmul output
-    matmul_buf = torch.empty(
-        (num_tokens, vocab_per_split), device=device, dtype=global_hidden.dtype
-    )
-    # float32 buffer for gradient arithmetic
-    logits_buf = torch.empty(
-        (num_tokens, vocab_per_split), device=device, dtype=torch.float32
-    )
-    row_idx = torch.arange(num_tokens, device=device)
-
-    d_hidden_flat = d_hidden.view(-1, dim)
-    for split_idx in range(num_splits):
-        v_start = split_idx * vocab_per_split
-        v_end = min(v_start + vocab_per_split, vocab_size)
-        chunk_size = v_end - v_start
-        weight_chunk = weight[v_start:v_end, :]
-        # ---- recompute logits in native dtype (bf16, fast) ----
-        matmul_chunk = matmul_buf[:, :chunk_size]
-        torch.matmul(hidden_view, weight_chunk.t(), out=matmul_chunk)
-        # ---- cast to float32 for gradient computation ----
-        logits_chunk = logits_buf[:, :chunk_size]
-        logits_chunk.copy_(matmul_chunk)
-        # d_logits = grad_scale * exp(logit - max)   (in-place)
-        logits_chunk.sub_(maximum.unsqueeze(1)).exp_()            # exp(logit - max)
-        logits_chunk.mul_(grad_scale.unsqueeze(1))                # * (dlogprobs / accu)
-        # subtract at label positions
-        global_v_start = vocab_offset + v_start
-        label_in_chunk = (
-            (labels_view >= global_v_start)
-            & (labels_view < (vocab_offset + v_end))
-            & valid_mask
-        )
-        if label_in_chunk.any():
-            local_idx = (labels_view - global_v_start).clamp(0, chunk_size - 1)
-            logits_chunk[row_idx[label_in_chunk], local_idx[label_in_chunk]] -= (
-                dlogprobs_per_token[label_in_chunk]
-            )
-        # cast to hidden dtype into reusable buffer
-        _d_logits[:, :chunk_size] = logits_chunk.to(global_hidden.dtype)
-        valid_d_logits = _d_logits[:, :chunk_size]
-        # d_hidden += d_logits @ weight_chunk  (bf16 matmul)
-        if split_idx == 0:
-            d_hidden_flat.copy_(torch.mm(valid_d_logits, weight_chunk))
-        else:
-            d_hidden_flat.add_(torch.mm(valid_d_logits, weight_chunk))
-        # d_weight[chunk] = d_logits.T @ hidden  (bf16 matmul)
-        torch.matmul(
-            valid_d_logits.t(),
-            hidden_view,
-            out=d_weight[v_start:v_end, :],
-        )
-    # ---- TP reduction ----
-    if in_tp_mode:
-        dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
-        if sequence_parallel:
-            partial_hidden_shape = (
-                global_hidden.shape[0] // tp_world_size,
-                *global_hidden.shape[1:],
-            )
-            partial_num_tokens = num_tokens // tp_world_size
-            d_hidden = d_hidden.view(-1, d_hidden.shape[-1])[
-                tp_rank * partial_num_tokens : (tp_rank + 1) * partial_num_tokens, :
-            ]
-            d_hidden = d_hidden.view(partial_hidden_shape).clone()
-
-    return d_hidden, d_weight
 
 
 def mock_thd_get_partitioned_indices(cu_seqlens, total_tokens, world_size, rank):

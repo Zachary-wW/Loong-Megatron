@@ -498,4 +498,3 @@ def _install_gdn_mock_hook():
         return
     _GDN_ORIGINAL_IMPORT = builtins.__import__
     builtins.__import__ = _gdn_patched_import
-
