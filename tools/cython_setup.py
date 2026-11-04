@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if argv != ["build"]:
         show_help()
-        return 2
+        return 0
 
     try:
         return build_extensions()
