@@ -1655,6 +1655,10 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mtp_connection_type must be either 'sequential' or 'parallel'."
             )
+        if self.mtp_connection_type == 'parallel' and self.mtp_hsm:
+            raise ValueError(
+                "mtp_connection_type='parallel' cannot be combined with mtp_hsm=True."
+            )
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
