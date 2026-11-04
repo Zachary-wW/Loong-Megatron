@@ -32,8 +32,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
         wgrad_deferral_limit: Optional[int] = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_remat_size: int = 1,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         """Forward pass of linear layer with grad accumulation and async communication."""
+        if gtp_remat_size != 1:
+            raise NotImplementedError("XPU Hydra linear does not support GTP weight rematerialization.")
+        if output_dtype is not None and output_dtype != input.dtype:
+            raise NotImplementedError(
+                "XPU Hydra linear does not support an output dtype different from the input dtype."
+            )
         if tp_group is None:
             tp_group = get_tensor_model_parallel_group()
         ctx.tp_group = tp_group
@@ -59,7 +67,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             total_input = torch.empty(
                 dim_size,
                 dtype=input.dtype,
-                device=torch.cuda.current_device(),
+                device=input.device,
                 requires_grad=False,
             )
 
@@ -84,7 +92,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if handle is not None:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
     @classmethod
     def _async_backward_input(

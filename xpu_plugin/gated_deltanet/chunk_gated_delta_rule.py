@@ -766,4 +766,3 @@ def chunk_gated_delta_rule(
         cp_context,
     )
     return o, final_state
-

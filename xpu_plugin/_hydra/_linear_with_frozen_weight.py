@@ -24,7 +24,13 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         allreduce_dgrad: bool,
         tp_group: Optional[dist.ProcessGroup],
+        output_dtype: Optional[torch.dtype] = None,
     ):
+        if output_dtype is not None and output_dtype != input.dtype:
+            raise NotImplementedError(
+                "XPU Hydra frozen-weight linear does not support an output dtype different "
+                "from the input dtype."
+            )
         result = linear_fwd(input, weight, bias)
 
         ctx.save_for_backward(weight)
@@ -51,4 +57,4 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         else:
             linear_bwd_dgrad(grad_output, weight, grad_input)
 
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None, None, None
