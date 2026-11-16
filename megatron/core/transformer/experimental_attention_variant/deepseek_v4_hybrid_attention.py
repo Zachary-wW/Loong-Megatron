@@ -160,12 +160,9 @@ class DSv4HybridAttention(Attention):
         self._dsv4_rope_base = rope_base
         self._dsv4_uses_yarn_rope = use_compressed_yarn
         if not use_compressed_yarn:
-            # DSv4 W layers rotate the full qk_pos_emb_head_dim. The model
-            # config's rotary_percent belongs to compressed/Yarn layers; using
-            # it here rotates only 8/64 dimensions and changes W-layer outputs.
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
-                rotary_percent=1.0,
+                rotary_percent=self.config.rotary_percent,
                 rotary_base=rope_base,
                 cp_group=self.pg_collection.cp,
             )

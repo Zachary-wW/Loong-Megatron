@@ -29,13 +29,8 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
-    learned_output_contract,
 )
-from megatron.core.transformer.module import (
-    GraphableMegatronModule,
-    MegatronModule,
-    mark_keep_in_fp32,
-)
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -339,20 +334,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             and 'mhc' in config.recompute_modules
         )
         self._build_layers()
-        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
-            mhc_mult = self.config.mhc_num_residual_streams
-            mhc_dim = self.config.hidden_size * mhc_mult
-            self.hc_head_fn = mark_keep_in_fp32(
-                torch.nn.Parameter(torch.empty(mhc_mult, mhc_dim))
-            )
-            self.hc_head_base = mark_keep_in_fp32(
-                torch.nn.Parameter(torch.zeros(mhc_mult))
-            )
-            self.hc_head_scale = mark_keep_in_fp32(torch.nn.Parameter(torch.ones(1)))
-            torch.nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                for parameter in (self.hc_head_fn, self.hc_head_base, self.hc_head_scale):
-                    setattr(parameter, "sequence_parallel", True)
         self.num_layers_per_pipeline_rank = len(self.layers)
 
     def _build_layers(self):
@@ -554,7 +535,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        input_ids: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -724,7 +704,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
-                    input_ids=input_ids,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -764,8 +743,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     extra_layer_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
-                    if input_ids is not None:
-                        extra_layer_kwargs["input_ids"] = input_ids
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -801,27 +778,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        mhc_multistream = None
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
-            if (
-                getattr(self.config, "return_mhc_multistream_for_mtp", False)
-                and self.config.mtp_num_layers
-            ):
-                mhc_multistream = hidden_states
-            if hasattr(self, "hc_head_fn"):
-                hidden_states = learned_output_contract(
-                    hidden_states,
-                    self.hc_head_fn,
-                    self.hc_head_base,
-                    self.hc_head_scale,
-                    self.config.mhc_num_residual_streams,
-                    self.config.layernorm_epsilon,
-                )
-            else:
-                hidden_states = HyperConnectionModule.output_contract(
-                    hidden_states, self.mhc_num_residual_streams
-                )  # [s, b, n*C] -> [s, b, C]
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.mhc_num_residual_streams
+            )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -840,8 +801,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states
-        if mhc_multistream is not None:
-            return hidden_states, mhc_multistream
 
         return hidden_states
 
