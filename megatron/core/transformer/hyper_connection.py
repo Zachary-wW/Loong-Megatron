@@ -302,11 +302,9 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        # The mHC mapping computation runs in FP32: the parameters are kept in
-        # FP32 and the activations are upcast here, then compute_mappings casts
-        # the bounded mixing weights back to the activation dtype.
-        x_2d = x.reshape(s * b, nC).to(torch.float32)
-        weight = self.mapping_proj.weight.to(torch.float32)
+        compute_dtype = x.dtype if self.config.dsv4_legacy_numeric_parity else torch.float32
+        x_2d = x.reshape(s * b, nC).to(compute_dtype)
+        weight = self.mapping_proj.weight.to(compute_dtype)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
@@ -324,16 +322,28 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             h_res: [s, b, n^2] - residual mixing logits
         """
-        alpha_ = torch.cat(
-            [
-                self.alpha_pre.expand(self.n),
-                self.alpha_post.expand(self.n),
-                self.alpha_res.expand(self.n * self.n),
-            ],
-            dim=-1,
-        )
+        if self.config.dsv4_legacy_numeric_parity:
+            alpha_ = torch.cat(
+                [
+                    self.alpha_pre.to(proj.dtype).expand(self.n),
+                    self.alpha_post.to(proj.dtype).expand(self.n),
+                    self.alpha_res.to(proj.dtype).expand(self.n * self.n),
+                ],
+                dim=-1,
+            )
+            bias = self.bias.to(proj.dtype)
+        else:
+            alpha_ = torch.cat(
+                [
+                    self.alpha_pre.expand(self.n),
+                    self.alpha_post.expand(self.n),
+                    self.alpha_res.expand(self.n * self.n),
+                ],
+                dim=-1,
+            )
+            bias = self.bias
 
-        h = r * proj * alpha_ + self.bias
+        h = r * proj * alpha_ + bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
 
@@ -389,9 +399,6 @@ class HyperConnectionModule(MegatronModule):
             h_res, self.sinkhorn_iterations, self.sinkhorn_eps
         )  # [s, b, n, n]
 
-        # The mixing weights are bounded (sigmoid outputs / doubly stochastic
-        # matrix), so after the FP32 computation they are safe to apply to the
-        # streams in the activation dtype.
         dtype = x.dtype
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 

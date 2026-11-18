@@ -229,8 +229,16 @@ def unfused_compressed_sparse_attn(
     attn_sink: torch.Tensor,
     topk_indices: torch.Tensor,
     softmax_scale: float,
+    legacy_row_major_reduction: bool = False,
 ) -> torch.Tensor:
     """Differentiable sparse attention with MQA and attention sink.
+
+    Optional numeric parity:
+        The 0.15 reference path flattens batch and sequence before score
+        reduction, producing ``[batch*seq, heads, topk]``. MCore 0.20 uses
+        ``[batch, heads, seq, topk]``. Both are mathematically equivalent, but
+        CUDA FP32 reductions can round differently before the BF16 cast.
+        ``legacy_row_major_reduction=True`` enables the 0.15 layout.
 
     Determinism:
         Unknown. Bit-exact forward and backward repeatability has not been certified.
@@ -241,6 +249,7 @@ def unfused_compressed_sparse_attn(
         attn_sink:    [np]              per-head learnable bias.
         topk_indices: [b, sq, topk]     indices into kv_full (int32, -1 = invalid).
         softmax_scale: float
+        legacy_row_major_reduction: Use the 0.15 batch*sequence reduction layout.
 
     Returns:
         output:       [sq, b, np * hn]
@@ -252,48 +261,80 @@ def unfused_compressed_sparse_attn(
             f"got shape {tuple(attn_sink.shape)}."
         )
 
-    # --- Gather KV at topk positions ---
-    # Flatten batch and KV position before gathering. Gathering from a logical
-    # [b, sq, n_kv, hn] expanded view makes gather backward allocate that entire
-    # dense shape before reducing the stride-0 query dimension.
     n_kv = kv_full.size(0)
     topk = topk_indices.size(-1)
     kv_flat = kv_full.permute(1, 0, 2).reshape(b * n_kv, hn)
-    batch_offsets = (torch.arange(b, device=kv_full.device, dtype=torch.int64) * n_kv).view(b, 1, 1)
+
+    if legacy_row_major_reduction:
+        rows = b * sq
+        q_flat = query.permute(1, 0, 2, 3).reshape(rows, np_, hn)
+        batch_ids = torch.arange(b, device=query.device).view(b, 1, 1)
+        valid_indices = topk_indices >= 0
+        global_indices = torch.where(
+            valid_indices,
+            topk_indices + batch_ids * n_kv,
+            topk_indices,
+        ).reshape(rows, -1)
+
+        safe_indices = global_indices.clamp(min=0).long()
+        safe_indices_expanded = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
+        kv_gathered = torch.gather(
+            kv_flat.unsqueeze(0).expand(rows, -1, -1),
+            dim=1,
+            index=safe_indices_expanded,
+        )
+
+        q_flat_fp32 = q_flat.float()
+        kv_gathered_fp32 = kv_gathered.float()
+        scores = torch.einsum("rhd,rkd->rhk", q_flat_fp32, kv_gathered_fp32) * softmax_scale
+
+        invalid_mask = (~valid_indices).reshape(rows, 1, -1)
+        scores = scores.masked_fill(invalid_mask, float("-inf"))
+
+        sink = attn_sink.view(1, np_, 1).float()
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        scores_max = torch.max(scores_max, sink)
+
+        exp_scores = torch.exp(scores - scores_max)
+        exp_sink = torch.exp(sink - scores_max)
+
+        sum_exp = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+        attn_weights = exp_scores / sum_exp
+
+        output = torch.einsum("rhk,rkd->rhd", attn_weights, kv_gathered_fp32)
+        output = output.to(query.dtype)
+        return output.reshape(b, sq, np_, hn).permute(1, 0, 2, 3).contiguous().reshape(
+            sq, b, np_ * hn
+        )
+
+    # MCore 0.20 default: keep batch separate and reduce in [batch, heads, seq] order.
+    batch_offsets = (torch.arange(b, device=kv_full.device, dtype=torch.int64) * n_kv).view(
+        b, 1, 1
+    )
     safe_indices = topk_indices.clamp(min=0).to(dtype=torch.int64) + batch_offsets
     kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(b, sq, topk, hn)
 
-    # --- Attention scores ---
-    # query: [sq, b, np, hn] -> [b, np, sq, hn]
     q = query.permute(1, 2, 0, 3).float()
-    kv_g = kv_gathered.float()  # [b, sq, topk, hn]
-
-    # [b, np, sq, topk]
+    kv_g = kv_gathered.float()
     scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g) * softmax_scale
 
-    # Mask invalid
-    invalid_mask = (topk_indices < 0).unsqueeze(1)  # [b, 1, sq, topk]
+    invalid_mask = (topk_indices < 0).unsqueeze(1)
     scores = scores.masked_fill(invalid_mask, float("-inf"))
 
-    # --- Softmax with attention sink ---
     sink = attn_sink.view(1, np_, 1, 1).float()
-    scores_max = scores.max(dim=-1, keepdim=True).values  # [b, np, sq, 1]
+    scores_max = scores.max(dim=-1, keepdim=True).values
     scores_max = torch.max(scores_max, sink)
 
-    exp_scores = torch.exp(scores - scores_max)  # [b, np, sq, topk]
-    exp_sink = torch.exp(sink - scores_max)  # [1, np, 1, 1]
+    exp_scores = torch.exp(scores - scores_max)
+    exp_sink = torch.exp(sink - scores_max)
 
     sum_exp = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
-    attn_weights = exp_scores / sum_exp  # [b, np, sq, topk]
+    attn_weights = exp_scores / sum_exp
 
-    # --- Weighted sum ---
     output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_g)
     output = output.to(query.dtype)
-
-    # [b, np, sq, hn] -> [sq, b, np, hn] -> [sq, b, np * hn]
     output = output.permute(2, 0, 1, 3).contiguous()
-    output = output.reshape(sq, b, np_ * hn)
-    return output
+    return output.reshape(sq, b, np_ * hn)
 
 
 @torch.no_grad()
@@ -1362,7 +1403,12 @@ class CompressedSparseAttention(MegatronModule):
         # --- Step 5: Sparse attention ---
         nvtx_range_push("sparse_attn_kernel")
         output = unfused_compressed_sparse_attn(
-            query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
+            query,
+            kv_full,
+            self.attn_sink.float(),
+            topk_idxs,
+            self.softmax_scale,
+            legacy_row_major_reduction=self.config.dsv4_legacy_numeric_parity,
         )
         nvtx_range_pop("sparse_attn_kernel")
 

@@ -1286,6 +1286,16 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    dsv4_legacy_numeric_parity: bool = False
+    """Opt into DeepSeek-V4 0.15-compatible reference numerics.
+
+    When enabled, the native unfused CSA path uses the legacy row-major
+    reduction layout, and native mHC mapping computation uses the model
+    activation dtype for projection and H coefficients. The default False
+    value preserves MCore 0.20 behavior. Fused CSA/mHC execution must be
+    disabled because those kernels do not implement the legacy path.
+    """
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -2589,6 +2599,22 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
+
+        if self.dsv4_legacy_numeric_parity:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                raise ValueError(
+                    "dsv4_legacy_numeric_parity requires "
+                    "experimental_attention_variant='dsv4_hybrid'."
+                )
+            if self.dsa_kernel_backend not in (None, "none"):
+                raise ValueError(
+                    "dsv4_legacy_numeric_parity requires the unfused CSA reference path; "
+                    "set dsa_kernel_backend='none'."
+                )
+            if self.use_fused_mhc:
+                raise ValueError(
+                    "dsv4_legacy_numeric_parity is not supported with use_fused_mhc=True."
+                )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
         if self.mhc_fused_backend not in valid_mhc_fused_backends:
