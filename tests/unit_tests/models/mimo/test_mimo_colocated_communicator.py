@@ -458,6 +458,29 @@ class TestBridgeGradients:
         expected = grad_output.narrow(batch_dim, slot * b_local, b_local).contiguous()
         torch.testing.assert_close(local_input.grad, expected, rtol=0, atol=0)
 
+    def test_fan_in_uneven_source_sizes(self):
+        world_size = dist.get_world_size()
+        if world_size < 2 or world_size % 2:
+            pytest.skip("Fan-in requires an even number of ranks")
+        src_grid = create_hypercomm_grid(tp=1, dp=world_size)
+        dest_grid = create_hypercomm_grid(tp=2, dp=world_size // 2)
+        comm = make_comm(src_grid, dest_grid, dim_mapping={'b': 0, 'h': 1})
+        slot = comm.get_slice_info(comm.scale).start
+
+        for sizes in [(2, 3), (0, 3), (3, 0), (0, 0)]:
+            start = sum(sizes[:slot])
+            expected = torch.arange(sum(sizes), device='cuda', dtype=torch.float32).view(-1, 1)
+            local_input = expected.narrow(0, start, sizes[slot]).clone().requires_grad_()
+
+            output = comm.communicate(local_input, fan_in_sizes=sizes)
+
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            grad_output = expected + 1
+            output.backward(grad_output)
+            torch.testing.assert_close(
+                local_input.grad, grad_output.narrow(0, start, sizes[slot]), rtol=0, atol=0
+            )
+
     # ── Test 3: fan-out forward = input.narrow for this rank's slot ─────────
     @pytest.mark.parametrize("src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"])
     def test_fan_out_forward_equals_narrow(self, src_tp, src_dp, dest_tp, dest_dp):
