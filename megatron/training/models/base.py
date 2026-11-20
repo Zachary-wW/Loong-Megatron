@@ -4,8 +4,9 @@ import abc
 import functools
 import importlib
 import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -247,6 +248,12 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
 
     def __init__(self, model_config: ModelConfig):
         self._model_config = model_config
+
+    def build_optimizer(self, config, model_chunks, **kwargs):
+        """Build the optimizer for the distributed model returned by this builder."""
+        from megatron.core.optimizer import get_megatron_optimizer
+
+        return get_megatron_optimizer(config, model_chunks, **kwargs)
 
     @abc.abstractmethod
     def build_model(

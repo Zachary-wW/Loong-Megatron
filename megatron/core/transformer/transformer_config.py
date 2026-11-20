@@ -1307,7 +1307,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers per MHC recompute block.
 
     When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    in each recompute block (i.e., layer_number %% mhc_recompute_layer_num == 0 or the final
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
