@@ -4,6 +4,7 @@ This module provides megatron-core-xpu plugin.
 """
 
 import sys
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
@@ -188,7 +189,14 @@ class RotaryPositionalEmbeddingWithFreqFunction(torch.autograd.Function):
 
 
 def mock_apply_rotary_pos_emb_bshd(
-    t: Tensor, freqs: Tensor, rotary_interleaved: bool = False
+    t: Tensor,
+    freqs: Tensor,
+    rotary_interleaved: bool = False,
+    mla_rotary_interleaved: bool = False,
+    mscale: float = 1.0,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
+    multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
     """
     input tensor t is of shape [seq_length, ..., dim]
@@ -197,16 +205,48 @@ def mock_apply_rotary_pos_emb_bshd(
     """
     from megatron.core.models.common.embeddings.rotary_pos_embedding import _rotate_half
 
+    if multi_latent_attention is not None:
+        warnings.warn(
+            "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
+            DeprecationWarning,
+        )
+        mla_rotary_interleaved = multi_latent_attention
+
+    if freqs.dim() == t.dim() + 1 and freqs.size(-2) == 1:
+        freqs = freqs.squeeze(-2)
+
     rot_dim = freqs.shape[-1]
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
 
+    if mla_rotary_interleaved:
+        x1 = t[..., 0::2]
+        x2 = t[..., 1::2]
+        t = torch.cat((x1, x2), dim=-1)
+
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    if torch_xmlir is not None:
+    use_xmlir_fusion = (
+        torch_xmlir is not None
+        and not rotary_interleaved
+        and not mla_rotary_interleaved
+        and mscale == 1.0
+        and not inverse
+        and not mla_output_remove_interleaving
+    )
+    if use_xmlir_fusion:
         t = RotaryPositionalEmbeddingWithFreqFunction.apply(t, freqs)
     else:
-        t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
+        cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
+        sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+        if inverse:
+            sin_ = -sin_
+        t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
+
+    if mla_rotary_interleaved and mla_output_remove_interleaving:
+        x1, x2 = torch.chunk(t, 2, dim=-1)
+        t = torch.stack((x1, x2), dim=-1).flatten(start_dim=-2)
+
     return torch.cat((t, t_pass), dim=-1)
 
 
