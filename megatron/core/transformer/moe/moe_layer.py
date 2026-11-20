@@ -712,13 +712,10 @@ class MoELayer(BaseMoELayer):
         return shared_expert_output
 
     @internal_api
-    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
-        """Computes the output of the routed experts on the dispatched tokens.
-
-        This method first post-processes the dispatched input to get permuted tokens
-        for each expert. It then passes the tokens through the local experts.
-        The output from the experts is preprocessed for the combine step.
-        """
+    def _dispatch_postprocess_for_experts(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor
+    ):
+        """Prepare permuted expert inputs from dispatched tokens."""
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
@@ -734,6 +731,15 @@ class MoELayer(BaseMoELayer):
                     self.config.moe_mem_monitor_log,
                     self.config.print_moe_mem_monitor_interval,
                 )
+        return dispatched_input, tokens_per_expert, permuted_probs
+
+    def _run_experts(
+        self,
+        dispatched_input: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
+        """Run only the routed expert computation on already-permuted tokens."""
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
@@ -753,6 +759,22 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        return expert_output, mlp_bias
+
+    @internal_api
+    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """Computes the output of the routed experts on the dispatched tokens.
+
+        This method first post-processes the dispatched input to get permuted tokens
+        for each expert. It then passes the tokens through the local experts.
+        The output from the experts is preprocessed for the combine step.
+        """
+        dispatched_input, tokens_per_expert, permuted_probs = (
+            self._dispatch_postprocess_for_experts(hidden_states, probs)
+        )
+        expert_output, mlp_bias = self._run_experts(
+            dispatched_input, tokens_per_expert, permuted_probs
+        )
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
         return output, mlp_bias
@@ -922,15 +944,15 @@ class MoELayer(BaseMoELayer):
                 )
         return fc1_expert_dispatch_metadata, fc2_expert_dispatch_metadata
 
-    def _echo_experts_from_permuted(
+    def _run_echo_experts(
         self,
         dispatched_input: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
         fc1_expert_dispatch_metadata,
         fc2_expert_dispatch_metadata,
-    ) -> torch.Tensor:
-        """Run ECHO experts and prepare their output for a single token combine."""
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run ECHO experts on already-permuted tokens."""
         if self.config.moe_echo_expert_dispatch_overlap:
             expert_output, mlp_bias = self.experts.forward_with_dispatch_overlap(
                 dispatched_input,
@@ -951,6 +973,24 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        return expert_output, mlp_bias
+
+    def _echo_experts_from_permuted(
+        self,
+        dispatched_input: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        fc1_expert_dispatch_metadata,
+        fc2_expert_dispatch_metadata,
+    ) -> torch.Tensor:
+        """Run ECHO experts and prepare their output for a single token combine."""
+        expert_output, _ = self._run_echo_experts(
+            dispatched_input,
+            tokens_per_expert,
+            permuted_probs,
+            fc1_expert_dispatch_metadata,
+            fc2_expert_dispatch_metadata,
+        )
         return self.token_dispatcher.combine_preprocess(expert_output)
 
     def echo_routed_experts_compute(
@@ -962,7 +1002,7 @@ class MoELayer(BaseMoELayer):
     ) -> torch.Tensor:
         """Post-process ECHO tokens, run experts, and prepare one combine input."""
         permuted_tokens, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(dispatched_input, dispatched_probs)
+            self._dispatch_postprocess_for_experts(dispatched_input, dispatched_probs)
         )
         return self._echo_experts_from_permuted(
             permuted_tokens,
