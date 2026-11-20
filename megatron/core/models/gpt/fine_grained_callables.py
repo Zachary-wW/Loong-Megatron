@@ -257,7 +257,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
             node.layer_state.echo_expert_offloading_map = expert_offloading_map
 
-        if layer.a2a_overlap_mlp_recompute:
+        if layer.a2a_overlap_mlp_recompute and (
+            layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap
+        ):
             if pre_mlp_layernorm_output is None:
                 raise RuntimeError("A2A-overlap MLP recompute requires the pre-MLP norm output.")
             node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
@@ -283,8 +285,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        metadata = token_dispatcher.metadata
         if enable_deepep or enable_hybridep or enable_ncclep:
+            metadata = token_dispatcher.metadata
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to pre_dispatch_computation submodule
             metadata.token_probs = probs
@@ -310,8 +312,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         dispatched_probs = node.layer_state.dispatched_probs
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
-        metadata = layer.mlp.token_dispatcher.metadata
+        token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep or enable_ncclep:
+            metadata = token_dispatcher.metadata
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             metadata.dispatched_probs = dispatched_probs
@@ -337,23 +340,48 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             return expert_output
 
         if layer.a2a_overlap_mlp_recompute:
-            if pre_mlp_layernorm_output is None:
+            recompute_shared_experts = (
+                layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap
+            )
+            if recompute_shared_experts and pre_mlp_layernorm_output is None:
                 raise RuntimeError("A2A-overlap MLP recompute requires the pre-MLP norm output.")
+            permuted_tokens, tokens_per_expert, permuted_probs = (
+                layer.mlp._dispatch_postprocess_for_experts(dispatched_tokens, dispatched_probs)
+            )
 
-            def shared_and_routed_expert_forward(
-                routed_tokens, routed_probs, shared_expert_input
+            def checkpointed_experts(
+                routed_tokens,
+                routed_tokens_per_expert,
+                routed_probs,
+                shared_expert_input=None,
             ):
-                shared_expert_output = layer.mlp.shared_experts_compute(shared_expert_input)
-                expert_output = routed_expert_forward(routed_tokens, routed_probs)
+                shared_expert_output = (
+                    layer.mlp.shared_experts_compute(shared_expert_input)
+                    if recompute_shared_experts
+                    else None
+                )
+                if layer.config.moe_enable_echo:
+                    expert_output, _ = layer.mlp._run_echo_experts(
+                        routed_tokens,
+                        routed_tokens_per_expert,
+                        routed_probs,
+                        fc1_expert_dispatch_metadata,
+                        fc2_expert_dispatch_metadata,
+                    )
+                else:
+                    expert_output, _ = layer.mlp._run_experts(
+                        routed_tokens, routed_tokens_per_expert, routed_probs
+                    )
                 return expert_output, shared_expert_output
 
+            checkpoint_inputs = (permuted_tokens, tokens_per_expert, permuted_probs)
+            if recompute_shared_experts:
+                checkpoint_inputs += (pre_mlp_layernorm_output,)
             expert_output, shared_expert_output = checkpoint_region(
-                shared_and_routed_expert_forward,
-                dispatched_tokens,
-                dispatched_probs,
-                pre_mlp_layernorm_output,
+                checkpointed_experts, *checkpoint_inputs
             )
-            if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
+            expert_output = layer.mlp.token_dispatcher.combine_preprocess(expert_output)
+            if recompute_shared_experts:
                 node.layer_state.shared_expert_output = node.detach(shared_expert_output)
             node.layer_state.pre_mlp_layernorm_output = None
         else:
@@ -362,7 +390,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep or enable_ncclep:
-            tokens_per_expert = metadata.get_number_of_tokens_per_expert()
+            tokens_per_expert = token_dispatcher.metadata.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
         if (
