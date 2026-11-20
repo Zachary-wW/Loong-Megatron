@@ -2537,6 +2537,26 @@ def _add_network_size_args(parser):
         "use_te_rng_tracker",
         # Owned by TrainingConfig and injected into TransformerConfig after parsing.
         "micro_batch_size",
+        # ChunkPipe flags are registered in _add_training_args; runtime state is
+        # derived by validate_args and model construction.
+        "enable_chunkpipe",
+        "chunksize",
+        "chunk_num_per_seq",
+        "chunk_sizes",
+        "cu_chunks",
+        "max_chunk_size",
+        "keep_activations_chunks",
+        "chunkpipe_forward_microbatch",
+        "chunkpipe_backward_microbatch",
+        "chunkpipe_current_group_size",
+        "chunkpipe_composite_group_size",
+        "chunkpipe_component_sizes",
+        "chunkpipe_num_microbatches",
+        "chunkpipe_chunk_idx_in_group",
+        "chunk_keys",
+        "chunk_values",
+        "chunkpipe_forward",
+        "sft_chunkpipe_mode",
         # args uses same var with a different name
         "num_moe_experts",
         "hash_moe_vocab_size",
