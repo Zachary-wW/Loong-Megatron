@@ -79,6 +79,7 @@ def replace_symbol(symbol_path, target, record_origin=True, verbose=True):
             return
 
     obj = sys.modules[module_name]
+    target_name = getattr(target, '__name__', repr(target))
     try:
         for part in parts[1:-1]:
             obj = getattr(obj, part)
@@ -87,10 +88,10 @@ def replace_symbol(symbol_path, target, record_origin=True, verbose=True):
         if record_origin and origin is not None:
             setattr(obj, f'__origin_{parts[-1]}', origin)
         if verbose:
-            print(f'[INFO] Symbol {symbol_path} replaced with {target.__name__}')
+            print(f'[INFO] Symbol {symbol_path} replaced with {target_name}')
     except Exception as e:
         if verbose:
-            print(f'[WARN] Symbol {symbol_path} replaced with {target.__name__} failed: {e}')
+            print(f'[WARN] Symbol {symbol_path} replaced with {target_name} failed: {e}')
 
 
 def init_megatron_core_xpu_plugin():
@@ -152,6 +153,10 @@ def init_megatron_core_xpu_plugin():
     if os.getenv("XMLIR_USE_ROPE_FUSION") in ("true", "1", "True"):
         replace_symbol(
             "megatron.core.models.common.embeddings.rope_utils.apply_rotary_emb_flash", None
+        )
+        replace_symbol(
+            "megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_bshd",
+            mock_megatron.mock_apply_rotary_pos_emb_bshd,
         )
         replace_symbol(
             "megatron.core.models.common.embeddings.rotary_pos_embedding._apply_rotary_pos_emb_bshd",
