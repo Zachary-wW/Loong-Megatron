@@ -3596,6 +3596,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
         loss_reduced = {}
         for key in losses_reduced[0].keys():
+            if key == 'total_inputs':
+                # LoongForge's variable-length SFT loss emits this integer
+                # accounting field alongside the scalar [loss, token] pair.
+                loss_reduced[key] = sum(x[key] for x in losses_reduced)
+                continue
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
                 if args.sft and args.sft_loss_log_mode == 'microbatch':
