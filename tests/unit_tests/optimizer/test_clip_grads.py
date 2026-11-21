@@ -39,6 +39,15 @@ def test_grad_norm_preserves_backend_dependent_root(monkeypatch):
     assert isinstance(float_root, float)
     assert float_root == 5.0
 
+    monkeypatch.setattr(clip_grads, 'multi_tensor_scale_tensor_impl', object())
+    clip_grads.set_legacy_scalar_grad_norm(True)
+    try:
+        forced_float = get_grad_norm_fp32([grad], 2)
+        assert isinstance(forced_float, float)
+        assert forced_float == 5.0
+    finally:
+        clip_grads.set_legacy_scalar_grad_norm(False)
+
 
 class TestCountZerosFp32GtpPadding:
     """count_zeros_fp32 must exclude GTP alignment-padding rows: they are structural zeros
