@@ -1,8 +1,13 @@
+from argparse import ArgumentParser
+
+import pytest
 import torch
 
+import megatron.core.parallel_state as parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+from megatron.training.arguments import add_megatron_arguments
 
 
 def test_rerun_data_iterator_iter_returns_self():
@@ -37,3 +42,20 @@ def test_packed_seq_params_carries_cpu_offsets():
 
     assert params.cu_seqlens_cpu is cpu_offsets
     assert params.cu_seqlens_cpu.device.type == "cpu"
+
+
+def test_bindpcie_argument_contract():
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    assert parser.parse_args([]).bindpcie is False
+    assert parser.parse_args(["--bindpcie"]).bindpcie is True
+
+
+def test_context_parallel_src_rank_uses_first_global_rank(monkeypatch):
+    monkeypatch.setattr(parallel_state, "_CONTEXT_PARALLEL_GLOBAL_RANKS", [5, 7, 3])
+    assert parallel_state.get_context_parallel_src_rank() == 5
+
+    monkeypatch.setattr(parallel_state, "_CONTEXT_PARALLEL_GLOBAL_RANKS", None)
+    with pytest.raises(AssertionError, match="context parallel group is not initialized"):
+        parallel_state.get_context_parallel_src_rank()
