@@ -6,6 +6,7 @@ import torch
 import megatron.core.parallel_state as parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import (
     apply_fp32_param_patterns,
     convert_module_to_dtype_except_fp32_marked,
@@ -51,6 +52,16 @@ def test_fp32_param_patterns_select_parameters_and_buffers_by_name():
     assert module.router.routing_bias.keep_in_fp32 is True
     assert module.output_layer.dtype == torch.float16
     assert not getattr(module.output_layer, "keep_in_fp32", False)
+
+
+def test_fp32_param_pattern_rejects_unknown_module_names():
+    with pytest.raises(AssertionError, match="Invalid choices for use_fp32_dtype_for_param_pattern"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_fp32_dtype_for_param_pattern=["not_a_module"],
+        )
 
 
 def test_packed_seq_params_carries_cpu_offsets():
