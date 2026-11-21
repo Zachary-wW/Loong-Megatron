@@ -3,7 +3,8 @@
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.optimizer.clip_grads import count_zeros_fp32
+from megatron.core.optimizer import clip_grads
+from megatron.core.optimizer.clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -12,6 +13,31 @@ def test_grad_norm_skip_threshold_config():
     """Test that grad_norm_skip_threshold config has correct default."""
     config = OptimizerConfig()
     assert config.grad_norm_skip_threshold == float('inf')
+
+
+def test_grad_norm_preserves_backend_dependent_root(monkeypatch):
+    """TE tensor clipping and APEX/local float clipping must keep their old types."""
+    grad = torch.tensor([3.0, 4.0], device='cuda')
+
+    monkeypatch.setattr(
+        clip_grads,
+        'multi_tensor_applier',
+        lambda impl, overflow_buf, args, per_parameter: (
+            torch.tensor(5.0, device='cuda'),
+            None,
+        ),
+    )
+    monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(clip_grads, 'multi_tensor_scale_tensor_impl', object())
+    tensor_root = get_grad_norm_fp32([grad], 2)
+    assert torch.is_tensor(tensor_root)
+    assert torch.isclose(tensor_root, torch.tensor(5.0, device='cuda'))
+
+    monkeypatch.setattr(clip_grads, 'multi_tensor_scale_tensor_impl', None)
+    float_root = get_grad_norm_fp32([grad], 2)
+    assert isinstance(float_root, float)
+    assert float_root == 5.0
 
 
 class TestCountZerosFp32GtpPadding:
