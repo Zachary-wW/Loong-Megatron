@@ -6,7 +6,10 @@ import torch
 import megatron.core.parallel_state as parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+from megatron.core.transformer.module import (
+    apply_fp32_param_patterns,
+    convert_module_to_dtype_except_fp32_marked,
+)
 from megatron.training.arguments import add_megatron_arguments
 
 
@@ -30,6 +33,24 @@ def test_legacy_keep_in_float32_marker_survives_dtype_conversion():
 
     assert converted.matrix.dtype == torch.float16
     assert converted.legacy_marker.dtype == torch.float32
+
+
+def test_fp32_param_patterns_select_parameters_and_buffers_by_name():
+    module = torch.nn.Module()
+    module.experts = torch.nn.Module()
+    module.experts.expert_bias = torch.nn.Parameter(torch.ones(2, dtype=torch.float16))
+    module.router = torch.nn.Module()
+    module.router.register_buffer("routing_bias", torch.ones(2, dtype=torch.float16))
+    module.output_layer = torch.nn.Parameter(torch.ones(2, dtype=torch.float16))
+
+    apply_fp32_param_patterns(module, ["expert_bias", "router"])
+
+    assert module.experts.expert_bias.dtype == torch.float32
+    assert module.experts.expert_bias.keep_in_fp32 is True
+    assert module.router.routing_bias.dtype == torch.float32
+    assert module.router.routing_bias.keep_in_fp32 is True
+    assert module.output_layer.dtype == torch.float16
+    assert not getattr(module.output_layer, "keep_in_fp32", False)
 
 
 def test_packed_seq_params_carries_cpu_offsets():
