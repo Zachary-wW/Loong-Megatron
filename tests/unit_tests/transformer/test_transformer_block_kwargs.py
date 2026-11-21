@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import megatron.core.transformer.transformer_block as transformer_block_module
@@ -91,3 +92,21 @@ def test_transformer_block_forwards_extra_kwargs_to_checkpointed_forward(monkeyp
 
     assert output.shape == (2, 1, 4)
     assert captured["custom_metadata"] == {"source": "checkpoint"}
+
+
+def test_transformer_block_rejects_duplicate_mhc_manager_kwarg(monkeypatch):
+    block, _ = _make_block(monkeypatch)
+    block.mhc_recompute_enabled = True
+    block.config.mhc_recompute_layer_num = 1
+    monkeypatch.setattr(
+        transformer_block_module,
+        "build_mhc_recompute_layer_plan",
+        lambda **_: ([SimpleNamespace(is_last_layer_in_recompute_block=False)], [True]),
+    )
+
+    with pytest.raises(TypeError, match="multiple values"):
+        block.forward(
+            hidden_states=torch.ones(2, 1, 4),
+            attention_mask=None,
+            mhc_recompute_manager="caller-owned",
+        )
