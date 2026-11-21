@@ -1250,6 +1250,33 @@ class TestDSACPPositionHelpers:
         torch.testing.assert_close(ends, torch.arange(1, sq + 1, dtype=torch.int64))
         assert key_positions is None
 
+    def test_build_mask_chunk_query_positions_use_bottom_right_bounds(self):
+        """Chunk queries keep absolute causal bounds across the concatenated KV history."""
+        chunk_query_positions = torch.tensor([3, 4, 5], dtype=torch.int64)
+
+        float_mask, varlen_params, is_plain_causal = build_dsattention_forward_mask(
+            sq=3,
+            skv=6,
+            b=1,
+            device=torch.device("cpu"),
+            cp_size=1,
+            cp_rank=0,
+            cp_comm_type="p2p",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            chunk_query_positions=chunk_query_positions,
+        )
+
+        assert float_mask is None
+        assert is_plain_causal is False
+        starts, ends, key_positions = varlen_params
+        torch.testing.assert_close(starts, torch.zeros(3, dtype=torch.int64))
+        torch.testing.assert_close(ends, torch.tensor([4, 5, 6], dtype=torch.int64))
+        assert key_positions is None
+
     def test_build_mask_additive_mask_is_not_flagged_plain_causal(self):
         """The explicit additive-mask branch never sets the plain-causal flag."""
         sq, skv, b = 3, 3, 1
