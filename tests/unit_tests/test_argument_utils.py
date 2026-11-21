@@ -316,6 +316,52 @@ def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
         validate_args(args)
 
 
+@pytest.mark.parametrize(
+    ("max_connections", "expect_sequence_warning", "expect_async_warning"),
+    [
+        ("1", False, False),
+        ("32", True, True),
+        (None, True, True),
+    ],
+)
+def test_tp_cp_connection_count_uses_capability_warnings(
+    monkeypatch, max_connections, expect_sequence_warning, expect_async_warning
+):
+    """TP/CP connection-count guidance must warn instead of hard-asserting."""
+    from megatron.training import arguments as arguments_module
+
+    args = _minimal_training_args(monkeypatch)
+    args.world_size = 2
+    args.tensor_model_parallel_size = 2
+    args.context_parallel_size = 1
+    args.sequence_parallel = True
+    args.async_tensor_model_parallel_allreduce = True
+    args.use_torch_fsdp2 = False
+    args.use_megatron_fsdp = False
+    args.overlap_moe_expert_parallel_comm = False
+
+    if max_connections is None:
+        monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", max_connections)
+    monkeypatch.setattr(arguments_module, "get_device_arch_version", lambda: 9)
+    warnings = []
+    monkeypatch.setattr(
+        arguments_module,
+        "warn_rank_0",
+        lambda message, rank: warnings.append(message),
+    )
+
+    validate_args(args)
+
+    assert any("sequence parallelism requires" in message for message in warnings) is (
+        expect_sequence_warning
+    )
+    assert any("async gradient all reduce requires" in message for message in warnings) is (
+        expect_async_warning
+    )
+
+
 @dataclass
 class ConfigWithOptional:
     """Config with optional fields."""

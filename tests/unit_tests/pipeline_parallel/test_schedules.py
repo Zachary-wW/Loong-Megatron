@@ -377,6 +377,7 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
         grad_scale_func=lambda tensor: tensor * 3.0,
         num_moe_experts=None,
         mtp_num_layers=None,
+        enable_chunkpipe=False,
         timers=None,
     )
     forward_data_store = []
@@ -415,6 +416,7 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
         grad_scale_func=lambda tensor: tensor * 5.0,
         num_moe_experts=None,
         mtp_num_layers=None,
+        enable_chunkpipe=False,
         timers=None,
     )
 
@@ -454,6 +456,7 @@ def test_indexer_loss_scale_defaults_from_variant_without_mutating_config(varian
         grad_scale_func=lambda tensor: tensor * 7.0,
         num_moe_experts=None,
         mtp_num_layers=None,
+        enable_chunkpipe=False,
         timers=None,
     )
 

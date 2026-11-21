@@ -125,7 +125,10 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.module import Float16Module, mark_keep_in_fp32
+from megatron.core.transformer.module import (
+    Float16Module,
+    apply_fp32_param_patterns,
+)
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
@@ -2698,14 +2701,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
         if fp32_param_patterns:
             for model_module in model:
-                for name, param in model_module.named_parameters():
-                    if any(pattern in name for pattern in fp32_param_patterns):
-                        param.data = param.data.to(dtype=torch.float32)
-                        mark_keep_in_fp32(param)
-                for name, buffer in model_module.named_buffers():
-                    if any(pattern in name for pattern in fp32_param_patterns):
-                        buffer.data = buffer.data.to(dtype=torch.float32)
-                        mark_keep_in_fp32(buffer)
+                apply_fp32_param_patterns(model_module, fp32_param_patterns)
 
         model = [Float16Module(config, model_module) for model_module in model]
 
