@@ -457,6 +457,114 @@ def mock_reduce_scatter_along_first_dim(
     return output
 
 
+@torch.no_grad()
+def mock_lce_backward(
+    dlogprobs,
+    global_hidden,
+    weight,
+    labels,
+    maximum,
+    accu,
+    num_valid_tokens,
+    reduction="mean",
+    ignore_index=-100,
+    tp_group=None,
+    tp_rank=0,
+    tp_world_size=1,
+    sequence_parallel=False,
+):
+    """XPU-compatible chunked backward for fused linear cross-entropy."""
+    from torch import distributed as dist
+
+    from megatron.core.fusions.linear_cross_entropy import utils
+    from megatron.core.fusions.linear_cross_entropy.generic.entry import _get_config
+
+    in_tp_mode = (tp_group is not None) and (tp_world_size > 1)
+    hidden_view = global_hidden.view(-1, global_hidden.shape[-1])
+    labels_view = labels.view(-1)
+    num_tokens, dim = hidden_view.shape
+    vocab_size = weight.shape[0]
+    device = global_hidden.device
+    reduction_enum = utils.str_to_reduction_enum(reduction)
+
+    valid_mask = labels_view != ignore_index
+    if reduction_enum == utils.EntropyReductionEnum.kMean:
+        scale = dlogprobs.float() / num_valid_tokens.float().clamp(min=1)
+        dlogprobs_per_token = scale.expand(num_tokens)
+    elif reduction_enum == utils.EntropyReductionEnum.kSum:
+        dlogprobs_per_token = dlogprobs.float().expand(num_tokens)
+    else:
+        dlogprobs_per_token = dlogprobs.float().view(-1)
+    dlogprobs_per_token = dlogprobs_per_token * valid_mask.float()
+    grad_scale = dlogprobs_per_token / accu.clamp(min=1e-30)
+
+    d_hidden = torch.empty_like(global_hidden)
+    d_weight = torch.empty_like(weight)
+    vocab_offset = tp_rank * vocab_size
+    vocab_per_split = _get_config().bwd_vocab_per_split
+    num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
+    _d_logits = torch.empty(
+        (num_tokens, vocab_per_split), device=device, dtype=global_hidden.dtype
+    )
+    matmul_buf = torch.empty(
+        (num_tokens, vocab_per_split), device=device, dtype=global_hidden.dtype
+    )
+    logits_buf = torch.empty(
+        (num_tokens, vocab_per_split), device=device, dtype=torch.float32
+    )
+    row_idx = torch.arange(num_tokens, device=device)
+    d_hidden_flat = d_hidden.view(-1, dim)
+
+    for split_idx in range(num_splits):
+        v_start = split_idx * vocab_per_split
+        v_end = min(v_start + vocab_per_split, vocab_size)
+        chunk_size = v_end - v_start
+        weight_chunk = weight[v_start:v_end, :]
+        matmul_chunk = matmul_buf[:, :chunk_size]
+        torch.matmul(hidden_view, weight_chunk.t(), out=matmul_chunk)
+        logits_chunk = logits_buf[:, :chunk_size]
+        logits_chunk.copy_(matmul_chunk)
+        logits_chunk.sub_(maximum.unsqueeze(1)).exp_()
+        logits_chunk.mul_(grad_scale.unsqueeze(1))
+        global_v_start = vocab_offset + v_start
+        label_in_chunk = (
+            (labels_view >= global_v_start)
+            & (labels_view < (vocab_offset + v_end))
+            & valid_mask
+        )
+        if label_in_chunk.any():
+            local_idx = (labels_view - global_v_start).clamp(0, chunk_size - 1)
+            logits_chunk[row_idx[label_in_chunk], local_idx[label_in_chunk]] -= (
+                dlogprobs_per_token[label_in_chunk]
+            )
+        _d_logits[:, :chunk_size] = logits_chunk.to(global_hidden.dtype)
+        valid_d_logits = _d_logits[:, :chunk_size]
+        if split_idx == 0:
+            d_hidden_flat.copy_(torch.mm(valid_d_logits, weight_chunk))
+        else:
+            d_hidden_flat.add_(torch.mm(valid_d_logits, weight_chunk))
+        torch.matmul(
+            valid_d_logits.t(),
+            hidden_view,
+            out=d_weight[v_start:v_end, :],
+        )
+
+    if in_tp_mode:
+        dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
+        if sequence_parallel:
+            partial_hidden_shape = (
+                global_hidden.shape[0] // tp_world_size,
+                *global_hidden.shape[1:],
+            )
+            partial_num_tokens = num_tokens // tp_world_size
+            d_hidden = d_hidden.view(-1, d_hidden.shape[-1])[
+                tp_rank * partial_num_tokens : (tp_rank + 1) * partial_num_tokens, :
+            ]
+            d_hidden = d_hidden.view(partial_hidden_shape).clone()
+
+    return d_hidden, d_weight
+
+
 def mock_thd_get_partitioned_indices(cu_seqlens, total_tokens, world_size, rank):
     """
     mock_thd_get_partitioned_indices

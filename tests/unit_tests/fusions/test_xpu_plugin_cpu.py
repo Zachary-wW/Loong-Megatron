@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.models.common.embeddings import rope_utils
 
@@ -96,6 +97,32 @@ def test_kernel_availability_matches_legacy_contract(mock_megatron):
 
 
 def test_removed_non_migration_symbols_are_not_restored(mock_megatron):
-    assert not hasattr(mock_megatron, "mock_lce_backward")
     assert not hasattr(mock_megatron, "mock_bias_swiglu_impl")
     assert not hasattr(mock_megatron, "mock_unpermute")
+
+
+def test_lce_backward_matches_torch_cross_entropy(mock_megatron):
+    torch.manual_seed(0)
+    hidden = torch.randn(4, 8, requires_grad=True)
+    weight = torch.randn(16, 8, requires_grad=True)
+    labels = torch.tensor([0, 3, 5, -100])
+    logits = hidden @ weight.t()
+    maximum = logits.max(dim=1).values
+    accumulate = (logits - maximum[:, None]).exp().sum(dim=1)
+    num_valid = (labels != -100).sum()
+
+    actual_hidden, actual_weight = mock_megatron.mock_lce_backward(
+        torch.tensor(1.0),
+        hidden,
+        weight,
+        labels,
+        maximum,
+        accumulate,
+        num_valid,
+        reduction="mean",
+    )
+    reference = F.cross_entropy(logits, labels, reduction="mean")
+    reference_hidden, reference_weight = torch.autograd.grad(reference, (hidden, weight))
+
+    torch.testing.assert_close(actual_hidden, reference_hidden, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual_weight, reference_weight, atol=1e-5, rtol=1e-5)
