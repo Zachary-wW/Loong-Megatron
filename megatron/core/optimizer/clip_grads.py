@@ -136,10 +136,10 @@ def get_grad_norm_fp32(
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-        if multi_tensor_scale_tensor_impl is not None:
-            total_norm = total_norm.pow(1.0 / norm_type)
-        else:
-            total_norm = total_norm.item() ** (1.0 / norm_type)
+        # Keep the legacy Python-float clipping path.  The tensor variant
+        # changes the rounding of the clip coefficient on TE 2.x and breaks
+        # numerical parity with the pre-0.20 stack after several SFT updates.
+        total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
 
