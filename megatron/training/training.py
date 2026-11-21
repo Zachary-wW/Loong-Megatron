@@ -5684,6 +5684,14 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
+def _evaluation_num_microbatches(args, scheduled_eval_num_microbatches):
+    """Return the number of forward/backward calls used by one evaluation step."""
+    evaluation_num_microbatches = scheduled_eval_num_microbatches
+    if args.enable_chunkpipe and not args.sft_chunkpipe_mode:
+        evaluation_num_microbatches *= args.chunk_num_per_seq
+    return evaluation_num_microbatches
+
+
 @_otel_trace_fn('evaluate', 'megatron.evaluate')
 def evaluate(
     forward_step_func,
@@ -5792,12 +5800,12 @@ def evaluate(
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
 
-            evaluation_num_microbatches = scheduled_eval_num_microbatches
+            evaluation_num_microbatches = _evaluation_num_microbatches(
+                args, scheduled_eval_num_microbatches
+            )
             evaluation_seq_length = args.seq_length
             if args.enable_chunkpipe:
                 evaluation_seq_length = args.max_chunk_size or args.chunksize
-                if not args.sft_chunkpipe_mode:
-                    evaluation_num_microbatches *= args.chunk_num_per_seq
 
             ft_integration.on_eval_step_start()
 
