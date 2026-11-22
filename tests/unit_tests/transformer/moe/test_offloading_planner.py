@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from megatron.core.transformer.moe.offloading_planner import (
@@ -6,6 +7,7 @@ from megatron.core.transformer.moe.offloading_planner import (
     depth_first_allocation,
     gen_assignment,
     gen_intermediate,
+    gen_offloading_plan,
     one_shot_greedy_assignment,
 )
 
@@ -88,3 +90,46 @@ def test_auction_allocation_respects_supply_and_demand():
     assert (allocation.sum(dim=0) <= assignment.sum(dim=0)).all()
     assert (supply_remaining.sum(dim=1) <= counts.sum(dim=1)).all()
     assert supply_remaining.sum() + allocation.sum() == counts.sum()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "algorithm",
+    ["one_shot_greedy", "approx_bin_packing", "sinkhorn", "auction"],
+)
+def test_gen_offloading_plan_selects_algorithm_and_reroutes_tokens(algorithm):
+    num_tokens, num_experts = 24, 4
+    routing_map = torch.zeros(
+        num_tokens, num_experts, dtype=torch.bool, device="cuda"
+    )
+    routing_map[torch.arange(12), torch.zeros(12, dtype=torch.long, device="cuda")] = True
+    routing_map[torch.arange(12, 24), torch.ones(12, dtype=torch.long, device="cuda")] = True
+    probs = torch.zeros(num_tokens, num_experts, device="cuda")
+    probs[routing_map] = 1.0
+    counts = torch.tensor(
+        [[12, 12, 0, 0], [0, 0, 4, 4]], dtype=torch.int32, device="cuda"
+    )
+
+    # The public callable is only a torch.compile wrapper around this function.
+    # Exercise the selection logic while reroute_tokens_triton and the planner
+    # algorithms themselves use the real GPU implementation.
+    rerouted_map, rerouted_probs, home_to_spare = gen_offloading_plan.__wrapped__(
+        routing_map,
+        probs,
+        counts,
+        ep_rank=0,
+        num_ep_ranks=2,
+        num_spare_experts_per_ep_rank=1,
+        assignment_algorithm=algorithm,
+        _force_triton=False,
+    )
+
+    assert rerouted_map.shape == (num_tokens, num_experts + 2)
+    assert rerouted_probs.shape == rerouted_map.shape
+    assert home_to_spare.shape == (num_experts, 2)
+    assert rerouted_map.sum().item() == num_tokens
+    assert rerouted_map[:, num_experts:].any()
+    torch.testing.assert_close(
+        rerouted_probs.sum(dim=1),
+        torch.ones(num_tokens, device="cuda"),
+    )

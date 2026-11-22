@@ -2483,7 +2483,7 @@ class MoEElasticExpertDispatcher:
         self._materialize_dispatch_metadata(metadata)
         weight_shape = expert_weights[0].shape
         stacked = torch.stack([weight.ravel() for weight in expert_weights], dim=0)
-        permuted_expert_weights, _, _ = permute(
+        permuted_expert_weights, _, _, _, _ = permute(
             stacked,
             metadata.local_to_global_routing_map,
             num_out_tokens=metadata.num_out_experts,
