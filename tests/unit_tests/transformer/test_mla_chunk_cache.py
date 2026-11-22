@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.transformer import multi_latent_attention
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_latent_attention import MultiLatentAttention
 
 
@@ -233,3 +234,99 @@ def test_mla_cache_concatenation_preserves_single_rope_key_head():
     torch.testing.assert_close(value[:2], expected_first_kv * 100)
     torch.testing.assert_close(value[2:5], expected_second_kv * 100)
     torch.testing.assert_close(value[5:], current_value)
+
+
+def _forward_cache_owner(*, experimental_attention_variant):
+    captured = {}
+    query = torch.ones(1, 1, 1, 4)
+    key = torch.ones(1, 1, 1, 4)
+    value = torch.ones(1, 1, 1, 4)
+    packed_seq_params = SimpleNamespace(qkv_format="thd")
+
+    def get_qkv(*_args, **_kwargs):
+        return query, key, value, None, None
+
+    def adjust_key_value(*_args, **_kwargs):
+        return query, key, value, None, AttnMaskType.causal, None
+
+    def concat_cached_chunk_key_value_mla(attention_mask, current_key, current_value):
+        captured["concat_called"] = True
+        return current_key, current_value, attention_mask
+
+    def run_core_attention(
+        q,
+        k,
+        v,
+        attention_mask,
+        packed_seq_params=None,
+        attn_mask_type=None,
+        **_kwargs,
+    ):
+        captured["attn_mask_type"] = attn_mask_type
+        captured["packed_seq_params"] = packed_seq_params
+        return torch.zeros(1, 1, 1, 4)
+
+    class _Projection(torch.nn.Module):
+        def forward(self, x):
+            return x, None
+
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_chunkpipe=True,
+            sft_chunkpipe_mode=False,
+            chunkpipe_current_group_size=4,
+            chunkpipe_chunk_idx_in_group=1,
+            experimental_attention_variant=experimental_attention_variant,
+            cache_mla_latents=False,
+        ),
+        training=False,
+        cache_mla_latents=False,
+        checkpoint_core_attention=False,
+        padding_v_head_dim=False,
+        recompute_up_proj=False,
+        offload_qkv_linear=False,
+        offload_core_attention=False,
+        offload_attn_proj=False,
+        _use_fused_q_uproj=False,
+        core_attention=SimpleNamespace(requires_dsa_inputs=False),
+        linear_proj=_Projection(),
+        get_query_key_value_tensors=get_qkv,
+        _adjust_key_value_for_inference=adjust_key_value,
+        concat_cached_chunk_key_value_mla=concat_cached_chunk_key_value_mla,
+        _run_core_attention=run_core_attention,
+    )
+    return owner, packed_seq_params, captured
+
+
+def test_mla_dense_chunkpipe_selects_bottom_right_mask():
+    owner, packed_seq_params, captured = _forward_cache_owner(
+        experimental_attention_variant=None
+    )
+
+    MultiLatentAttention.forward(
+        owner,
+        hidden_states=torch.ones(1, 1, 4),
+        attention_mask=torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        packed_seq_params=packed_seq_params,
+    )
+
+    assert captured["concat_called"]
+    assert captured["attn_mask_type"] is AttnMaskType.causal_bottom_right
+    assert captured["packed_seq_params"] is None
+
+
+def test_mla_dsa_chunkpipe_keeps_causal_mask_and_packed_params():
+    owner, packed_seq_params, captured = _forward_cache_owner(
+        experimental_attention_variant="dsa"
+    )
+
+    MultiLatentAttention.forward(
+        owner,
+        hidden_states=torch.ones(1, 1, 4),
+        attention_mask=torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        packed_seq_params=packed_seq_params,
+    )
+
+    assert captured["concat_called"]
+    assert captured["attn_mask_type"] is AttnMaskType.causal
+    assert captured["packed_seq_params"] is packed_seq_params
