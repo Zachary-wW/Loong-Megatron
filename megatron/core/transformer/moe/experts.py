@@ -986,18 +986,18 @@ class TEGroupedMLP(MegatronModule):
         expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
         weight_shape = self.fc1_weight_shape if module == "fc1" else self.fc2_weight_shape
         for i, expert_index in enumerate(expert_indices):
+            weight_name = f"weight{expert_index}"
             if expert_weights[i].numel() == 0:
-                setattr(
-                    expert_layer,
-                    f"weight{expert_index}",
-                    DummyFunction.apply(expert_weights[i], weight_shape),
-                )
+                weight = DummyFunction.apply(expert_weights[i], weight_shape)
             else:
-                setattr(
-                    expert_layer,
-                    f"weight{expert_index}",
-                    expert_weights[i],
-                )
+                weight = expert_weights[i]
+            if not isinstance(weight, torch.nn.Parameter) and hasattr(expert_layer, weight_name):
+                # TE GroupedLinear registers weightN as an nn.Parameter, while
+                # ECHO temporarily injects remote/placeholder tensors. Drop the
+                # parameter registration before assigning the plain tensor; a
+                # later Parameter assignment re-registers it.
+                delattr(expert_layer, weight_name)
+            setattr(expert_layer, weight_name, weight)
 
     def _apply_activation(
         self,
@@ -1351,7 +1351,6 @@ class TEGroupedMLP(MegatronModule):
         # applies its common aligned-segment contract to the GroupedTensor backend so quantized
         # grouped execution receives supported shapes
         elif self._needs_quantization_padding() or self._use_grouped_tensor:
-            tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert

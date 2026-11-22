@@ -1236,6 +1236,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
             )
         buffer = HybridEPExpertDispatch.expert_dispatch_buffers[buffer_idx]
         non_blocking = num_dispatched_weights is not None
+        ctx.non_blocking = non_blocking
         if fp8_dispatch:
             assert scale_tensor.dtype == torch.float32
             assert weight_tensor.shape[1] // scale_tensor.shape[1] == 128
@@ -1275,6 +1276,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 handle=handle,
                 pad_multiple=None,
                 num_permuted_tokens=num_dispatched_weights * num_chunks_per_weight,
+                non_blocking=non_blocking,
             )
 
 
@@ -1379,6 +1381,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                     probs=None,
                     handle=ctx.handle,
                     pad_multiple=None,
+                    non_blocking=ctx.non_blocking,
                 )
                 # Record event: THIS buffer's combine is done on moe_a2a_stream.
                 global _expert_dispatch_buf_events
@@ -1396,6 +1399,7 @@ class HybridEPExpertDispatch(torch.autograd.Function):
                 probs=None,
                 handle=ctx.handle,
                 pad_multiple=None,
+                non_blocking=ctx.non_blocking,
             )
             # Record event even on non-stream path
             if _expert_dispatch_buf_events[buffer_idx] is None:
