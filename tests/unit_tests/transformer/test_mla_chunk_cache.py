@@ -387,3 +387,106 @@ def test_mla_dsa_chunkpipe_keeps_causal_mask_and_packed_params():
     assert captured["concat_called"]
     assert captured["attn_mask_type"] is AttnMaskType.causal
     assert captured["packed_seq_params"] is packed_seq_params
+
+
+def test_mla_core_attention_promotes_packed_3d_to_sbhd_without_packed_metadata():
+    captured = {}
+
+    class _CoreAttention:
+        requires_dsa_inputs = False
+
+        def __call__(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            packed_seq_params=None,
+            attn_mask_type=None,
+            **_kwargs,
+        ):
+            captured["query_shape"] = query.shape
+            captured["key_shape"] = key.shape
+            captured["value_shape"] = value.shape
+            captured["packed_seq_params"] = packed_seq_params
+            return torch.zeros(2, 1, 1, 4)
+
+    attention = SimpleNamespace(
+        config=SimpleNamespace(
+            experimental_attention_variant=None,
+            padding_v_to_qk_dim=False,
+        ),
+        core_attention=_CoreAttention(),
+        attn_mask_type=AttnMaskType.causal,
+    )
+    query = torch.ones(2, 1, 4)
+    key = torch.ones(2, 1, 4)
+    value = torch.ones(2, 1, 4)
+
+    output = MultiLatentAttention._run_core_attention(
+        attention,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        packed_seq_params=None,
+        attn_mask_type=AttnMaskType.causal_bottom_right,
+    )
+
+    assert captured["query_shape"] == (2, 1, 1, 4)
+    assert captured["key_shape"] == (2, 1, 1, 4)
+    assert captured["value_shape"] == (2, 1, 1, 4)
+    assert captured["packed_seq_params"] is None
+    assert output.shape == (2, 1, 4)
+
+
+def test_mla_core_attention_keeps_3d_thd_inputs():
+    captured = {}
+
+    class _CoreAttention:
+        requires_dsa_inputs = False
+
+        def __call__(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            packed_seq_params=None,
+            attn_mask_type=None,
+            **_kwargs,
+        ):
+            captured["query_shape"] = query.shape
+            captured["key_shape"] = key.shape
+            captured["value_shape"] = value.shape
+            captured["packed_seq_params"] = packed_seq_params
+            return torch.zeros(2, 1, 4)
+
+    attention = SimpleNamespace(
+        config=SimpleNamespace(
+            experimental_attention_variant=None,
+            padding_v_to_qk_dim=False,
+        ),
+        core_attention=_CoreAttention(),
+        attn_mask_type=AttnMaskType.causal,
+    )
+    packed_seq_params = SimpleNamespace(qkv_format="thd")
+    query = torch.ones(2, 1, 4)
+    key = torch.ones(2, 1, 4)
+    value = torch.ones(2, 1, 4)
+
+    output = MultiLatentAttention._run_core_attention(
+        attention,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        packed_seq_params=packed_seq_params,
+        attn_mask_type=AttnMaskType.causal,
+    )
+
+    assert captured["query_shape"] == (2, 1, 4)
+    assert captured["key_shape"] == (2, 1, 4)
+    assert captured["value_shape"] == (2, 1, 4)
+    assert captured["packed_seq_params"] is packed_seq_params
+    assert output.shape == (2, 1, 4)
