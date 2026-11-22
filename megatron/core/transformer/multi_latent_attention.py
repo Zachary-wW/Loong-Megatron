@@ -149,6 +149,21 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
     return value, need_v_pad, orig_v_dim, padded_v_dim
 
 
+def _align_chunkpipe_cache_grad(grad, cached_grad):
+    """Align an SFT cache gradient with the current packed activation gradient."""
+    if grad.shape == cached_grad.shape:
+        return cached_grad
+    if grad.ndim == 4 and cached_grad.ndim == 3 and grad.size(1) == 1:
+        return cached_grad.unsqueeze(1)
+    if grad.ndim == 3 and cached_grad.ndim == 2 and grad.size(1) == 1:
+        return cached_grad.unsqueeze(1)
+    if grad.ndim == 3 and cached_grad.ndim == 4 and cached_grad.size(1) == 1:
+        return cached_grad.squeeze(1)
+    if grad.ndim == 2 and cached_grad.ndim == 3 and cached_grad.size(1) == 1:
+        return cached_grad.squeeze(1)
+    return cached_grad
+
+
 def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim):
     """Trim MLA core attention output back to the original per-head V dimension."""
     if need_v_pad:
@@ -408,6 +423,14 @@ class MultiLatentAttention(Attention):
         # current chunk's actual length.
         tp_size = get_pg_size(self.pg_collection.tp)
         slot_size = self.config.max_chunk_size or self.config.chunksize
+        if self.config.sft_chunkpipe_mode:
+            # SFT ChunkPipe uses packed 3-D/4-D tensors with a dummy batch
+            # dimension of one, while the cache is stored without that batch
+            # dimension.
+            if normed_kv_compressed.ndim == 3 and normed_kv_compressed.size(1) == 1:
+                normed_kv_compressed = normed_kv_compressed.squeeze(1)
+            if k_pos_emb.ndim == 4 and k_pos_emb.size(1) == 1:
+                k_pos_emb = k_pos_emb.squeeze(1)
         kv_len = normed_kv_compressed.shape[0]
         pos_len = k_pos_emb.shape[0]
         kv_cache_indices = torch.arange(kv_len) + (chunk_id * slot_size // tp_size)
@@ -520,6 +543,11 @@ class MultiLatentAttention(Attention):
         chunk_sizes = self.config.chunk_sizes
         slot_size = self.config.max_chunk_size or self.config.chunksize
         total_concatenated_tokens = cu_chunks[current_chunk_idx + 1]
+        if self.config.sft_chunkpipe_mode:
+            if curr_key.ndim == 4 and curr_key.size(1) == 1:
+                curr_key = curr_key.squeeze(1)
+            if curr_value.ndim == 4 and curr_value.size(1) == 1:
+                curr_value = curr_value.squeeze(1)
 
         # Detect packed sequence mode (SFT chunkpipe uses packed sequences,
         # where batch dim is squeezed: key/value are 3D [t, n, d] instead of 4D [s, b, n, d])
@@ -822,10 +850,17 @@ class MultiLatentAttention(Attention):
                         and self.config.sft_chunkpipe_mode
                         and self.config.chunkpipe_current_group_size > 1
                     ):
+                        def _ensure_sbhd(tensor):
+                            return (
+                                tensor.unsqueeze(1)
+                                if tensor is not None and tensor.ndim == 3
+                                else tensor
+                            )
+
                         core_attn_out = self._run_core_attention(
-                            query.unsqueeze(1),
-                            key.unsqueeze(1),
-                            value.unsqueeze(1),
+                            _ensure_sbhd(query),
+                            _ensure_sbhd(key),
+                            _ensure_sbhd(value),
                             attention_mask,
                             packed_seq_params=None,
                             attn_mask_type=AttnMaskType.causal_bottom_right,
@@ -1530,7 +1565,8 @@ class MLASelfAttention(MultiLatentAttention):
                             f"unavailable; layer={self.layer_number}, "
                             f"bwd_mb={self.config.chunkpipe_backward_microbatch}"
                         )
-                    return grad + self.kv_compressed_cache_grad.pop(chunk_idx)
+                    cached_grad = self.kv_compressed_cache_grad.pop(chunk_idx)
+                    return grad + _align_chunkpipe_cache_grad(grad, cached_grad)
 
                 def key_pos_emb_hook_fn(grad):
                     chunk_idx, is_last = _chunk_boundary()
@@ -1542,7 +1578,8 @@ class MLASelfAttention(MultiLatentAttention):
                             f"unavailable; layer={self.layer_number}, "
                             f"bwd_mb={self.config.chunkpipe_backward_microbatch}"
                         )
-                    return grad + self.key_pos_emb_cache_grad.pop(chunk_idx)
+                    cached_grad = self.key_pos_emb_cache_grad.pop(chunk_idx)
+                    return grad + _align_chunkpipe_cache_grad(grad, cached_grad)
 
                 if self.is_enable_grad_chunkpipe():
                     kv_compressed.register_hook(kv_compressed_hook_fn)
