@@ -110,3 +110,25 @@ def test_transformer_block_rejects_duplicate_mhc_manager_kwarg(monkeypatch):
             attention_mask=None,
             mhc_recompute_manager="caller-owned",
         )
+
+
+def test_transformer_block_chunkpipe_recompute_retains_trailing_chunk(monkeypatch):
+    block, _ = _make_block(monkeypatch)
+    block.config.enable_chunkpipe = True
+    block.config.chunk_num_per_seq = 4
+    block.config.keep_activations_chunks = 1
+    checkpointed_microbatches = []
+
+    def fake_checkpointed_forward(_block, **kwargs):
+        checkpointed_microbatches.append(block.config.chunkpipe_forward_microbatch)
+        return kwargs["hidden_states"]
+
+    monkeypatch.setattr(
+        transformer_block_module, "checkpointed_forward", fake_checkpointed_forward
+    )
+
+    for microbatch in range(4):
+        block.config.chunkpipe_forward_microbatch = microbatch
+        block.forward(hidden_states=torch.ones(2, 1, 4), attention_mask=None)
+
+    assert checkpointed_microbatches == [0, 1, 2]
