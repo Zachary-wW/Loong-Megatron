@@ -14,6 +14,16 @@ def _configure_generic(monkeypatch):
     fused_linear_cross_entropy._get_platform.cache_clear()
 
 
+def _select_platform(monkeypatch, *, force_generic: bool, capability: tuple[int, int]):
+    monkeypatch.setenv("LCE_FORCE_GENERIC", "1" if force_generic else "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    fused_linear_cross_entropy.Platform._instance = None
+    fused_linear_cross_entropy._get_platform.cache_clear()
+    return fused_linear_cross_entropy._get_platform()
+
+
 @pytest.mark.parametrize("reduction", ["none", "sum", "mean"])
 def test_generic_lce_matches_torch_cross_entropy(monkeypatch, reduction):
     _configure_generic(monkeypatch)
@@ -73,5 +83,25 @@ def test_generic_lce_bf16_matches_float_reference(monkeypatch):
 def test_generic_lce_platform_selection(monkeypatch):
     _configure_generic(monkeypatch)
     platform = fused_linear_cross_entropy._get_platform()
+    assert platform.forward_func is generic_entry.forward
+    assert platform.backward_func is generic_entry.backward
+
+
+def test_platform_selects_blackwell_for_sm100(monkeypatch):
+    from megatron.core.fusions.linear_cross_entropy.blackwell import entry as blackwell_entry
+
+    platform = _select_platform(monkeypatch, force_generic=False, capability=(10, 0))
+    assert platform.forward_func is blackwell_entry.forward
+    assert platform.backward_func is blackwell_entry.backward
+
+
+def test_platform_selects_generic_on_non_sm100(monkeypatch):
+    platform = _select_platform(monkeypatch, force_generic=False, capability=(12, 0))
+    assert platform.forward_func is generic_entry.forward
+    assert platform.backward_func is generic_entry.backward
+
+
+def test_platform_force_generic_overrides_sm100(monkeypatch):
+    platform = _select_platform(monkeypatch, force_generic=True, capability=(10, 0))
     assert platform.forward_func is generic_entry.forward
     assert platform.backward_func is generic_entry.backward
