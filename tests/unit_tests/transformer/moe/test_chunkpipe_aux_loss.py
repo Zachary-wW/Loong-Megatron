@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.router import TopKRouter
 
 
@@ -55,3 +56,29 @@ def test_chunkpipe_sft_group_state_uses_scheduler_offsets():
         }
     )
     assert TopKRouter._get_chunkpipe_group_state(router, forward=True) == (1, 3, 3)
+
+
+def test_chunkpipe_reduce_produces_global_and_token_counts(monkeypatch):
+    router = SimpleNamespace(config=SimpleNamespace(), topk=2)
+    calls = []
+
+    def fake_reduce(tensor, group):
+        calls.append((tensor.clone(), group))
+        return tensor * 2
+
+    monkeypatch.setattr(
+        router_module, "reduce_from_tensor_model_parallel_region", fake_reduce
+    )
+    local_tokens = torch.tensor([3, 0, 5], dtype=torch.float32)
+
+    global_tokens, local_num_tokens, total_num_tokens = (
+        TopKRouter._reduce_chunkpipe_tokens_per_expert(
+            router, local_tokens, ("tp-group",)
+        )
+    )
+
+    torch.testing.assert_close(global_tokens, local_tokens * 2)
+    assert local_num_tokens == 4
+    assert total_num_tokens == 8
+    assert len(calls) == 1
+    assert calls[0][1] == "tp-group"
