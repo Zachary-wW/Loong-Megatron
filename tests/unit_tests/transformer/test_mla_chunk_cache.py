@@ -76,3 +76,160 @@ def test_mla_cache_grad_consumption_fails_on_orphan():
 
     with pytest.raises(AssertionError, match="Orphan kv_compressed_cache_grad"):
         MultiLatentAttention.check_kv_cache_grad_consumed(owner)
+
+
+def _concat_cache_owner(*, sft_chunkpipe_mode):
+    batch = 1
+    kv_lora_rank = 2
+    pos_dim = 2
+    slot_size = 3
+    total_slots = 3
+    total_tokens = slot_size * total_slots
+    if sft_chunkpipe_mode:
+        kv_shape = (total_tokens, kv_lora_rank)
+        pos_shape = (total_tokens, 1, pos_dim)
+    else:
+        kv_shape = (total_tokens, batch, kv_lora_rank)
+        pos_shape = (total_tokens, batch, 1, pos_dim)
+
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_chunkpipe=True,
+            chunkpipe_forward=True,
+            sft_chunkpipe_mode=sft_chunkpipe_mode,
+            chunkpipe_forward_microbatch=2,
+            chunkpipe_backward_microbatch=0,
+            chunkpipe_chunk_idx_in_group=2,
+            chunk_sizes=[2, 3, 2],
+            cu_chunks=[0, 2, 5, 7],
+            max_chunk_size=slot_size,
+            chunksize=slot_size,
+            micro_batch_size=batch,
+            v_head_dim=kv_lora_rank,
+        ),
+        num_chunks_per_seq=3,
+        num_attention_heads_per_partition=1,
+        key_hidden_size=kv_lora_rank + pos_dim,
+        padding_v_head_dim=False,
+        pg_collection=SimpleNamespace(tp=None),
+        kv_cache_chunk_size=total_slots,
+        empty_chunk_indices=[],
+        micro_batch_to_cache_chunk_map={0: 0, 1: 1},
+        kv_compressed_cache=torch.zeros(kv_shape),
+        key_pos_emb_cache=torch.zeros(pos_shape),
+        kv_compressed_cache_grad={},
+        key_pos_emb_cache_grad={},
+        is_enable_grad_chunkpipe=lambda: False,
+        layer_number=1,
+    )
+
+    first_kv = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    second_kv = torch.tensor([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+    first_pos = torch.arange(4, dtype=torch.float32).reshape(2, 1, pos_dim)
+    second_pos = (torch.arange(6, dtype=torch.float32) + 10).reshape(3, 1, pos_dim)
+
+    if sft_chunkpipe_mode:
+        owner.kv_compressed_cache[0:2] = first_kv
+        owner.kv_compressed_cache[3:6] = second_kv
+        owner.key_pos_emb_cache[0:2] = first_pos
+        owner.key_pos_emb_cache[3:6] = second_pos
+    else:
+        owner.kv_compressed_cache[0:2, 0, :] = first_kv
+        owner.kv_compressed_cache[3:6, 0, :] = second_kv
+        owner.key_pos_emb_cache[0:2, 0] = first_pos
+        owner.key_pos_emb_cache[3:6, 0] = second_pos
+
+    recovered = []
+
+    def recover_key_value_up_proj_tensors(kv_compressed, key_pos_emb):
+        recovered.append((kv_compressed.clone(), key_pos_emb.clone()))
+        if sft_chunkpipe_mode:
+            key = torch.cat((kv_compressed.unsqueeze(1), key_pos_emb), dim=-1)
+            value = kv_compressed.unsqueeze(1) * 100
+        else:
+            key = torch.cat((kv_compressed.unsqueeze(2), key_pos_emb), dim=-1)
+            value = kv_compressed.unsqueeze(2) * 100
+        return key, value
+
+    owner.recover_key_value_up_proj_tensors = recover_key_value_up_proj_tensors
+    owner.recovered = recovered
+    owner.expected_first_kv = first_kv
+    owner.expected_second_kv = second_kv
+    owner.expected_first_pos = first_pos if sft_chunkpipe_mode else first_pos.unsqueeze(2)
+    owner.expected_second_pos = second_pos if sft_chunkpipe_mode else second_pos.unsqueeze(2)
+    return owner
+
+
+def test_mla_cache_concatenates_variable_chunks_and_builds_bottom_right_mask():
+    owner = _concat_cache_owner(sft_chunkpipe_mode=True)
+    current_kv = torch.tensor([[11.0, 12.0], [13.0, 14.0]])
+    current_pos = (torch.arange(4, dtype=torch.float32) + 20).reshape(2, 1, 2)
+    current_key = torch.cat((current_kv.unsqueeze(1), current_pos), dim=-1)
+    current_value = current_kv.unsqueeze(1)
+
+    key, value, mask = MultiLatentAttention.concat_cached_chunk_key_value_mla(
+        owner,
+        attention_mask=torch.ones(1, 1, 2, 7, dtype=torch.bool),
+        curr_key=current_key,
+        curr_value=current_value,
+    )
+
+    assert len(owner.recovered) == 2
+    torch.testing.assert_close(owner.recovered[0][0], owner.expected_first_kv)
+    torch.testing.assert_close(owner.recovered[1][0], owner.expected_second_kv)
+    torch.testing.assert_close(owner.recovered[0][1], owner.expected_first_pos)
+    torch.testing.assert_close(owner.recovered[1][1], owner.expected_second_pos)
+
+    expected_first_key = torch.cat(
+        (owner.expected_first_kv.unsqueeze(1), owner.expected_first_pos), dim=-1
+    )
+    expected_second_key = torch.cat(
+        (owner.expected_second_kv.unsqueeze(1), owner.expected_second_pos), dim=-1
+    )
+    torch.testing.assert_close(key[:2], expected_first_key)
+    torch.testing.assert_close(key[2:5], expected_second_key)
+    torch.testing.assert_close(key[5:], current_key)
+    torch.testing.assert_close(value[:2], owner.expected_first_kv.unsqueeze(1) * 100)
+    torch.testing.assert_close(value[2:5], owner.expected_second_kv.unsqueeze(1) * 100)
+    torch.testing.assert_close(value[5:], current_value)
+
+    # True means masked: the first current token may attend the five cached
+    # tokens but not the second token in its own chunk.
+    assert mask.shape == (1, 1, 2, 7)
+    assert not mask[0, 0, 0, :6].any()
+    assert mask[0, 0, 0, 6]
+    assert not mask[0, 0, 1].any()
+
+
+def test_mla_cache_concatenation_preserves_single_rope_key_head():
+    owner = _concat_cache_owner(sft_chunkpipe_mode=False)
+    current_kv = torch.tensor([[[11.0, 12.0]], [[13.0, 14.0]]])
+    current_pos = (torch.arange(4, dtype=torch.float32) + 20).reshape(2, 1, 1, 2)
+    current_key = torch.cat((current_kv.unsqueeze(2), current_pos), dim=-1)
+    current_value = current_kv.unsqueeze(2)
+
+    key, value, mask = MultiLatentAttention.concat_cached_chunk_key_value_mla(
+        owner,
+        attention_mask=None,
+        curr_key=current_key,
+        curr_value=current_value,
+    )
+
+    assert mask is None
+    assert len(owner.recovered) == 2
+    for _, recovered_pos in owner.recovered:
+        assert recovered_pos.shape[2] == 1
+    torch.testing.assert_close(owner.recovered[0][1], owner.expected_first_pos)
+    torch.testing.assert_close(owner.recovered[1][1], owner.expected_second_pos)
+    expected_first_kv = owner.expected_first_kv.unsqueeze(1).unsqueeze(2)
+    expected_second_kv = owner.expected_second_kv.unsqueeze(1).unsqueeze(2)
+    torch.testing.assert_close(key[:2], torch.cat(
+        (expected_first_kv, owner.expected_first_pos), dim=-1
+    ))
+    torch.testing.assert_close(key[2:5], torch.cat(
+        (expected_second_kv, owner.expected_second_pos), dim=-1
+    ))
+    torch.testing.assert_close(key[5:], current_key)
+    torch.testing.assert_close(value[:2], expected_first_kv * 100)
+    torch.testing.assert_close(value[2:5], expected_second_kv * 100)
+    torch.testing.assert_close(value[5:], current_value)
