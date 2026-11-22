@@ -3619,7 +3619,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 continue
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
+                is_sft = args.sft or getattr(args, 'training_phase', None) == 'sft'
+                if is_sft and args.sft_loss_log_mode == 'microbatch':
                     # Some CP shards can legitimately contain no trainable tokens.
                     # Average only the valid per-microbatch losses.
                     val = torch.vstack(val)
@@ -3644,7 +3645,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                         local_sum / local_count.clamp(min=1),
                         torch.zeros_like(local_sum),
                     )
-                elif args.sft:
+                elif is_sft:
                     # Average over the total number of tokens across the global batch.
                     val = torch.vstack(val).sum(dim=0)
                     torch.distributed.all_reduce(val, group=dp_cp_group)
