@@ -5,6 +5,10 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.extensions.transformer_engine import (
+    TEFusedMLP,
+    TEFusedMLPWithGroupedLinear,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import mlp as mlp_module
@@ -62,6 +66,34 @@ class TestParallelMLP:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
         assert output_bias.device.type == 'cuda'
+
+
+@pytest.mark.parametrize("mlp_cls", [TEFusedMLP, TEFusedMLPWithGroupedLinear])
+def test_te_fused_mlp_falls_back_for_activation_recompute(monkeypatch, mlp_cls):
+    """mlp_act must use the unfused MLP path instead of the TE op-fuser."""
+
+    sentinel = (torch.ones(2, 1, 4), None)
+    calls = []
+
+    def fake_mlp_forward(self, hidden_states, **kwargs):
+        calls.append((self, hidden_states, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(MLP, "forward", fake_mlp_forward)
+    mlp = object.__new__(mlp_cls)
+    torch.nn.Module.__init__(mlp)
+    mlp.activation_recompute = True
+    mlp._get_fused_impl = lambda: (_ for _ in ()).throw(
+        AssertionError("TE fused implementation must not be built for mlp_act")
+    )
+
+    hidden_states = torch.ones(2, 1, 4)
+    output = mlp(hidden_states, custom_metadata={"source": "mlp_act"})
+
+    assert output is sentinel
+    assert len(calls) == 1
+    assert calls[0][1] is hidden_states
+    assert calls[0][2] == {"custom_metadata": {"source": "mlp_act"}}
 
 
 class _CallRecorder:
