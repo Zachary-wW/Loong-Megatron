@@ -6,6 +6,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from megatron.training import training as training_mod
+from megatron.training.training import (
+    _get_forward_backward_seq_length,
+    _uses_chunkpipe_sft_scalar_loss,
+)
 
 
 class _Rerun:
@@ -106,6 +110,34 @@ def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
 
     overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
     nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
+
+
+def test_chunkpipe_sft_schedule_uses_chunk_sequence_length():
+    args = SimpleNamespace(
+        enable_chunkpipe=True,
+        max_chunk_size=128,
+        chunksize=64,
+        seq_length=2048,
+    )
+    assert _get_forward_backward_seq_length(args) == 128
+    args.max_chunk_size = None
+    assert _get_forward_backward_seq_length(args) == 64
+    args.enable_chunkpipe = False
+    assert _get_forward_backward_seq_length(args) == 2048
+
+
+def test_chunkpipe_sft_scalar_loss_predicate():
+    args = SimpleNamespace(
+        enable_chunkpipe=True,
+        sft_chunkpipe_mode=True,
+        calculate_per_token_loss=False,
+    )
+    assert _uses_chunkpipe_sft_scalar_loss(args) is True
+    args.calculate_per_token_loss = True
+    assert _uses_chunkpipe_sft_scalar_loss(args) is False
+    args.calculate_per_token_loss = False
+    args.enable_chunkpipe = False
+    assert _uses_chunkpipe_sft_scalar_loss(args) is False
 
 
 def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():

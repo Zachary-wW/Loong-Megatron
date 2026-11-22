@@ -3337,6 +3337,21 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
+def _get_forward_backward_seq_length(args):
+    """Return the per-microbatch sequence length used by pipeline schedules."""
+    if getattr(args, 'enable_chunkpipe', False):
+        return getattr(args, 'max_chunk_size', None) or args.chunksize
+    return args.seq_length
+
+
+def _uses_chunkpipe_sft_scalar_loss(args):
+    return (
+        getattr(args, 'enable_chunkpipe', False)
+        and getattr(args, 'sft_chunkpipe_mode', False)
+        and not getattr(args, 'calculate_per_token_loss', False)
+    )
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3452,7 +3467,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=_get_forward_backward_seq_length(args),
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
@@ -3638,8 +3653,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     torch.distributed.all_reduce(val, group=dp_cp_group)
                     loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
+                if _uses_chunkpipe_sft_scalar_loss(args):
+                    # Each rank reports D * S_g,k / (N_g * G_total). Sum the
+                    # local chunks, then the DP+CP sum and 1/world_size below
+                    # recover the step-level per-sample metric.
+                    val = torch.cat(val).sum()
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    val /= torch.distributed.get_world_size(group=dp_cp_group)
+                else:
+                    # legacy behavior, we average over the number of microbatches
+                    val = torch.cat(val).mean()
                 loss_reduced[key] = val
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
