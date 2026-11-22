@@ -69,6 +69,38 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
 
 
+_DSA_INDEX_SHARE_HOLDER_ATTR = "_dsa_index_share_topk_holder"
+
+
+def get_dsa_index_share_topk_holder(
+    packed_seq_params: Optional[PackedSeqParams],
+    index_share_carrier: Optional[object],
+    skip_topk: bool,
+    layer_number: int,
+    source_layer: int,
+) -> Optional[dict]:
+    """Return the per-forward cross-layer DSA top-k holder.
+
+    This is the legacy-LoongForge-facing helper retained as a thin adapter over
+    the same carrier contract used by ``DSAttention``. A computing layer without
+    a carrier may run without sharing; a skip layer must have one.
+    """
+    carrier = index_share_carrier if index_share_carrier is not None else packed_seq_params
+    if carrier is None:
+        if not skip_topk:
+            return None
+        raise RuntimeError(
+            "DSA index sharing has no per-forward carrier at "
+            f"layer_number={layer_number}, which reuses indices from layer "
+            f"{source_layer}. Have the transformer block pass index_share_carrier."
+        )
+    holder = getattr(carrier, _DSA_INDEX_SHARE_HOLDER_ATTR, None)
+    if holder is None:
+        holder = {}
+        setattr(carrier, _DSA_INDEX_SHARE_HOLDER_ATTR, holder)
+    return holder
+
+
 def _unfused_absorbed_dsa_fn(
     query: torch.Tensor,
     key: torch.Tensor,
