@@ -48,6 +48,35 @@ def test_mla_cache_writes_slot_offset_and_single_rope_head(monkeypatch):
     assert owner.empty_chunk_indices == [1]
 
 
+@pytest.mark.parametrize("sft_chunkpipe_mode", [False, True])
+def test_mla_cache_initializes_declared_shape(monkeypatch, sft_chunkpipe_mode):
+    monkeypatch.setattr(multi_latent_attention, "get_pg_size", lambda _: 2)
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            max_chunk_size=None,
+            chunksize=3,
+            sft_chunkpipe_mode=sft_chunkpipe_mode,
+            micro_batch_size=2,
+            kv_lora_rank=4,
+            qk_pos_emb_head_dim=6,
+        ),
+        kv_cache_chunk_size=2,
+        pg_collection=SimpleNamespace(tp=object()),
+        parameters=lambda: iter([torch.zeros(1)]),
+    )
+
+    MultiLatentAttention.init_chunk_key_value_cache_mla(owner)
+
+    if sft_chunkpipe_mode:
+        assert owner.kv_compressed_cache.shape == (3, 4)
+        assert owner.key_pos_emb_cache.shape == (6, 1, 6)
+    else:
+        assert owner.kv_compressed_cache.shape == (3, 2, 4)
+        assert owner.key_pos_emb_cache.shape == (6, 2, 1, 6)
+    assert owner.kv_compressed_cache_grad == {}
+    assert owner.key_pos_emb_cache_grad == {}
+
+
 def test_mla_cache_sft_squeezes_dummy_batch_dimension(monkeypatch):
     monkeypatch.setattr(multi_latent_attention, "get_pg_size", lambda _: 1)
     owner = _cache_owner()
@@ -291,6 +320,53 @@ def test_mla_cache_concatenation_preserves_single_rope_key_head():
     torch.testing.assert_close(value[:2], expected_first_kv * 100)
     torch.testing.assert_close(value[2:5], expected_second_kv * 100)
     torch.testing.assert_close(value[5:], current_value)
+
+
+def test_mla_cache_recover_broadcasts_single_rope_head_to_all_heads():
+    tokens = 2
+    batch = 1
+    num_heads = 3
+    qk_head_dim = 4
+    v_head_dim = 2
+    projected_width = num_heads * (qk_head_dim + v_head_dim)
+    projected = torch.arange(
+        tokens * batch * projected_width, dtype=torch.float32
+    ).reshape(tokens, batch, projected_width)
+
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
+        ),
+        num_attention_heads_per_partition=num_heads,
+        linear_kv_up_proj=lambda _kv: (projected, None),
+        padding_v_head_dim=False,
+        q_head_dim=qk_head_dim,
+    )
+    pos_emb = torch.arange(
+        tokens * batch * qk_head_dim, dtype=torch.float32
+    ).reshape(tokens, batch, 1, qk_head_dim)
+
+    key, value = MultiLatentAttention.recover_key_value_up_proj_tensors(
+        owner,
+        torch.zeros(tokens, batch, 2),
+        pos_emb,
+    )
+
+    expected = projected.reshape(
+        tokens,
+        batch,
+        num_heads,
+        qk_head_dim + v_head_dim,
+    )
+    assert key.shape == (tokens, batch, num_heads, 2 * qk_head_dim)
+    assert value.shape == (tokens, batch, num_heads, v_head_dim)
+    torch.testing.assert_close(key[..., :qk_head_dim], expected[..., :qk_head_dim])
+    torch.testing.assert_close(
+        key[..., qk_head_dim:],
+        pos_emb.expand(tokens, batch, num_heads, qk_head_dim),
+    )
+    torch.testing.assert_close(value, expected[..., qk_head_dim:])
 
 
 def _forward_cache_owner(*, experimental_attention_variant):
