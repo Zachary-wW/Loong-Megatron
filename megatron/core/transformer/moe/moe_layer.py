@@ -315,6 +315,7 @@ class MoELayer(BaseMoELayer):
         self.routed_experts_recompute = (
             config.recompute_granularity == 'selective'
             and "routed_experts" in config.recompute_modules
+            and "moe" not in config.recompute_modules
         )
 
         self.tp_group = pg_collection.tp
@@ -1380,7 +1381,6 @@ class MoELayer(BaseMoELayer):
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
             assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
             output = self.combine(output)
-            output = self.postprocess(output, shared_expert_output)
             return output, mlp_bias
 
         if self.moe_layer_recompute and self.training:
@@ -1425,6 +1425,9 @@ class MoELayer(BaseMoELayer):
                     False,
                     *checkpoint_args,
                 )
+            output, mlp_bias = outputs
+            output = self.postprocess(output, shared_expert_output)
+            outputs = (output, mlp_bias)
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 

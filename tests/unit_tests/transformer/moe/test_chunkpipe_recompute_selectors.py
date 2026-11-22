@@ -10,6 +10,8 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 def test_routed_experts_selector_replays_route_dispatch_pipeline(monkeypatch):
     events = []
+    checkpoint_depth = 0
+    postprocess_depths = []
     config = SimpleNamespace(
         moe_enable_echo=False,
         fp8=False,
@@ -51,6 +53,7 @@ def test_routed_experts_selector_replays_route_dispatch_pipeline(monkeypatch):
 
     def postprocess(hidden_states, _shared_expert_output):
         events.append("postprocess")
+        postprocess_depths.append(checkpoint_depth)
         return hidden_states
 
     layer.shared_experts_compute = shared_experts_compute
@@ -62,8 +65,13 @@ def test_routed_experts_selector_replays_route_dispatch_pipeline(monkeypatch):
     layer.postprocess = postprocess
 
     def fake_checkpoint(function, _distribute, *args):
+        nonlocal checkpoint_depth
         events.append("checkpoint")
-        return function(*args)
+        checkpoint_depth += 1
+        try:
+            return function(*args)
+        finally:
+            checkpoint_depth -= 1
 
     monkeypatch.setattr(
         moe_layer_module.tensor_parallel, "checkpoint", fake_checkpoint
@@ -83,6 +91,7 @@ def test_routed_experts_selector_replays_route_dispatch_pipeline(monkeypatch):
         "combine",
         "postprocess",
     ]
+    assert postprocess_depths == [0], "postprocess must run outside the routed-expert checkpoint"
 
 
 def test_pre_mlp_selector_uses_checkpointed_attention_path():
