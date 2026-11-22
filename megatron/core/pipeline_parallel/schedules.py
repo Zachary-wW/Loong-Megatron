@@ -4509,7 +4509,6 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     rank = p2p_communicator.pp_group.rank()
-    pp_size = p2p_communicator.pp_group.size()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -4517,9 +4516,6 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_rank=rank,
-        pp_size=pp_size,
-        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -4528,9 +4524,6 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_rank=rank,
-        pp_size=pp_size,
-        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(

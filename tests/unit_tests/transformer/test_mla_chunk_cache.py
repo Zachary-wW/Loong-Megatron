@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.transformer import multi_latent_attention
+from megatron.core.transformer.multi_latent_attention import _align_chunkpipe_cache_grad
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_latent_attention import MultiLatentAttention
 
@@ -47,6 +48,25 @@ def test_mla_cache_writes_slot_offset_and_single_rope_head(monkeypatch):
     assert owner.empty_chunk_indices == [1]
 
 
+def test_mla_cache_sft_squeezes_dummy_batch_dimension(monkeypatch):
+    monkeypatch.setattr(multi_latent_attention, "get_pg_size", lambda _: 1)
+    owner = _cache_owner()
+    owner.config.sft_chunkpipe_mode = True
+    owner.config.chunkpipe_chunk_idx_in_group = 0
+    owner.config.chunkpipe_current_group_size = 2
+    owner.kv_compressed_cache = torch.zeros(8, 2)
+    owner.key_pos_emb_cache = torch.zeros(8, 1, 2)
+    compressed = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
+    pos_emb = torch.arange(4, dtype=torch.float32).reshape(2, 1, 1, 2)
+
+    MultiLatentAttention.append_chunk_key_value_cache_mla(owner, compressed, pos_emb)
+
+    torch.testing.assert_close(owner.kv_compressed_cache[:2], compressed.squeeze(1))
+    torch.testing.assert_close(
+        owner.key_pos_emb_cache[:2], pos_emb.squeeze(1)
+    )
+
+
 def test_mla_cache_skips_last_chunk(monkeypatch):
     monkeypatch.setattr(multi_latent_attention, "get_pg_size", lambda _: 1)
     owner = _cache_owner(forward_microbatch=3)
@@ -77,6 +97,22 @@ def test_mla_cache_grad_consumption_fails_on_orphan():
 
     with pytest.raises(AssertionError, match="Orphan kv_compressed_cache_grad"):
         MultiLatentAttention.check_kv_cache_grad_consumed(owner)
+
+
+def test_chunkpipe_cache_grad_aligns_dummy_batch_dimension():
+    compressed_grad = torch.ones(2, 1, 3)
+    compressed_cache_grad = torch.ones(2, 3)
+    torch.testing.assert_close(
+        _align_chunkpipe_cache_grad(compressed_grad, compressed_cache_grad),
+        compressed_cache_grad.unsqueeze(1),
+    )
+
+    pos_grad = torch.ones(2, 1, 1, 4)
+    pos_cache_grad = torch.ones(2, 1, 4)
+    torch.testing.assert_close(
+        _align_chunkpipe_cache_grad(pos_grad, pos_cache_grad),
+        pos_cache_grad.unsqueeze(1),
+    )
 
 
 def _concat_cache_owner(*, sft_chunkpipe_mode):
@@ -200,6 +236,27 @@ def test_mla_cache_concatenates_variable_chunks_and_builds_bottom_right_mask():
     assert not mask[0, 0, 0, :6].any()
     assert mask[0, 0, 0, 6]
     assert not mask[0, 0, 1].any()
+
+
+def test_mla_cache_sft_concat_squeezes_current_batch_dimension():
+    owner = _concat_cache_owner(sft_chunkpipe_mode=True)
+    current_kv = torch.tensor([[11.0, 12.0], [13.0, 14.0]])
+    current_pos = (torch.arange(4, dtype=torch.float32) + 20).reshape(2, 1, 2)
+    current_key = torch.cat((current_kv.unsqueeze(1), current_pos), dim=-1)
+    current_value = current_kv.unsqueeze(1)
+
+    key, value, mask = MultiLatentAttention.concat_cached_chunk_key_value_mla(
+        owner,
+        attention_mask=torch.ones(1, 1, 2, 7, dtype=torch.bool),
+        curr_key=current_key.unsqueeze(1),
+        curr_value=current_value.unsqueeze(1),
+    )
+
+    assert key.shape == (7, 1, 4)
+    assert value.shape == (7, 1, 2)
+    assert mask.shape == (1, 1, 2, 7)
+    torch.testing.assert_close(key[5:], current_key)
+    torch.testing.assert_close(value[5:], current_value)
 
 
 def test_mla_cache_concatenation_preserves_single_rope_key_head():
