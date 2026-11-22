@@ -682,6 +682,24 @@ class MultiLatentAttention(Attention):
         **extra_kwargs,
     ):
         """Run MLA core attention with the THD value pad/trim workaround."""
+        packed_thd = (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        )
+        inputs_were_packed = any(
+            tensor is not None and tensor.ndim == 3
+            for tensor in (query, key, value)
+        )
+        if not packed_thd and inputs_were_packed:
+            # TE requires [s, b, h, d] for the sbhd path. SFT ChunkPipe can
+            # reach this branch for a one-chunk group, where the upstream
+            # packed tensors are already [t, h, d]. Preserve THD when packed
+            # metadata is present; otherwise add the dummy batch dimension
+            # before MLA's value padding and TE dispatch.
+            query = query.unsqueeze(1) if query is not None and query.ndim == 3 else query
+            key = key.unsqueeze(1) if key is not None and key.ndim == 3 else key
+            value = value.unsqueeze(1) if value is not None and value.ndim == 3 else value
+            packed_seq_params = None
         value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
             self, query, value, packed_seq_params
         )
@@ -714,7 +732,20 @@ class MultiLatentAttention(Attention):
             if orig_v_head_dim is not None:
                 self.core_attention.hidden_size_per_attention_head_v = orig_v_head_dim
 
-        return _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim)
+        core_attn_out = _trim_mla_core_attention_output(
+            core_attn_out, need_v_pad, orig_v_dim, padded_v_dim
+        )
+        if (
+            not packed_thd
+            and inputs_were_packed
+            and query is not None
+            and query.ndim == 4
+            and query.size(1) == 1
+            and core_attn_out.ndim == 4
+            and core_attn_out.size(1) == 1
+        ):
+            core_attn_out = core_attn_out.squeeze(1)
+        return core_attn_out
 
     def forward(
         self,
