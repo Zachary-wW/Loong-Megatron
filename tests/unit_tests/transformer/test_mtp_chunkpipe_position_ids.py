@@ -78,3 +78,49 @@ def test_non_chunkpipe_mtp_rolls_inputs_before_embedding(monkeypatch):
     torch.testing.assert_close(outputs[1], position_ids + 100)
     torch.testing.assert_close(captured["input_ids"], input_ids + 100)
     torch.testing.assert_close(captured["position_ids"], position_ids + 100)
+
+
+def test_chunkpipe_mtp_recompute_retains_trailing_chunk():
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            enable_chunkpipe=True,
+            sft_chunkpipe_mode=False,
+            chunk_num_per_seq=4,
+            keep_activations_chunks=1,
+            chunkpipe_forward_microbatch=0,
+            recompute_granularity=None,
+        ),
+        training=True,
+        mtp_layer_pattern=None,
+    )
+    checkpointed_microbatches = []
+
+    def get_precomputed_embeddings(decoder_input, hidden_states):
+        return decoder_input, hidden_states
+
+    def checkpointed_forward(**kwargs):
+        checkpointed_microbatches.append(owner.config.chunkpipe_forward_microbatch)
+        return kwargs["hidden_states"]
+
+    def project_and_transformer_layer(**kwargs):
+        return kwargs["hidden_states"]
+
+    owner._get_precomputed_embeddings = get_precomputed_embeddings
+    owner._checkpointed_forward = checkpointed_forward
+    owner._proj_and_transformer_layer = project_and_transformer_layer
+
+    for microbatch in range(4):
+        owner.config.chunkpipe_forward_microbatch = microbatch
+        hidden_states = torch.ones(2, 1, 4)
+        outputs = MultiTokenPredictionLayer.forward(
+            owner,
+            input_ids=None,
+            position_ids=None,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            decoder_input=torch.zeros(2, 1, 4),
+        )
+        torch.testing.assert_close(outputs[0], hidden_states)
+        assert outputs[1:] == (None, None, None, None)
+
+    assert checkpointed_microbatches == [0, 1, 2]
