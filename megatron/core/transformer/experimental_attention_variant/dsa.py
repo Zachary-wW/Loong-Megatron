@@ -69,6 +69,53 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
 
 
+_DSA_INDEX_SHARE_HOLDER_ATTR = "_dsa_index_share_topk_holder"
+
+
+def get_dsa_index_share_topk_holder(
+    packed_seq_params: Optional[PackedSeqParams],
+    index_share_carrier: Optional[object],
+    skip_topk: bool,
+    layer_number: int,
+    source_layer: int,
+) -> Optional[dict]:
+    """Return the per-forward cross-layer DSA top-k holder.
+
+    This is the legacy-LoongForge-facing helper retained as a thin adapter over
+    the same carrier contract used by ``DSAttention``. A computing layer without
+    a carrier may run without sharing; a skip layer must have one.
+    """
+    carrier = index_share_carrier if index_share_carrier is not None else packed_seq_params
+    if carrier is None:
+        if not skip_topk:
+            return None
+        raise RuntimeError(
+            "DSA index sharing has no per-forward carrier at "
+            f"layer_number={layer_number}, which reuses indices from layer "
+            f"{source_layer}. Have the transformer block pass index_share_carrier."
+        )
+    holder = getattr(carrier, _DSA_INDEX_SHARE_HOLDER_ATTR, None)
+    if holder is None:
+        holder = {}
+        setattr(carrier, _DSA_INDEX_SHARE_HOLDER_ATTR, holder)
+    return holder
+
+
+class DSAIndexShareCarrier:
+    """Per-forward holder for cross-layer DSA top-k indices (IndexShare).
+
+    A fresh instance must be created on every block forward so that in-flight
+    microbatches under virtual pipelining never observe each other's indices.
+    Activation recompute re-runs the layer closure that captured this instance,
+    so a consuming layer reads back the indices produced by its own microbatch.
+    """
+
+    __slots__ = (_DSA_INDEX_SHARE_HOLDER_ATTR,)
+
+    def __init__(self):
+        self._dsa_index_share_topk_holder = None
+
+
 def _unfused_absorbed_dsa_fn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2053,23 +2100,26 @@ class DSAttention(MegatronModule):
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
         self.layer_number = layer_number
+        if is_mtp_layer:
+            self.layer_number = self.layer_number + self.config.num_layers
         self.index_topk = self.config.dsa_indexer_topk
         self.index_topk_freq = self.config.dsa_indexer_topk_freq or 1
         self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset or 0
         self.index_share = self.index_topk_freq > 1
-        self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
-            layer_number, self.index_skip_topk_offset, self.index_topk_freq
+        self.skip_topk = self.index_share and not is_mtp_layer and is_dsa_skip_topk_layer(
+            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
         self.source_layer = (
             source_dsa_compute_layer(
-                layer_number, self.index_skip_topk_offset, self.index_topk_freq
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
             )
-            if self.index_share
-            else layer_number
+            if self.skip_topk
+            else self.layer_number
         )
 
         if pg_collection is None:

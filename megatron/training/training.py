@@ -3342,6 +3342,21 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
+def _get_forward_backward_seq_length(args):
+    """Return the per-microbatch sequence length used by pipeline schedules."""
+    if getattr(args, 'enable_chunkpipe', False):
+        return getattr(args, 'max_chunk_size', None) or args.chunksize
+    return args.seq_length
+
+
+def _uses_chunkpipe_sft_scalar_loss(args):
+    return (
+        getattr(args, 'enable_chunkpipe', False)
+        and getattr(args, 'sft_chunkpipe_mode', False)
+        and not getattr(args, 'calculate_per_token_loss', False)
+    )
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3457,7 +3472,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=_get_forward_backward_seq_length(args),
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
@@ -3597,9 +3612,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
         loss_reduced = {}
         for key in losses_reduced[0].keys():
+            if key == 'total_inputs':
+                # LoongForge's variable-length SFT loss emits this integer
+                # accounting field alongside the scalar [loss, token] pair.
+                loss_reduced[key] = sum(x[key] for x in losses_reduced)
+                continue
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
+                is_sft = args.sft or getattr(args, 'training_phase', None) == 'sft'
+                if is_sft and args.sft_loss_log_mode == 'microbatch':
                     # Some CP shards can legitimately contain no trainable tokens.
                     # Average only the valid per-microbatch losses.
                     val = torch.vstack(val)
@@ -3624,7 +3645,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                         local_sum / local_count.clamp(min=1),
                         torch.zeros_like(local_sum),
                     )
-                elif args.sft:
+                elif is_sft:
                     # Average over the total number of tokens across the global batch.
                     val = torch.vstack(val).sum(dim=0)
                     torch.distributed.all_reduce(val, group=dp_cp_group)
@@ -3638,8 +3659,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     torch.distributed.all_reduce(val, group=dp_cp_group)
                     loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
+                if _uses_chunkpipe_sft_scalar_loss(args):
+                    # Each rank reports D * S_g,k / (N_g * G_total). Sum the
+                    # local chunks, then the DP+CP sum and 1/world_size below
+                    # recover the step-level per-sample metric.
+                    val = torch.cat(val).sum()
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    val /= torch.distributed.get_world_size(group=dp_cp_group)
+                else:
+                    # legacy behavior, we average over the number of microbatches
+                    val = torch.cat(val).mean()
                 loss_reduced[key] = val
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
@@ -5679,6 +5708,14 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
+def _evaluation_num_microbatches(args, scheduled_eval_num_microbatches):
+    """Return the number of forward/backward calls used by one evaluation step."""
+    evaluation_num_microbatches = scheduled_eval_num_microbatches
+    if args.enable_chunkpipe and not args.sft_chunkpipe_mode:
+        evaluation_num_microbatches *= args.chunk_num_per_seq
+    return evaluation_num_microbatches
+
+
 @_otel_trace_fn('evaluate', 'megatron.evaluate')
 def evaluate(
     forward_step_func,
@@ -5787,12 +5824,12 @@ def evaluate(
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
 
-            evaluation_num_microbatches = scheduled_eval_num_microbatches
+            evaluation_num_microbatches = _evaluation_num_microbatches(
+                args, scheduled_eval_num_microbatches
+            )
             evaluation_seq_length = args.seq_length
             if args.enable_chunkpipe:
                 evaluation_seq_length = args.max_chunk_size or args.chunksize
-                if not args.sft_chunkpipe_mode:
-                    evaluation_num_microbatches *= args.chunk_num_per_seq
 
             ft_integration.on_eval_step_start()
 

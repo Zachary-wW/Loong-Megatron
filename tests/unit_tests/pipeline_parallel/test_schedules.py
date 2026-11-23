@@ -756,6 +756,140 @@ def test_schedule_enables_grad_sync_on_first_stage(
     assert events == ["enter_no_sync", "exit_no_sync", "backward"]
 
 
+def test_sft_chunkpipe_backward_syncs_only_final_chunk(monkeypatch):
+    events = []
+    depth = 0
+
+    @contextmanager
+    def no_sync():
+        nonlocal depth
+        depth += 1
+        events.append(("enter", depth))
+        try:
+            yield
+        finally:
+            events.append(("exit", depth))
+            depth -= 1
+
+    config = SimpleNamespace(
+        timers=None,
+        no_sync_func=no_sync,
+        sft_chunkpipe_mode=True,
+        chunkpipe_component_sizes=[2, 1],
+        chunkpipe_composite_group_size=3,
+        chunkpipe_current_group_size=2,
+        mtp_num_layers=0,
+        num_moe_experts=None,
+        finalize_model_grads_func=None,
+        fine_grained_activation_offloading=False,
+        calculate_per_token_loss=False,
+        barrier_with_L1_time=False,
+        cuda_graph_impl="none",
+        chunkpipe_forward=False,
+    )
+    model = SimpleNamespace(config=config)
+    monkeypatch.setattr(schedule, "get_model_config", lambda _: config)
+    monkeypatch.setattr(schedule.parallel_state, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(schedule, "remove_key_value_cache", lambda *_: None)
+    monkeypatch.setattr(schedule, "clear_key_value_cache", lambda *_: None)
+    real_zeros = torch.zeros
+    monkeypatch.setattr(
+        schedule.torch,
+        "zeros",
+        lambda *args, **kwargs: real_zeros(
+            *args, **{key: value for key, value in kwargs.items() if key != "device"}
+        ),
+    )
+    monkeypatch.setattr(
+        schedule,
+        "forward_step",
+        lambda *_args, **_kwargs: (torch.tensor(1.0), torch.tensor(0)),
+    )
+    monkeypatch.setattr(
+        schedule,
+        "backward_step",
+        lambda *_args, **_kwargs: events.append(("backward", depth)),
+    )
+
+    schedule.forward_backward_no_pipelining_with_chunkpipe(
+        forward_step_func=None,
+        data_iterator=None,
+        model=model,
+        num_microbatches=3,
+        seq_length=1,
+        micro_batch_size=1,
+        pg_collection=SimpleNamespace(),
+    )
+
+    assert [level for kind, level in events if kind == "backward"] == [1, 1, 0]
+
+
+def test_sft_chunkpipe_multi_composite_syncs_only_global_final_chunk(monkeypatch):
+    events = []
+    depth = 0
+
+    @contextmanager
+    def no_sync():
+        nonlocal depth
+        depth += 1
+        try:
+            yield
+        finally:
+            depth -= 1
+
+    config = SimpleNamespace(
+        timers=None,
+        no_sync_func=no_sync,
+        sft_chunkpipe_mode=True,
+        chunkpipe_component_sizes=[3, 2],
+        chunkpipe_composite_group_size=5,
+        chunkpipe_current_group_size=3,
+        mtp_num_layers=0,
+        num_moe_experts=None,
+        finalize_model_grads_func=None,
+        fine_grained_activation_offloading=False,
+        calculate_per_token_loss=False,
+        barrier_with_L1_time=False,
+        cuda_graph_impl="none",
+        chunkpipe_forward=False,
+    )
+    model = SimpleNamespace(config=config)
+    monkeypatch.setattr(schedule, "get_model_config", lambda _: config)
+    monkeypatch.setattr(schedule.parallel_state, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(schedule, "remove_key_value_cache", lambda *_: None)
+    monkeypatch.setattr(schedule, "clear_key_value_cache", lambda *_: None)
+    real_zeros = torch.zeros
+    monkeypatch.setattr(
+        schedule.torch,
+        "zeros",
+        lambda *args, **kwargs: real_zeros(
+            *args, **{key: value for key, value in kwargs.items() if key != "device"}
+        ),
+    )
+    monkeypatch.setattr(
+        schedule,
+        "forward_step",
+        lambda *_args, **_kwargs: (torch.tensor(1.0), torch.tensor(0)),
+    )
+    monkeypatch.setattr(
+        schedule,
+        "backward_step",
+        lambda *_args, **_kwargs: events.append(depth),
+    )
+
+    schedule.forward_backward_no_pipelining_with_chunkpipe(
+        forward_step_func=None,
+        data_iterator=None,
+        model=model,
+        num_microbatches=10,
+        seq_length=1,
+        micro_batch_size=1,
+        pg_collection=SimpleNamespace(),
+    )
+
+    assert events == [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
+
+
 def test_forward_backward_func_with_pipeline_parallel(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 

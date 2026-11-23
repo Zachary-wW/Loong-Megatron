@@ -20,6 +20,8 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorGroup,
     OffloadTensorPool,
     PipelineOffloadManager,
+    fine_grained_offloading_group_commit,
+    get_fine_grained_offloading_context,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -45,6 +47,34 @@ def _make_chunk_handler_for_offload_checker(min_offloaded_tensor_size: int = 1):
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     handler.min_offloaded_tensor_size = min_offloaded_tensor_size
     return handler
+
+
+def test_legacy_group_commit_preserves_tuple_contract(monkeypatch):
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+
+    calls = []
+
+    def fake_offload(tensor, name, forced_released_tensors=None):
+        calls.append((tensor, name, forced_released_tensors))
+        return tensor if isinstance(tensor, tuple) else (tensor,)
+
+    monkeypatch.setattr(
+        off_module, "fine_grained_offloading_group_offload", fake_offload
+    )
+    first = torch.tensor(1)
+    second = torch.tensor(2)
+
+    result = fine_grained_offloading_group_commit(
+        first, second, name="legacy", forced_released_tensors=[first]
+    )
+
+    assert result == (first, second)
+    assert calls == [((first, second), "legacy", [first])]
+
+
+def test_legacy_offloading_context_alias():
+    with get_fine_grained_offloading_context(False):
+        pass
 
 
 @pytest.fixture(autouse=True)

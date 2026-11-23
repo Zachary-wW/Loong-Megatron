@@ -362,6 +362,51 @@ def test_tp_cp_connection_count_uses_capability_warnings(
     )
 
 
+def test_sft_chunkpipe_derives_microbatches_and_inflates_global_batch(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.enable_chunkpipe = True
+    args.sft = True
+    args.chunksize = 4
+    args.seq_length = 16
+    args.global_batch_size = 2
+    args.micro_batch_size = 1
+    args.data_parallel_size = 1
+    args.world_size = 1
+    args.create_attention_mask_in_dataloader = False
+
+    validate_args(args)
+
+    assert args.sft_chunkpipe_mode is True
+    assert args.chunk_num_per_seq == 4
+    assert args.chunk_sizes == [4, 4, 4, 4]
+    assert args.global_batch_size == 4
+    assert args.chunkpipe_num_microbatches == 4
+
+
+@pytest.mark.parametrize(
+    ("enable_chunkpipe", "sft_chunkpipe_mode", "scheduled", "expected"),
+    [
+        (False, False, 3, 3),
+        (True, True, 3, 3),
+        (True, False, 3, 12),
+    ],
+)
+def test_chunkpipe_evaluation_microbatch_count(
+    enable_chunkpipe, sft_chunkpipe_mode, scheduled, expected
+):
+    """SFT receives chunk-level batches; pretrain expands each sequence into chunks."""
+    from megatron.training.training import _evaluation_num_microbatches
+
+    args = SimpleNamespace(
+        enable_chunkpipe=enable_chunkpipe,
+        sft_chunkpipe_mode=sft_chunkpipe_mode,
+        chunk_num_per_seq=4,
+    )
+
+    assert _evaluation_num_microbatches(args, scheduled) == expected
+
+
 @dataclass
 class ConfigWithOptional:
     """Config with optional fields."""

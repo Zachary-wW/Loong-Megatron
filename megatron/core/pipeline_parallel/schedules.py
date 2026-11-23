@@ -2024,9 +2024,11 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 if chunkpipe_forward_microbatch not in output_tensors[model_chunk_id]:
                     input_tensors[model_chunk_id][chunkpipe_forward_microbatch] = None
             else:
-                if len(input_tensors[model_chunk_id][microbatch_id]) == len(
-                        output_tensors[model_chunk_id][microbatch_id]):
-                    input_tensors[model_chunk_id][microbatch_id].append(None)
+                first_stage_inputs = input_tensors[model_chunk_id][microbatch_id]
+                if len(first_stage_inputs) <= chunk_id:
+                    first_stage_inputs.extend(
+                        [None] * (chunk_id + 1 - len(first_stage_inputs))
+                    )
 
         # For non-depth-first pipeline schedules, the first rank would buffer multiple received
         # activation tensors for a model chunk until accessed during warmup.
@@ -2048,6 +2050,11 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
         if is_sft_chunkpipe:
             # SFT: use fwd_mb as key
             output_tensors[model_chunk_id][chunkpipe_forward_microbatch] = output_tensor
+        elif forward_only:
+            output_slots = output_tensors[model_chunk_id][microbatch_id]
+            if len(output_slots) <= chunk_id:
+                output_slots.extend([None] * (chunk_id + 1 - len(output_slots)))
+            output_slots[chunk_id] = output_tensor
         else:
             output_tensors[model_chunk_id][microbatch_id].append(output_tensor)
 
@@ -2061,8 +2068,15 @@ def forward_backward_pipelining_with_interleaving_with_chunkpipe(
                 del input_tensors[model_chunk_id][chunkpipe_forward_microbatch]
                 del output_tensors[model_chunk_id][chunkpipe_forward_microbatch]
             else:
-                input_tensors[model_chunk_id][microbatch_id].pop(0)
-                output_tensors[model_chunk_id][microbatch_id].pop()
+                input_slots = input_tensors[model_chunk_id][microbatch_id]
+                output_slots = output_tensors[model_chunk_id][microbatch_id]
+                if chunk_id < len(input_slots):
+                    input_slots[chunk_id] = None
+                if chunk_id < len(output_slots):
+                    output_slots[chunk_id] = None
+                if chunk_id == num_chunks - 1:
+                    input_slots.clear()
+                    output_slots.clear()
             if is_sft_chunkpipe:
                 _info = forward_chunk_info.get((model_chunk_id, microbatch_id * num_chunks + chunk_id))
                 if _info is not None:
@@ -4509,7 +4523,6 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     rank = p2p_communicator.pp_group.rank()
-    pp_size = p2p_communicator.pp_group.size()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -4517,9 +4530,6 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_rank=rank,
-        pp_size=pp_size,
-        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -4528,9 +4538,6 @@ def forward_backward_pipelining_without_interleaving_chunkpipe(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_rank=rank,
-        pp_size=pp_size,
-        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(

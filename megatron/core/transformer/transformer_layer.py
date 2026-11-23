@@ -791,6 +791,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        index_share_carrier: Optional[Any] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -848,6 +849,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            self_attn_extra_kwargs = {}
+            if self.config.experimental_attention_variant == "dsa":
+                self_attn_extra_kwargs["index_share_carrier"] = index_share_carrier
             attention_output_with_bias = self.self_attention(
                 input_layernorm_output,
                 attention_mask=attention_mask,
@@ -859,6 +863,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **self_attn_extra_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 
@@ -1184,6 +1189,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        index_share_carrier: Optional[Any] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -1203,6 +1209,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             sequence_len_offset,
             padding_mask,
             input_ids,
+            index_share_carrier,
         ):
             return self._forward_attention(
                 hidden_states,
@@ -1220,6 +1227,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 residual_stream_recompute_context=residual_stream_recompute_context,
+                index_share_carrier=index_share_carrier,
             )
 
         args = (
@@ -1235,6 +1243,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             sequence_len_offset,
             padding_mask,
             input_ids,
+            index_share_carrier,
         )
         if self.config.fp8 or self.config.fp4:
             from megatron.core.extensions.transformer_engine import te_checkpoint

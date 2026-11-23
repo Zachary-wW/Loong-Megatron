@@ -22,6 +22,20 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, make_v
 from megatron.core.typed_torch import apply_module, copy_signature
 
 
+def _snapshot_dispatcher_state(dispatcher) -> dict | None:
+    """Capture mutable routing metadata around a checkpoint recompute."""
+    if dispatcher is None:
+        return None
+    return dict(dispatcher.__dict__)
+
+
+def _restore_dispatcher_state(dispatcher, state: dict | None) -> None:
+    if dispatcher is None or state is None:
+        return
+    dispatcher.__dict__.clear()
+    dispatcher.__dict__.update(state)
+
+
 def build_transformer_layer_callables(layer: TransformerLayer):
     """Create callables for transformer layer nodes.
     Divides the transformer layer's operations into a sequence of smaller, independent
@@ -144,32 +158,47 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 if layer.a2a_overlap_post_attn_recompute:
                     node.layer_state.mlp_norm_manager = None
+                    post_attn_calls = [0]
 
                     def post_attn_forward(post_attention_input):
-                        pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
-                            post_attention_input
+                        # ``dispatch_preprocess`` mutates the token dispatcher's routing
+                        # metadata. During checkpoint recompute that mutation may run after
+                        # the next microbatch has already advanced the dispatcher state.
+                        # Restore the state that was current when recompute started.
+                        is_recompute = post_attn_calls[0] > 0
+                        post_attn_calls[0] += 1
+                        dispatcher_state = (
+                            dict(layer.mlp.token_dispatcher.__dict__) if is_recompute else None
                         )
-                        if layer._pre_mlp_layernorm_returns_residual:
-                            pre_mlp_layernorm_output, post_attention_input = (
-                                pre_mlp_layernorm_output
+                        try:
+                            pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
+                                post_attention_input
                             )
-                        probs, routing_map = layer.mlp.route(
-                            pre_mlp_layernorm_output,
-                            padding_mask,
-                            packed_seq_params=packed_seq_params,
-                        )
-                        local_tokens, probs = layer.mlp.preprocess(
-                            pre_mlp_layernorm_output,
-                            probs,
-                            routing_map,
-                            padding_mask,
-                        )
-                        return (
-                            post_attention_input,
-                            pre_mlp_layernorm_output,
-                            local_tokens,
-                            probs,
-                        )
+                            if layer._pre_mlp_layernorm_returns_residual:
+                                pre_mlp_layernorm_output, post_attention_input = (
+                                    pre_mlp_layernorm_output
+                                )
+                            probs, routing_map = layer.mlp.route(
+                                pre_mlp_layernorm_output,
+                                padding_mask,
+                                packed_seq_params=packed_seq_params,
+                            )
+                            local_tokens, probs = layer.mlp.preprocess(
+                                pre_mlp_layernorm_output,
+                                probs,
+                                routing_map,
+                                padding_mask,
+                            )
+                            return (
+                                post_attention_input,
+                                pre_mlp_layernorm_output,
+                                local_tokens,
+                                probs,
+                            )
+                        finally:
+                            _restore_dispatcher_state(
+                                layer.mlp.token_dispatcher, dispatcher_state
+                            )
 
                     (
                         hidden_states,
@@ -212,12 +241,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     return hidden_states, None, None, shared_expert_output
 
                 shared_expert_output = (
-                    None
-                    if layer.a2a_overlap_mlp_recompute
-                    else layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                    layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                    if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap
+                    else None
                 )
-                if layer.a2a_overlap_mlp_recompute:
-                    node.layer_state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
+                # The shared expert is computed eagerly here, matching the
+                # reference MoELayer path. The A2A-overlap MLP checkpoint only
+                # replays routed experts; replaying shared experts as well
+                # introduces BF16 gradient ULP drift.
+                node.layer_state.pre_mlp_layernorm_output = None
 
                 if layer.a2a_overlap_post_attn_recompute:
                     return hidden_states, local_tokens, probs, shared_expert_output
@@ -257,22 +289,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
             node.layer_state.echo_expert_offloading_map = expert_offloading_map
 
-        if layer.a2a_overlap_mlp_recompute and (
-            layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap
-        ):
-            if pre_mlp_layernorm_output is None:
-                raise RuntimeError("A2A-overlap MLP recompute requires the pre-MLP norm output.")
-            node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
-        else:
-            node.layer_state.pre_mlp_layernorm_output = None
+        node.layer_state.pre_mlp_layernorm_output = None
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
-        if (
-            not layer.a2a_overlap_mlp_recompute
-            and layer.mlp.use_shared_expert
-            and not layer.mlp.shared_expert_overlap
-        ):
+        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
@@ -340,14 +361,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             return expert_output
 
         if layer.a2a_overlap_mlp_recompute:
-            recompute_shared_experts = (
-                layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap
-            )
-            if recompute_shared_experts and pre_mlp_layernorm_output is None:
-                raise RuntimeError("A2A-overlap MLP recompute requires the pre-MLP norm output.")
-            permuted_tokens, tokens_per_expert, permuted_probs = (
-                layer.mlp._dispatch_postprocess_for_experts(dispatched_tokens, dispatched_probs)
-            )
+            recompute_shared_experts = False
 
             def checkpointed_experts(
                 routed_tokens,
@@ -374,11 +388,30 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     )
                 return expert_output, shared_expert_output
 
+            checkpointed_experts_calls = [0]
+            dispatcher_state = None
+
+            def recompute_safe_experts(*args):
+                nonlocal dispatcher_state
+                is_recompute = checkpointed_experts_calls[0] > 0
+                checkpointed_experts_calls[0] += 1
+                if is_recompute:
+                    dispatcher_state = _snapshot_dispatcher_state(layer.mlp.token_dispatcher)
+                try:
+                    return checkpointed_experts(*args)
+                finally:
+                    _restore_dispatcher_state(layer.mlp.token_dispatcher, dispatcher_state)
+                    if is_recompute:
+                        dispatcher_state = None
+
+            permuted_tokens, tokens_per_expert, permuted_probs = (
+                layer.mlp._dispatch_postprocess_for_experts(dispatched_tokens, dispatched_probs)
+            )
             checkpoint_inputs = (permuted_tokens, tokens_per_expert, permuted_probs)
             if recompute_shared_experts:
                 checkpoint_inputs += (pre_mlp_layernorm_output,)
             expert_output, shared_expert_output = checkpoint_region(
-                checkpointed_experts, *checkpoint_inputs
+                recompute_safe_experts, *checkpoint_inputs
             )
             expert_output = layer.mlp.token_dispatcher.combine_preprocess(expert_output)
             if recompute_shared_experts:
@@ -422,6 +455,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # `mlp_bda` run as one kernel that is bit-identical to the two adds.
         fuse_residual_add = (
             shared_expert_output is not None
+            and not layer.a2a_overlap_mlp_recompute
             and layer.mlp_bda is get_bias_dropout_add
             and (layer.hidden_dropout == 0.0 or not layer.training)
         )
