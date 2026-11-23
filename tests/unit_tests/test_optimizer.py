@@ -193,6 +193,23 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     assert wd_mults == {1.0, 0.0}
 
 
+def test_optimizer_config_skips_embedding_weight_decay_for_legacy_init_std():
+    from megatron.training.training import get_megatron_optimizer_config
+
+    args = SimpleNamespace(
+        lr=1e-4,
+        min_lr=1e-5,
+        weight_decay=0.1,
+        embedding_init_method_std=0.02,
+        decoupled_weight_decay=True,
+    )
+    config, overrides = get_megatron_optimizer_config(args)
+
+    assert config.weight_decay == pytest.approx(0.1)
+    embedding_key = next(key for key in overrides if key.name == "*embedding*")
+    assert overrides[embedding_key]["wd_mult"] == 0.0
+
+
 @pytest.mark.parametrize("apply_wd_to_qk_layernorm", [False, True])
 def test_standard_overrides_apply_weight_decay_to_wide_residual_retention(
     monkeypatch, apply_wd_to_qk_layernorm

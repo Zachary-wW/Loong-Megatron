@@ -1882,10 +1882,6 @@ def validate_args(args, defaults={}):
             "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
             "as the hybrid device optimizer reuses the code path of this flag."
         )
-        assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
-            "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
-            "must be used in conjunction with `--fp8-recipe delayed`."
-        )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -2879,6 +2875,18 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--no-use-deepspeed-cpu-adam', action='store_false',
+                       dest='use_deepspeed_cpu_adam',
+                       help='Disable DeepSpeed CPU Adam implementation.')
+    group.add_argument('--optimizer-offload-grad-streaming', action='store_true',
+                       help='Stream CPU-offloaded gradients through two bounded pinned '
+                       'staging arenas instead of retaining a full-size host gradient mirror.')
+    group.add_argument('--optimizer-offload-grad-streaming-bucket-mb', type=int, default=4096,
+                       help='Wave size in MiB for --optimizer-offload-grad-streaming.')
+    group.add_argument('--optimizer-cpu-offload-contiguous-state', action='store_true',
+                       help='Place CPU-offloaded Adam FP32 master parameters and moment buffers '
+                       'in contiguous pinned arenas. At data-parallel size one, legacy optimizer '
+                       'checkpoint save/load can use the arenas directly.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
