@@ -1095,6 +1095,58 @@ class TestMegatronNetworkArgumentGeneration:
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
 
+    def test_chunkpipe_flags_are_registered_once_and_runtime_fields_excluded(self):
+        """ChunkPipe runtime state must not be reflected into argparse."""
+        from megatron.training.arguments import _add_network_size_args, _add_training_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+        _add_training_args(parser)
+
+        destinations = [action.dest for action in parser._actions]
+        for flag_dest in (
+            "enable_chunkpipe",
+            "chunksize",
+            "chunk_sizes",
+            "keep_activations_chunks",
+        ):
+            assert destinations.count(flag_dest) == 1
+
+        runtime_fields = {
+            "chunk_num_per_seq",
+            "cu_chunks",
+            "max_chunk_size",
+            "chunkpipe_forward_microbatch",
+            "chunkpipe_backward_microbatch",
+            "chunkpipe_current_group_size",
+            "chunkpipe_composite_group_size",
+            "chunkpipe_component_sizes",
+            "chunkpipe_num_microbatches",
+            "chunkpipe_chunk_idx_in_group",
+            "chunk_keys",
+            "chunk_values",
+            "chunkpipe_forward",
+            "sft_chunkpipe_mode",
+        }
+        assert set(destinations).isdisjoint(runtime_fields)
+
+        args = parser.parse_args(
+            [
+                "--enable-chunkpipe",
+                "--chunk-sizes",
+                "4",
+                "6",
+                "10",
+                "--keep-activations-chunks",
+                "1",
+            ]
+        )
+        assert args.enable_chunkpipe is True
+        assert args.chunk_sizes == [4, 6, 10]
+        assert args.keep_activations_chunks == 1
+        for field_name in runtime_fields:
+            assert not hasattr(args, field_name)
+
     def test_mhc_fused_backend_is_exposed_as_config_choice(self):
         assert self._parser().parse_args([]).mhc_fused_backend == "auto"
 

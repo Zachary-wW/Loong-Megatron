@@ -6,7 +6,7 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -633,23 +633,38 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
+    custom_pipeline_recompute_layers: Optional[List[int]] = field(
+        default=None,
+        metadata={"argparse_meta": {"type": str, "nargs": None}},
+    )
+    """Comma-separated recompute layer count for each physical pipeline stage.
+
+    The list is resolved against the current pipeline rank when the forward pass runs, rather than
+    during configuration construction. This keeps model creation independent of pipeline-group
+    initialization. Requires full recompute granularity.
+    """
+
     distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    choices: "core_attn", "moe_act", "mlp_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "routed_experts", "pre_mlp", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream", "a2a_overlap_attn",
     "a2a_overlap_post_attn", "a2a_overlap_mlp".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "mlp_act": recompute the dense MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "routed_experts": recompute router, dispatch, routed experts, and combine without recomputing
+            shared experts.
+    "pre_mlp": recompute the attention path before the MLP.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
@@ -667,11 +682,72 @@ class TransformerConfig(ModelParallelConfig):
             preprocessing together in the pre-dispatch node.
     "a2a_overlap_mlp": recompute shared-expert and routed-expert computation in
             the MLP node.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "moe_act", "mlp_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", "shared_experts", and the three A2A-overlap selectors use normal
+    "core_attn", "mlp", "moe", "shared_experts", "routed_experts", "pre_mlp", and the three
+    A2A-overlap selectors use normal
     checkpointing.
     """
+
+    ####################
+    # ChunkPipe
+    ####################
+    enable_chunkpipe: bool = False
+    """Split each sequence into causal chunks processed as a pipeline group."""
+
+    chunksize: int = 0
+    """Number of tokens in each ChunkPipe chunk."""
+
+    chunk_num_per_seq: int = 0
+    """Number of chunks per sequence."""
+
+    chunk_sizes: Optional[list] = None
+    """Per-chunk token counts in sequence order."""
+
+    cu_chunks: Optional[list] = None
+    """Prefix sums of chunk_sizes, including the zero start and trailing end."""
+
+    max_chunk_size: int = 0
+    """Largest chunk size, used for cache slot stride and shape hints."""
+
+    micro_batch_size: int = 1
+    """Micro-batch size used to allocate ChunkPipe attention caches."""
+
+    keep_activations_chunks: int = 0
+    """Number of trailing chunks whose activations are retained."""
+
+    chunkpipe_forward_microbatch: int = 0
+    """Runtime forward-microbatch index used by ChunkPipe."""
+
+    chunkpipe_backward_microbatch: int = 0
+    """Runtime backward-microbatch index used by ChunkPipe."""
+
+    chunkpipe_current_group_size: int = 0
+    """Runtime size of the ChunkPipe group being processed."""
+
+    chunkpipe_composite_group_size: int = 0
+    """Runtime total chunk count of the current SFT composite group."""
+
+    chunkpipe_component_sizes: Optional[list] = None
+    """Runtime real-group sizes that make up the current SFT composite group."""
+
+    chunkpipe_num_microbatches: int = 0
+    """Number of chunk-level microbatches scheduled in the current SFT step."""
+
+    chunkpipe_chunk_idx_in_group: int = 0
+    """Runtime zero-based chunk index within the current ChunkPipe group."""
+
+    chunk_keys: Optional[dict[int, Any]] = None
+    """Runtime cross-chunk key cache."""
+
+    chunk_values: Optional[dict[int, Any]] = None
+    """Runtime cross-chunk value cache."""
+
+    chunkpipe_forward: bool = False
+    """Whether the scheduler is in the ChunkPipe forward phase."""
+
+    sft_chunkpipe_mode: bool = False
+    """Whether ChunkPipe is running with external, dynamically sized SFT groups."""
 
     ####################
     # fp8 related
@@ -1731,6 +1807,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mtp_connection_type='parallel' cannot be combined with mtp_hsm=True."
             )
+        self.chunk_keys = {}
+        self.chunk_values = {}
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -2494,6 +2572,21 @@ class TransformerConfig(ModelParallelConfig):
                 "CPU offloading does not work when activation recomputation is enabled"
             )
 
+        if self.custom_pipeline_recompute_layers is not None:
+            if self.recompute_granularity != "full":
+                raise ValueError(
+                    "custom_pipeline_recompute_layers requires recompute_granularity='full'."
+                )
+            if (
+                len(self.custom_pipeline_recompute_layers)
+                != self.pipeline_model_parallel_size
+            ):
+                raise ValueError(
+                    "custom_pipeline_recompute_layers must contain one value per physical "
+                    f"pipeline stage: {len(self.custom_pipeline_recompute_layers)} != "
+                    f"{self.pipeline_model_parallel_size}."
+                )
+
         if self.recompute_granularity is not None:
             if self.recompute_granularity not in ["full", "selective"]:
                 raise ValueError(
@@ -2512,7 +2605,11 @@ class TransformerConfig(ModelParallelConfig):
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if (
+                self.recompute_granularity != "selective"
+                and self.recompute_num_layers is None
+                and self.custom_pipeline_recompute_layers is None
+            ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -2554,11 +2651,14 @@ class TransformerConfig(ModelParallelConfig):
                     "a2a_overlap_post_attn",
                     "core_attn",
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "routed_experts",
+                    "pre_mlp",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
@@ -2635,18 +2735,20 @@ class TransformerConfig(ModelParallelConfig):
             if self.fp8:
                 fp8_output_discarding_modules = {
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "shortcut_pre_mlp_layernorm",
                 }
                 if fp8_output_discarding_modules & set(self.recompute_modules):
                     if self.fp8_recipe == 'delayed':
                         raise ValueError(
-                            "Delayed scaling does not support moe_act, layernorm, or "
+                            "Delayed scaling does not support moe_act, mlp_act, layernorm, or "
                             "shortcut_pre_mlp_layernorm recompute for fp8."
                         )
                     if not is_te_min_version("2.6.0dev0"):
                         raise ValueError(
-                            "moe_act, layernorm, and shortcut_pre_mlp_layernorm recompute for "
+                            "moe_act, mlp_act, layernorm, and shortcut_pre_mlp_layernorm "
+                            "recompute for "
                             "fp8 need "
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
@@ -3230,6 +3332,8 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion for multi-latent attention only supports training. "
                     "It is experimental and may change in future versions."
                 )
+                if self.enable_chunkpipe:
+                    self.apply_rope_fusion = False
             else:
                 if self.rotary_interleaved:
                     if not is_te_min_version("2.3.0"):
