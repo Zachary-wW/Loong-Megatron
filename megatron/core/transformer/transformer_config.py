@@ -1125,6 +1125,7 @@ class TransformerConfig(ModelParallelConfig):
         },
     )
     """Parameter and buffer name patterns to keep in FP32 during FP16/BF16 training."""
+
     enable_moe_mem_monitor: bool = False
     """Whether to enable MoE memory and dispatcher-token monitoring."""
 
