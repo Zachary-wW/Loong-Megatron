@@ -35,6 +35,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     bwd_fused_indexer_loss_naive,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
+    get_dsa_index_share_topk_holder,
     is_dsa_skip_topk_layer,
     rotate_activation,
     source_dsa_compute_layer,
@@ -102,6 +103,47 @@ class TestDSAIndexShareHelpers:
         assert is_dsa_skip_topk_layer(2, 0, 4)
         assert source_dsa_compute_layer(1, 0, 4) == 1
         assert source_dsa_compute_layer(4, 0, 4) == 1
+
+    def test_legacy_index_share_holder_adapter(self):
+        assert (
+            get_dsa_index_share_topk_holder(
+                packed_seq_params=None,
+                index_share_carrier=None,
+                skip_topk=False,
+                layer_number=1,
+                source_layer=1,
+            )
+            is None
+        )
+
+        carrier = SimpleNamespace()
+        holder = get_dsa_index_share_topk_holder(
+            packed_seq_params=None,
+            index_share_carrier=carrier,
+            skip_topk=False,
+            layer_number=1,
+            source_layer=1,
+        )
+        assert holder == {}
+        assert (
+            get_dsa_index_share_topk_holder(
+                packed_seq_params=None,
+                index_share_carrier=carrier,
+                skip_topk=False,
+                layer_number=2,
+                source_layer=1,
+            )
+            is holder
+        )
+
+        with pytest.raises(RuntimeError, match="no per-forward carrier"):
+            get_dsa_index_share_topk_holder(
+                packed_seq_params=None,
+                index_share_carrier=None,
+                skip_topk=True,
+                layer_number=2,
+                source_layer=1,
+            )
 
     def test_index_share_pipeline_split_rejects_cross_stage_source(self):
         config = SimpleNamespace(
@@ -1248,6 +1290,33 @@ class TestDSACPPositionHelpers:
         starts, ends, key_positions = varlen_params
         torch.testing.assert_close(starts, torch.zeros(sq, dtype=torch.int64))
         torch.testing.assert_close(ends, torch.arange(1, sq + 1, dtype=torch.int64))
+        assert key_positions is None
+
+    def test_build_mask_chunk_query_positions_use_bottom_right_bounds(self):
+        """Chunk queries keep absolute causal bounds across the concatenated KV history."""
+        chunk_query_positions = torch.tensor([3, 4, 5], dtype=torch.int64)
+
+        float_mask, varlen_params, is_plain_causal = build_dsattention_forward_mask(
+            sq=3,
+            skv=6,
+            b=1,
+            device=torch.device("cpu"),
+            cp_size=1,
+            cp_rank=0,
+            cp_comm_type="p2p",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            chunk_query_positions=chunk_query_positions,
+        )
+
+        assert float_mask is None
+        assert is_plain_causal is False
+        starts, ends, key_positions = varlen_params
+        torch.testing.assert_close(starts, torch.zeros(3, dtype=torch.int64))
+        torch.testing.assert_close(ends, torch.tensor([4, 5, 6], dtype=torch.int64))
         assert key_positions is None
 
     def test_build_mask_additive_mask_is_not_flagged_plain_causal(self):

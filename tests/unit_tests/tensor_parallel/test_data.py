@@ -34,4 +34,16 @@ def test_broadcast_data():
     )
     expected = torch.arange(12, dtype=dtype, device="cuda").reshape(3, 4)
     assert torch.equal(world_output["value"], expected)
+
+    six_d_input = (
+        {"value": torch.arange(6, dtype=dtype, device="cuda").reshape(1, 1, 1, 1, 2, 3)}
+        if torch.distributed.get_rank() == 0
+        else None
+    )
+    six_d_output = broadcast_data(
+        ["value"], six_d_input, dtype, tp_group=torch.distributed.group.WORLD
+    )
+    assert six_d_output["value"].shape == (1, 1, 1, 1, 2, 3)
+    if six_d_input is not None:
+        assert torch.equal(six_d_output["value"], six_d_input["value"])
     Utils.destroy_model_parallel()

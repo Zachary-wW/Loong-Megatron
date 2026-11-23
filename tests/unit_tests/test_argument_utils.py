@@ -316,6 +316,97 @@ def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
         validate_args(args)
 
 
+@pytest.mark.parametrize(
+    ("max_connections", "expect_sequence_warning", "expect_async_warning"),
+    [
+        ("1", False, False),
+        ("32", True, True),
+        (None, True, True),
+    ],
+)
+def test_tp_cp_connection_count_uses_capability_warnings(
+    monkeypatch, max_connections, expect_sequence_warning, expect_async_warning
+):
+    """TP/CP connection-count guidance must warn instead of hard-asserting."""
+    from megatron.training import arguments as arguments_module
+
+    args = _minimal_training_args(monkeypatch)
+    args.world_size = 2
+    args.tensor_model_parallel_size = 2
+    args.context_parallel_size = 1
+    args.sequence_parallel = True
+    args.async_tensor_model_parallel_allreduce = True
+    args.use_torch_fsdp2 = False
+    args.use_megatron_fsdp = False
+    args.overlap_moe_expert_parallel_comm = False
+
+    if max_connections is None:
+        monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", max_connections)
+    monkeypatch.setattr(arguments_module, "get_device_arch_version", lambda: 9)
+    warnings = []
+    monkeypatch.setattr(
+        arguments_module,
+        "warn_rank_0",
+        lambda message, rank: warnings.append(message),
+    )
+
+    validate_args(args)
+
+    assert any("sequence parallelism requires" in message for message in warnings) is (
+        expect_sequence_warning
+    )
+    assert any("async gradient all reduce requires" in message for message in warnings) is (
+        expect_async_warning
+    )
+
+
+def test_sft_chunkpipe_derives_microbatches_and_inflates_global_batch(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.enable_chunkpipe = True
+    args.sft = True
+    args.chunksize = 4
+    args.seq_length = 16
+    args.global_batch_size = 2
+    args.micro_batch_size = 1
+    args.data_parallel_size = 1
+    args.world_size = 1
+    args.create_attention_mask_in_dataloader = False
+
+    validate_args(args)
+
+    assert args.sft_chunkpipe_mode is True
+    assert args.chunk_num_per_seq == 4
+    assert args.chunk_sizes == [4, 4, 4, 4]
+    assert args.global_batch_size == 4
+    assert args.chunkpipe_num_microbatches == 4
+
+
+@pytest.mark.parametrize(
+    ("enable_chunkpipe", "sft_chunkpipe_mode", "scheduled", "expected"),
+    [
+        (False, False, 3, 3),
+        (True, True, 3, 3),
+        (True, False, 3, 12),
+    ],
+)
+def test_chunkpipe_evaluation_microbatch_count(
+    enable_chunkpipe, sft_chunkpipe_mode, scheduled, expected
+):
+    """SFT receives chunk-level batches; pretrain expands each sequence into chunks."""
+    from megatron.training.training import _evaluation_num_microbatches
+
+    args = SimpleNamespace(
+        enable_chunkpipe=enable_chunkpipe,
+        sft_chunkpipe_mode=sft_chunkpipe_mode,
+        chunk_num_per_seq=4,
+    )
+
+    assert _evaluation_num_microbatches(args, scheduled) == expected
+
+
 @dataclass
 class ConfigWithOptional:
     """Config with optional fields."""
@@ -1093,6 +1184,58 @@ class TestMegatronNetworkArgumentGeneration:
         assert destinations.isdisjoint(callback_fields)
         args = parser.parse_args([])
         for field_name in callback_fields:
+            assert not hasattr(args, field_name)
+
+    def test_chunkpipe_flags_are_registered_once_and_runtime_fields_excluded(self):
+        """ChunkPipe runtime state must not be reflected into argparse."""
+        from megatron.training.arguments import _add_network_size_args, _add_training_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+        _add_training_args(parser)
+
+        destinations = [action.dest for action in parser._actions]
+        for flag_dest in (
+            "enable_chunkpipe",
+            "chunksize",
+            "chunk_sizes",
+            "keep_activations_chunks",
+        ):
+            assert destinations.count(flag_dest) == 1
+
+        runtime_fields = {
+            "chunk_num_per_seq",
+            "cu_chunks",
+            "max_chunk_size",
+            "chunkpipe_forward_microbatch",
+            "chunkpipe_backward_microbatch",
+            "chunkpipe_current_group_size",
+            "chunkpipe_composite_group_size",
+            "chunkpipe_component_sizes",
+            "chunkpipe_num_microbatches",
+            "chunkpipe_chunk_idx_in_group",
+            "chunk_keys",
+            "chunk_values",
+            "chunkpipe_forward",
+            "sft_chunkpipe_mode",
+        }
+        assert set(destinations).isdisjoint(runtime_fields)
+
+        args = parser.parse_args(
+            [
+                "--enable-chunkpipe",
+                "--chunk-sizes",
+                "4",
+                "6",
+                "10",
+                "--keep-activations-chunks",
+                "1",
+            ]
+        )
+        assert args.enable_chunkpipe is True
+        assert args.chunk_sizes == [4, 6, 10]
+        assert args.keep_activations_chunks == 1
+        for field_name in runtime_fields:
             assert not hasattr(args, field_name)
 
     def test_mhc_fused_backend_is_exposed_as_config_choice(self):

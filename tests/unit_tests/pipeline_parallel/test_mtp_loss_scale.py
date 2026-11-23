@@ -1,10 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from megatron.core import ModelParallelConfig
+from megatron.core.pipeline_parallel import schedules
 from megatron.core.pipeline_parallel.schedules import _get_mtp_loss_scale
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
 
 def test_mtp_grad_scale_func_config():
@@ -73,3 +77,67 @@ def test_mtp_loss_scale_rejects_non_scalar_scale(config, scale_func_name):
 
     with pytest.raises(ValueError, match=f"{scale_func_name} must return a scalar"):
         _get_mtp_loss_scale(config, device)
+
+
+def _chunkpipe_config(**overrides):
+    values = {
+        "calculate_per_token_loss": False,
+        "mtp_num_layers": 1,
+        "mtp_grad_scale_func": lambda: torch.tensor(3.0),
+        "enable_chunkpipe": True,
+        "sft_chunkpipe_mode": True,
+        "chunkpipe_step_num_groups": 4,
+        "num_moe_experts": None,
+        "timers": None,
+        "experimental_attention_variant_loss_scale_func": None,
+        "experimental_attention_variant": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _run_mtp_loss_scale(config, monkeypatch, dp_size=8, num_microbatches=2):
+    monkeypatch.setattr(
+        schedules.parallel_state, "get_data_parallel_world_size", lambda: dp_size
+    )
+    MTPLossAutoScaler.main_loss_backward_scale = None
+    schedules.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(1.0),
+        loss_func=None,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=num_microbatches,
+        forward_data_store=[],
+        cp_group_size=1,
+        is_last_stage=True,
+    )
+    return MTPLossAutoScaler.main_loss_backward_scale
+
+
+def test_sft_chunkpipe_mtp_loss_scale_uses_dp_and_group_count(monkeypatch):
+    scale = _run_mtp_loss_scale(_chunkpipe_config(), monkeypatch)
+
+    torch.testing.assert_close(scale, torch.tensor(6.0))
+    MTPLossAutoScaler.main_loss_backward_scale = None
+
+
+def test_sft_chunkpipe_mtp_loss_scale_requires_positive_group_count(monkeypatch):
+    with pytest.raises(AssertionError, match="chunkpipe_step_num_groups > 0"):
+        _run_mtp_loss_scale(
+            _chunkpipe_config(chunkpipe_step_num_groups=0), monkeypatch
+        )
+    MTPLossAutoScaler.main_loss_backward_scale = None
+
+
+def test_non_sft_chunkpipe_mtp_loss_scale_uses_chunk_denominator(monkeypatch):
+    config = _chunkpipe_config(
+        sft_chunkpipe_mode=False,
+        chunk_num_per_seq=4,
+    )
+
+    scale = _run_mtp_loss_scale(config, monkeypatch, num_microbatches=8)
+
+    torch.testing.assert_close(scale, torch.tensor(1.5))
+    MTPLossAutoScaler.main_loss_backward_scale = None

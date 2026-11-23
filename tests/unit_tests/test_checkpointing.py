@@ -502,6 +502,32 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
         check_checkpoint_args(checkpoint_args)
 
 
+def test_check_checkpoint_args_defaults_missing_add_position_embedding_to_false():
+    current_args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        add_position_embedding=False,
+        vocab_file=None,
+        data_parallel_random_init=False,
+        phase_transition_iterations=None,
+        use_dist_ckpt=True,
+        wide_residual_num_streams=None,
+        wide_residual_streamwise_sigmoid_init_scale=0.01,
+        wide_residual_learned_retention=False,
+        wide_residual_retention_init=0.999,
+        wide_residual_retention_max_forget=0.10,
+    )
+    checkpoint_args = SimpleNamespace(**vars(current_args))
+    del checkpoint_args.add_position_embedding
+
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=current_args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+    ):
+        check_checkpoint_args(checkpoint_args)
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
