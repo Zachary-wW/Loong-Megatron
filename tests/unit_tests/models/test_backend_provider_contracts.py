@@ -11,10 +11,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from megatron.core.extensions.transformer_engine import te_cross_entropy
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
+from megatron.core.models.common.language_module import language_module
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.backends import (
     BackendSpecProvider,
     InferenceSpecProvider,
@@ -137,6 +140,45 @@ class TestCrossEntropyFollowsTheConfig:
         with patch("megatron.core.models.backends.is_te_min_version", return_value=True):
             target = get_backend_from_config(config).vocab_parallel_cross_entropy()
         assert target.keywords["cuda_graph_capturable"] == (cuda_graph_impl == "full_iteration")
+
+    def test_linear_fusion_routes_hidden_and_weight_to_lce(self, monkeypatch):
+        """The linear implementation is not a logits-only cross entropy target."""
+        module = object.__new__(LanguageModule)
+        module.config = _config(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="linear")
+        tp_group = object()
+        module.pg_collection = SimpleNamespace(tp=tp_group)
+
+        calls = {}
+
+        def fake_linear_cross_entropy(hidden, weight, labels, **kwargs):
+            calls["hidden"] = hidden
+            calls["weight"] = weight
+            calls["labels"] = labels
+            calls["kwargs"] = kwargs
+            return hidden.new_zeros(labels.shape)
+
+        monkeypatch.setattr(language_module, "linear_cross_entropy", fake_linear_cross_entropy)
+        hidden = torch.randn(2, 3, 4)
+        weight = torch.randn(8, 4)
+        labels = torch.tensor([[1, 2, 3], [4, 5, 6]])
+
+        loss = module.compute_output_layer_and_language_model_loss(
+            hidden,
+            labels=labels,
+            weight=weight,
+            sequence_parallel_enabled=True,
+        )
+
+        assert loss.shape == labels.shape
+        assert calls["hidden"] is hidden
+        assert calls["weight"] is weight
+        assert calls["labels"].shape == labels.transpose(0, 1).shape
+        assert calls["kwargs"] == {
+            "tp_group": tp_group,
+            "sequence_parallel": True,
+            "reduction": "none",
+            "ignore_index": -100,
+        }
 
 
 class TestBertLmHeadNormDoesNotFollowTransformerImpl:
