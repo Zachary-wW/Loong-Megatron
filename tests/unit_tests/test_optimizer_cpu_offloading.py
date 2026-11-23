@@ -134,7 +134,10 @@ def test_load_state_dict_with_native_fp32_param():
 
     assert set(restored_optimizer.state) == set(restored_model.parameters())
     assert restored_model.proj.weight in restored_optimizer.param_to_fp32_param
-    assert restored_model.scale not in restored_optimizer.param_to_fp32_param
+    # HDO checkpoint restoration needs a CPU conversion entry for native FP32
+    # parameters as well as BF16 parameters with an FP32 master copy.
+    assert restored_model.scale in restored_optimizer.param_to_fp32_param
+    assert restored_optimizer.param_to_fp32_param[restored_model.scale].dtype == torch.float32
     assert torch.equal(
         restored_optimizer.param_to_fp32_param[restored_model.proj.weight],
         optimizer.param_to_fp32_param[model.proj.weight],
