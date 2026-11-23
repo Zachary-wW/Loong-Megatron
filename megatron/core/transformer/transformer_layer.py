@@ -502,6 +502,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        self.a2a_overlap_attn_recompute = False
+        self.a2a_overlap_post_attn_recompute = False
+        self.a2a_overlap_mlp_recompute = False
         # Batch-first shape of the padding_mask this layer received in eager execution (the
         # cuda_graph_warmup_steps), recorded in _forward_attention before any MLP chunking.
         self._padding_mask_shape_seen: Optional[tuple[int, ...]] = None
@@ -575,6 +578,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if "mlp" in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
+            if "a2a_overlap_attn" in self.config.recompute_modules:
+                self.a2a_overlap_attn_recompute = True
+            if "a2a_overlap_post_attn" in self.config.recompute_modules:
+                self.a2a_overlap_post_attn_recompute = True
+            if "a2a_overlap_mlp" in self.config.recompute_modules:
+                self.a2a_overlap_mlp_recompute = True
 
         self._set_offload_modules()
         self.off_interface = _get_offloading_interface()
@@ -1128,6 +1137,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
+            if getattr(self.config, 'moe_echo_expert_dispatch_overlap', False):
+                from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum
+
+                hidden_states = FlushPendingGradAccum.apply(hidden_states)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
                 residual_stream_recompute_context = kwargs.get(
                     "residual_stream_recompute_context", None
@@ -2050,6 +2063,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 residual = cuda_graph_output.pop()
                 if not self.is_moe_layer:
                     return residual, None, None, None
+                if getattr(self.config, 'moe_echo_expert_dispatch_overlap', False):
+                    from megatron.core.transformer.moe.moe_layer import FlushPendingGradAccum
+
+                    residual = FlushPendingGradAccum.apply(residual)
                 hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
                 if self._pre_mlp_layernorm_returns_residual:
                     hidden_states, residual = hidden_states

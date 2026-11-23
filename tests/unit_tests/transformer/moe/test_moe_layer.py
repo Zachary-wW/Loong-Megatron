@@ -400,5 +400,59 @@ class TestMoELayerRecompute:
 
         Utils.destroy_model_parallel()
 
+    def test_routed_experts_recompute_forward_backward(self):
+        """Exercise the routed-expert selective-recompute branch end to end."""
+        Utils.initialize_model_parallel(1, 1)
+        try:
+            _set_random_seed(seed_=123, data_parallel_random_init=False)
+            transformer_config = TransformerConfig(
+                num_layers=1,
+                hidden_size=64,
+                num_attention_heads=4,
+                num_moe_experts=2,
+                use_cpu_initialization=False,
+                moe_token_dispatcher_type="allgather",
+                moe_router_load_balancing_type="aux_loss",
+                moe_router_topk=2,
+                moe_aux_loss_coeff=0.01,
+                moe_grouped_gemm=False,
+                moe_ffn_hidden_size=256,
+                add_bias_linear=False,
+                recompute_granularity="selective",
+                recompute_modules=["routed_experts"],
+                tensor_model_parallel_size=1,
+                expert_model_parallel_size=1,
+                sequence_parallel=False,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+            )
+            submodules = get_submodules(
+                get_gpt_layer_local_submodules(
+                    num_experts=2, moe_grouped_gemm=False
+                ).mlp
+            )
+            moe_layer = MoELayer(transformer_config, submodules).cuda()
+            hidden_states = torch.randn(
+                32,
+                2,
+                64,
+                device=torch.cuda.current_device(),
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+
+            output, _ = moe_layer(hidden_states)
+            output.sum().backward()
+
+            assert moe_layer.routed_experts_recompute
+            assert hidden_states.grad is not None
+            assert all(
+                parameter.grad is not None
+                for parameter in moe_layer.parameters()
+                if parameter.requires_grad
+            )
+        finally:
+            Utils.destroy_model_parallel()
+
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
